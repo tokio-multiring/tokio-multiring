@@ -245,8 +245,21 @@ impl FixedBuf {
         (self.id as usize / self.pool.bufs_per_registered) as u16
     }
 
-    /// Records that the kernel wrote `count` more bytes after the contents.
-    pub(crate) fn advance(&mut self, count: usize) {
+    /// The bytes past the contents, for filling in place before a call to
+    /// [`grow`](Self::grow).
+    pub fn spare_capacity_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as in `deref_mut`. The spare bytes are initialized too,
+        // with whatever was last written there.
+        unsafe { std::slice::from_raw_parts_mut(self.spare_ptr(), self.spare_len()) }
+    }
+
+    /// Extends the contents by the next `count` bytes of the spare capacity,
+    /// as they are.
+    ///
+    /// # Panics
+    ///
+    /// Panics if that is more than the spare capacity.
+    pub fn grow(&mut self, count: usize) {
         assert!(count <= self.spare_len());
         self.len += count;
     }

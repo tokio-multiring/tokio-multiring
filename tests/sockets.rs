@@ -45,7 +45,7 @@ fn tcp_echo() {
 
             let mut request = pool.acquire().await;
             while request.len() < 5 {
-                let (received, buf) = sidecar.recv(stream.clone(), request).await;
+                let (received, buf) = sidecar.recv(stream.clone(), request, usize::MAX).await;
                 assert_ne!(received.unwrap(), 0);
                 request = buf;
             }
@@ -53,7 +53,7 @@ fn tcp_echo() {
 
             let mut reply = pool.acquire().await;
             reply.extend_from_slice(b"polo!");
-            let (sent, _) = sidecar.send(stream, reply).await;
+            let (sent, _) = sidecar.send(stream, reply, 0).await;
             assert_eq!(sent.unwrap(), 5);
         })
         .await
@@ -87,7 +87,7 @@ fn send_delivers_the_whole_buffer() {
         let mut buf = pool.acquire().await;
         let pattern: Vec<u8> = (0..SIZE).map(|index| (index % 251) as u8).collect();
         buf.extend_from_slice(&pattern);
-        let (sent, buf) = sidecar.send(ours, buf).await;
+        let (sent, buf) = sidecar.send(ours, buf, 0).await;
         assert_eq!(sent.unwrap(), SIZE);
         drop(buf);
     });
@@ -111,12 +111,42 @@ fn recv_reports_the_end_of_the_stream() {
 
     runtime().block_on(async {
         let sidecar = Sidecar::start(Config::default()).await.unwrap();
-        let (received, buf) = sidecar.recv(ours.clone(), pool.acquire().await).await;
+        let (received, buf) = sidecar
+            .recv(ours.clone(), pool.acquire().await, usize::MAX)
+            .await;
         assert_eq!(received.unwrap(), 10);
-        let (received, buf) = sidecar.recv(ours, buf).await;
+        let (received, buf) = sidecar.recv(ours, buf, usize::MAX).await;
         assert_eq!(received.unwrap(), 0);
         assert_eq!(&buf[..], b"last words");
     });
+}
+
+/// A receive takes no more than its limit, leaving the rest for the next
+/// one, and a send can start part of the way into its buffer.
+#[test]
+fn recv_limit_and_send_offset() {
+    let (ours, mut theirs) = socket_pair();
+    let pool = BufferPool::new(4096, 1).unwrap();
+    theirs.write_all(b"headbody").unwrap();
+
+    runtime().block_on(async {
+        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+        let (received, buf) = sidecar.recv(ours.clone(), pool.acquire().await, 4).await;
+        assert_eq!(received.unwrap(), 4);
+        assert_eq!(&buf[..], b"head");
+        let (received, buf) = sidecar.recv(ours.clone(), buf, usize::MAX).await;
+        assert_eq!(received.unwrap(), 4);
+        assert_eq!(&buf[..], b"headbody");
+
+        let (sent, buf) = sidecar.send(ours.clone(), buf, 4).await;
+        assert_eq!(sent.unwrap(), 4);
+        let (sent, _) = sidecar.send(ours, buf, 8).await;
+        assert_eq!(sent.unwrap(), 0);
+    });
+
+    let mut echoed = [0; 4];
+    theirs.read_exact(&mut echoed).unwrap();
+    assert_eq!(&echoed, b"body");
 }
 
 /// Without `MSG_NOSIGNAL` this would kill the test process.
@@ -130,7 +160,7 @@ fn send_to_a_closed_peer_is_an_error() {
         let sidecar = Sidecar::start(Config::default()).await.unwrap();
         let mut buf = pool.acquire().await;
         buf.extend_from_slice(b"anyone?");
-        let (sent, buf) = sidecar.send(ours, buf).await;
+        let (sent, buf) = sidecar.send(ours, buf, 0).await;
         assert_eq!(sent.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
         assert_eq!(&buf[..], b"anyone?");
     });
@@ -186,7 +216,7 @@ fn dropped_recv_is_cancelled() {
 
     runtime().block_on(async {
         let sidecar = Sidecar::start(Config::default()).await.unwrap();
-        let recv = sidecar.recv(ours, pool.acquire().await);
+        let recv = sidecar.recv(ours, pool.acquire().await, usize::MAX);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), recv)
                 .await

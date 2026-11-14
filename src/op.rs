@@ -1,3 +1,4 @@
+use std::ffi::CString;
 use std::future::Future;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -51,10 +52,50 @@ pub(crate) enum Operation {
     Recv {
         fd: Arc<OwnedFd>,
         buf: FixedBuf,
+        /// The most bytes to take.
+        limit: usize,
     },
     Send {
         fd: Arc<OwnedFd>,
         buf: FixedBuf,
+        /// Where in the contents to start.
+        start: usize,
+    },
+    OpenAt {
+        dir: Arc<OwnedFd>,
+        path: CString,
+        flags: i32,
+        mode: u32,
+        /// The new descriptor, once the operation has succeeded.
+        opened: Option<OwnedFd>,
+    },
+    /// With an empty `path`, about `dir` itself.
+    Statx {
+        dir: Arc<OwnedFd>,
+        path: CString,
+        stat: Box<libc::statx>,
+    },
+    RenameAt {
+        dir: Arc<OwnedFd>,
+        from: CString,
+        to: CString,
+    },
+    UnlinkAt {
+        dir: Arc<OwnedFd>,
+        path: CString,
+        flags: i32,
+    },
+    MkdirAt {
+        dir: Arc<OwnedFd>,
+        path: CString,
+        mode: u32,
+    },
+    Fdatasync {
+        fd: Arc<OwnedFd>,
+    },
+    Truncate {
+        fd: Arc<OwnedFd>,
+        len: u64,
     },
 }
 
@@ -104,18 +145,57 @@ impl Operation {
             )
             .flags(libc::SOCK_CLOEXEC)
             .build(),
-            Operation::Recv { fd, buf } => opcode::Recv::new(
+            Operation::Recv { fd, buf, limit } => opcode::Recv::new(
                 types::Fd(fd.as_raw_fd()),
                 buf.spare_ptr(),
-                io_len(buf.spare_len()),
+                io_len(buf.spare_len().min(*limit)),
             )
             .build(),
             // WAITALL has the kernel keep sending until the whole buffer is
             // out, where it would otherwise stop at a full socket buffer.
-            Operation::Send { fd, buf } => {
-                opcode::Send::new(types::Fd(fd.as_raw_fd()), buf.as_ptr(), io_len(buf.len()))
+            Operation::Send { fd, buf, start } => {
+                let rest = &buf[*start..];
+                opcode::Send::new(types::Fd(fd.as_raw_fd()), rest.as_ptr(), io_len(rest.len()))
                     .flags(libc::MSG_NOSIGNAL | libc::MSG_WAITALL)
                     .build()
+            }
+            Operation::OpenAt {
+                dir,
+                path,
+                flags,
+                mode,
+                ..
+            } => opcode::OpenAt::new(types::Fd(dir.as_raw_fd()), path.as_ptr())
+                .flags(*flags | libc::O_CLOEXEC)
+                .mode(*mode)
+                .build(),
+            Operation::Statx { dir, path, stat } => opcode::Statx::new(
+                types::Fd(dir.as_raw_fd()),
+                path.as_ptr(),
+                std::ptr::from_mut::<libc::statx>(stat).cast(),
+            )
+            .flags(libc::AT_EMPTY_PATH)
+            .mask(libc::STATX_TYPE | libc::STATX_SIZE | libc::STATX_MTIME)
+            .build(),
+            Operation::RenameAt { dir, from, to } => {
+                let dir = types::Fd(dir.as_raw_fd());
+                opcode::RenameAt::new(dir, from.as_ptr(), dir, to.as_ptr()).build()
+            }
+            Operation::UnlinkAt { dir, path, flags } => {
+                opcode::UnlinkAt::new(types::Fd(dir.as_raw_fd()), path.as_ptr())
+                    .flags(*flags)
+                    .build()
+            }
+            Operation::MkdirAt { dir, path, mode } => {
+                opcode::MkDirAt::new(types::Fd(dir.as_raw_fd()), path.as_ptr())
+                    .mode(*mode)
+                    .build()
+            }
+            Operation::Fdatasync { fd } => opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
+                .flags(types::FsyncFlags::DATASYNC)
+                .build(),
+            Operation::Truncate { fd, len } => {
+                opcode::Ftruncate::new(types::Fd(fd.as_raw_fd()), *len).build()
             }
         }
     }
@@ -145,11 +225,16 @@ pub(crate) struct Completion {
 
 impl Completion {
     pub(crate) fn new(result: i32, mut operation: Operation) -> Self {
-        if let (Operation::Accept { accepted, .. }, 0..) = (&mut operation, result) {
-            // SAFETY: a successful accept returns a new descriptor that
-            // nothing else owns. Taking it here, before anyone can drop
-            // the completion, is what keeps it from leaking.
-            *accepted = Some(unsafe { OwnedFd::from_raw_fd(result) });
+        let new_fd = match &mut operation {
+            Operation::Accept { accepted, .. } => Some(accepted),
+            Operation::OpenAt { opened, .. } => Some(opened),
+            _ => None,
+        };
+        if let (Some(new_fd), 0..) = (new_fd, result) {
+            // SAFETY: a successful accept or open returns a new descriptor
+            // that nothing else owns. Taking it here, before anyone can
+            // drop the completion, is what keeps it from leaking.
+            *new_fd = Some(unsafe { OwnedFd::from_raw_fd(result) });
         }
         let result = if result < 0 {
             Err(io::Error::from_raw_os_error(-result))

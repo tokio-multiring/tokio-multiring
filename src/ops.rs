@@ -1,3 +1,4 @@
+use std::ffi::CString;
 use std::future::Future;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -171,7 +172,7 @@ impl Sidecar {
             };
             let result = completion.result.map(|read| {
                 let read = read as usize;
-                buf.advance(read);
+                buf.grow(read);
                 read
             });
             (result, buf)
@@ -254,9 +255,9 @@ impl Sidecar {
     }
 
     /// Receives from the socket `fd` into the spare capacity of `buf`,
-    /// extending its contents by the number of bytes received. Completes as
-    /// soon as any bytes have arrived; `Ok(0)` means the peer has shut down
-    /// its side, or that `buf` had no spare capacity.
+    /// extending its contents by the number of bytes received, which is at
+    /// most `limit`. Completes as soon as any bytes have arrived; `Ok(0)`
+    /// means the peer has shut down its side, or that there was no room.
     ///
     /// The buffer is handed back whether or not the receive succeeds. If the
     /// future is dropped before it completes, the receive is cancelled and
@@ -266,8 +267,9 @@ impl Sidecar {
         &self,
         fd: Arc<OwnedFd>,
         buf: FixedBuf,
+        limit: usize,
     ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
-        let op = Op::new(self, Operation::Recv { fd, buf });
+        let op = Op::new(self, Operation::Recv { fd, buf, limit });
         async move {
             let completion = op.await;
             let Operation::Recv { mut buf, .. } = completion.operation else {
@@ -275,26 +277,32 @@ impl Sidecar {
             };
             let result = completion.result.map(|received| {
                 let received = received as usize;
-                buf.advance(received);
+                buf.grow(received);
                 received
             });
             (result, buf)
         }
     }
 
-    /// Sends the contents of `buf` on the socket `fd`. The kernel keeps
-    /// going until everything is sent, so a count short of the contents
-    /// means the connection failed part of the way through.
+    /// Sends the contents of `buf` from position `start` on, on the socket
+    /// `fd`. The kernel keeps going until everything is sent, so a count
+    /// short of that means the connection failed part of the way through.
     ///
     /// A peer that has gone away is reported as `BrokenPipe`, without
     /// raising `SIGPIPE`. The buffer is handed back whether or not the send
     /// succeeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `start` is past the end of the contents.
     pub fn send(
         &self,
         fd: Arc<OwnedFd>,
         buf: FixedBuf,
+        start: usize,
     ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
-        let op = Op::new(self, Operation::Send { fd, buf });
+        assert!(start <= buf.len());
+        let op = Op::new(self, Operation::Send { fd, buf, start });
         async move {
             let completion = op.await;
             let Operation::Send { buf, .. } = completion.operation else {
@@ -303,4 +311,147 @@ impl Sidecar {
             (completion.result.map(|sent| sent as usize), buf)
         }
     }
+
+    /// Opens `path`, relative to the directory `dir`, as `openat(2)` does.
+    /// Close-on-exec is always set.
+    pub fn open_at(
+        &self,
+        dir: Arc<OwnedFd>,
+        path: CString,
+        flags: i32,
+        mode: u32,
+    ) -> impl Future<Output = io::Result<OwnedFd>> + Send + use<> {
+        let op = Op::new(
+            self,
+            Operation::OpenAt {
+                dir,
+                path,
+                flags,
+                mode,
+                opened: None,
+            },
+        );
+        async move {
+            let completion = op.await;
+            completion.result?;
+            let Operation::OpenAt { opened, .. } = completion.operation else {
+                unreachable!("a completion carries the operation it was submitted with")
+            };
+            Ok(opened.expect("a successful open carries its descriptor"))
+        }
+    }
+
+    /// Looks up the file `path`, relative to the directory `dir`, following
+    /// symbolic links.
+    pub fn stat_at(
+        &self,
+        dir: Arc<OwnedFd>,
+        path: CString,
+    ) -> impl Future<Output = io::Result<FileStat>> + Send + use<> {
+        // SAFETY: `statx` is plain data, for which all zeroes is valid.
+        let stat = Box::new(unsafe { std::mem::zeroed() });
+        let op = Op::new(self, Operation::Statx { dir, path, stat });
+        async move {
+            let completion = op.await;
+            completion.result?;
+            let Operation::Statx { stat, .. } = completion.operation else {
+                unreachable!("a completion carries the operation it was submitted with")
+            };
+            Ok(FileStat {
+                size: stat.stx_size,
+                modified: (stat.stx_mtime.tv_sec, stat.stx_mtime.tv_nsec),
+                is_dir: u32::from(stat.stx_mode) & libc::S_IFMT == libc::S_IFDIR,
+            })
+        }
+    }
+
+    /// Looks up the open file `fd`.
+    pub fn stat(
+        &self,
+        fd: Arc<OwnedFd>,
+    ) -> impl Future<Output = io::Result<FileStat>> + Send + use<> {
+        self.stat_at(fd, CString::default())
+    }
+
+    /// Renames `from` to `to`, both relative to the directory `dir`,
+    /// replacing `to` if it exists.
+    pub fn rename_at(
+        &self,
+        dir: Arc<OwnedFd>,
+        from: CString,
+        to: CString,
+    ) -> impl Future<Output = io::Result<()>> + Send + use<> {
+        self.unit(Operation::RenameAt { dir, from, to })
+    }
+
+    /// Removes the file `path`, relative to the directory `dir`.
+    pub fn unlink_at(
+        &self,
+        dir: Arc<OwnedFd>,
+        path: CString,
+    ) -> impl Future<Output = io::Result<()>> + Send + use<> {
+        self.unit(Operation::UnlinkAt {
+            dir,
+            path,
+            flags: 0,
+        })
+    }
+
+    /// Removes the empty directory `path`, relative to the directory `dir`.
+    pub fn rmdir_at(
+        &self,
+        dir: Arc<OwnedFd>,
+        path: CString,
+    ) -> impl Future<Output = io::Result<()>> + Send + use<> {
+        self.unit(Operation::UnlinkAt {
+            dir,
+            path,
+            flags: libc::AT_REMOVEDIR,
+        })
+    }
+
+    /// Creates the directory `path`, relative to the directory `dir`.
+    pub fn mkdir_at(
+        &self,
+        dir: Arc<OwnedFd>,
+        path: CString,
+        mode: u32,
+    ) -> impl Future<Output = io::Result<()>> + Send + use<> {
+        self.unit(Operation::MkdirAt { dir, path, mode })
+    }
+
+    /// Has the data of `fd`, and the metadata needed to read it back, reach
+    /// the device, as `fdatasync(2)` does.
+    pub fn fdatasync(
+        &self,
+        fd: Arc<OwnedFd>,
+    ) -> impl Future<Output = io::Result<()>> + Send + use<> {
+        self.unit(Operation::Fdatasync { fd })
+    }
+
+    /// Sets the size of the file `fd` to `len` bytes.
+    pub fn truncate(
+        &self,
+        fd: Arc<OwnedFd>,
+        len: u64,
+    ) -> impl Future<Output = io::Result<()>> + Send + use<> {
+        self.unit(Operation::Truncate { fd, len })
+    }
+
+    /// Runs an operation whose result carries nothing but success.
+    fn unit(&self, operation: Operation) -> impl Future<Output = io::Result<()>> + Send + use<> {
+        let op = Op::new(self, operation);
+        async move { op.await.result.map(drop) }
+    }
+}
+
+/// What [`Sidecar::stat`] reports about a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStat {
+    /// Size in bytes.
+    pub size: u64,
+    /// Time of the last change to the contents, as seconds and nanoseconds
+    /// since the Unix epoch.
+    pub modified: (i64, u32),
+    pub is_dir: bool,
 }

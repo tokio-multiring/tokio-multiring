@@ -302,8 +302,9 @@ impl Sidecar {
         self.inner.buffers.as_ref()
     }
 
-    /// Whether the workers have polled disk rings.
-    pub(crate) fn has_disk_rings(&self) -> bool {
+    /// Whether the workers have polled disk rings, for the `*_polled`
+    /// operations.
+    pub fn has_disk_rings(&self) -> bool {
         self.inner.disk.is_some()
     }
 

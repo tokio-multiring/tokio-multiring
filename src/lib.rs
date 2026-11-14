@@ -42,5 +42,6 @@ mod plan;
 mod reactor;
 
 pub use buffers::{BufferPool, FixedBuf};
+pub use ops::FileStat;
 pub use plan::{Domain, Hyperthreads, Plan};
 pub use reactor::{Config, DiskConfig, Sidecar, before_steal};
