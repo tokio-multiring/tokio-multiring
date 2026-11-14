@@ -1,109 +1,103 @@
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::{Context, Poll, Waker};
+use std::task::Waker;
 
 use io_uring::{IoUring, opcode, squeue};
-use slab::Slab;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc};
 
+use crate::landing::{Arbiter, CellRef, Claim, TaskRef};
 use crate::op::{Completion, Operation};
 
 /// `user_data` of submissions whose completion nobody waits for. Operation
-/// tokens carry a slab key in their low 32 bits, which never reaches
+/// tokens carry a slot index in their low 32 bits, which never reaches
 /// `u32::MAX`, so the two cannot collide.
 const DETACHED: u64 = u64::MAX;
+
+/// Arbiters are allocated this many at a time.
+const CHUNK: usize = 64;
+
+/// How many leases a reactor moves between its own free list and its pool
+/// at a time.
+const BATCH: usize = 32;
 
 thread_local! {
     static CURRENT: RefCell<Option<Rc<Reactor>>> = const { RefCell::new(None) };
 }
 
-enum Stage {
-    /// The future is waiting for the result.
-    Waiting(Waker),
-    /// The result is in, and the future has not collected it yet.
-    Done(i32),
-    /// The future was dropped. The slot is released when the kernel is done
-    /// with the operation.
-    Abandoned,
+/// The right to start an operation in slot `index` of a reactor, with the
+/// arbiter that goes with the slot.
+#[derive(Clone, Copy)]
+struct Lease {
+    index: u32,
+    cell: CellRef,
 }
 
-struct Slot {
-    token: u64,
-    operation: Operation,
-    stage: Stage,
-    /// Whether the operation has been queued for the kernel, which from then
-    /// on may use its buffers until the completion arrives.
-    in_kernel: bool,
-}
-
-/// Work handed to a reactor by a thread that does not own its ring. The
-/// tokens name slots in that reactor's `Operations`.
+/// Work handed to a reactor by a thread that does not own its ring.
 enum Remote {
-    Submit(u64),
+    Submit {
+        lease: Lease,
+        generation: u32,
+        task: TaskRef,
+        operation: Operation,
+    },
     Cancel(u64),
 }
 
-/// A worker's operations, from submission until the future has collected the
-/// result. Futures reach their slot from whichever thread polls them.
+/// What other threads share with a worker's reactor: the arbiters, and the
+/// way in for threads that have no ring of their own.
 #[derive(Default)]
-struct Operations {
-    slots: Slab<Slot>,
-    /// Distinguishes successive users of one slab key, so a cancel that
-    /// arrives after its target completed cannot hit the key's next user.
-    generation: u32,
-    remote: Vec<Remote>,
-    /// Set when the reactor is gone. Nothing completes after that.
+struct Pool {
+    chunks: Vec<NonNull<[Arbiter]>>,
+    /// Leases not held by the reactor's own free list.
+    free: Vec<Lease>,
+    queue: Vec<Remote>,
+    /// Set when the reactor is gone. Nothing is accepted after that.
     closed: bool,
 }
 
-impl Operations {
-    fn insert(&mut self, operation: Operation, waker: &Waker, in_kernel: bool) -> u64 {
-        let slot = self.slots.vacant_entry();
-        let token = u64::from(self.generation) << 32 | slot.key() as u64;
-        self.generation = self.generation.wrapping_add(1);
-        slot.insert(Slot {
-            token,
-            operation,
-            stage: Stage::Waiting(waker.clone()),
-            in_kernel,
-        });
-        token
+// SAFETY: the chunks are plain heap allocations of atomics, owned by the
+// pool.
+unsafe impl Send for Pool {}
+
+impl Pool {
+    fn lease(&mut self) -> Lease {
+        if self.free.is_empty() {
+            self.grow();
+        }
+        self.free.pop().expect("pool was just grown")
     }
 
-    fn get_mut(&mut self, token: u64) -> Option<&mut Slot> {
-        self.slots
-            .get_mut(key_of(token))
-            .filter(|slot| slot.token == token)
+    fn grow(&mut self) {
+        let chunk: Box<[Arbiter]> = (0..CHUNK).map(|_| Arbiter::new()).collect();
+        // Held as a raw pointer: the arbiters are referred to from futures
+        // and from the reactor for as long as the pool lives.
+        let chunk = NonNull::from(Box::leak(chunk));
+        let base = self.chunks.len() * CHUNK;
+        self.chunks.push(chunk);
+        let first = chunk.cast::<Arbiter>();
+        self.free.extend((0..CHUNK).map(|offset| Lease {
+            index: u32::try_from(base + offset).expect("more than u32::MAX operations in flight"),
+            // SAFETY: `offset` is within the chunk.
+            cell: CellRef::new(unsafe { first.add(offset) }),
+        }));
     }
+}
 
-    fn remove(&mut self, token: u64) -> Slot {
-        self.slots.remove(key_of(token))
-    }
-
-    /// Records the kernel's result for `token`. Waking the future and
-    /// dropping an abandoned operation both run foreign code, so they are
-    /// left to the caller to do once the lock is released.
-    fn finish(
-        &mut self,
-        token: u64,
-        result: i32,
-        wakers: &mut Vec<Waker>,
-        released: &mut Vec<Slot>,
-    ) {
-        let slot = self
-            .get_mut(token)
-            .expect("completion for an operation that is not in flight");
-        match std::mem::replace(&mut slot.stage, Stage::Done(result)) {
-            Stage::Waiting(waker) => wakers.push(waker),
-            Stage::Abandoned => released.push(self.remove(token)),
-            Stage::Done(_) => unreachable!("operation completed twice"),
+impl Drop for Pool {
+    fn drop(&mut self) {
+        for chunk in self.chunks.drain(..) {
+            // SAFETY: allocated as a `Box` in `grow`. The pool is dropped
+            // with the sidecar's last handle, when no future and no reactor
+            // is left to use an arbiter.
+            drop(unsafe { Box::from_raw(chunk.as_ptr()) });
         }
     }
 }
@@ -111,31 +105,36 @@ impl Operations {
 /// The part of a reactor that other threads can reach.
 #[derive(Default)]
 struct Shared {
-    operations: Mutex<Operations>,
+    pool: Mutex<Pool>,
     /// Wakes the driver task.
     wake: Notify,
     in_flight: AtomicUsize,
 }
 
 impl Shared {
-    fn operations(&self) -> MutexGuard<'_, Operations> {
-        self.operations
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn pool(&self) -> MutexGuard<'_, Pool> {
+        self.pool.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-/// Names an in-flight operation: the worker whose ring runs it, and its
-/// token there.
-#[derive(Clone, Copy)]
-pub(crate) struct Ticket {
-    worker: usize,
-    token: u64,
 }
 
 struct Inner {
     workers: Box<[Shared]>,
     next_remote: AtomicUsize,
+}
+
+/// Names an in-flight operation: the worker whose ring runs it, its token
+/// there, and its arbiter.
+#[derive(Clone, Copy)]
+pub(crate) struct Ticket {
+    worker: usize,
+    token: u64,
+    cell: CellRef,
+}
+
+impl Ticket {
+    pub(crate) fn generation(&self) -> u32 {
+        generation_of(self.token)
+    }
 }
 
 /// Settings for the per-worker rings.
@@ -200,8 +199,8 @@ impl Sidecar {
         Ok(Sidecar { inner })
     }
 
-    /// Number of operations submitted to the kernel and not yet completed,
-    /// across all workers.
+    /// Number of operations handed to a ring and not yet completed, across
+    /// all workers.
     pub fn in_flight(&self) -> usize {
         self.inner
             .workers
@@ -211,106 +210,81 @@ impl Sidecar {
     }
 
     /// Hands `operation` to a ring: the current worker's if this thread has
-    /// one, otherwise the next in rotation. `waker` is woken when the result
-    /// is ready for [`poll_completion`](Self::poll_completion).
-    pub(crate) fn submit(&self, mut operation: Operation, waker: &Waker) -> Ticket {
+    /// one, otherwise the next in rotation. The result is written to `task`,
+    /// whose waker must already be set.
+    pub(crate) fn submit(&self, operation: Operation, task: TaskRef) -> Ticket {
         match self.local() {
             Some(reactor) => {
-                let entry = operation.entry();
-                let token = reactor.shared().operations().insert(operation, waker, true);
-                reactor.push_operation(token, entry);
+                let lease = reactor.lease();
+                // SAFETY: `self` keeps the pool alive.
+                let generation = unsafe { lease.cell.get() }.arm();
+                let token = reactor.start(lease, generation, task, operation);
                 if !reactor.hook_seen.get() {
                     reactor.notify_driver();
                 }
                 Ticket {
                     worker: reactor.index,
                     token,
+                    cell: lease.cell,
                 }
             }
             None => {
                 let rotation = self.inner.next_remote.fetch_add(1, Ordering::Relaxed);
                 let worker = rotation % self.inner.workers.len();
                 let shared = &self.inner.workers[worker];
-                let token = {
-                    let mut operations = shared.operations();
-                    let token = operations.insert(operation, waker, false);
-                    operations.remote.push(Remote::Submit(token));
-                    token
+
+                let mut pool = shared.pool();
+                let lease = pool.lease();
+                // SAFETY: `self` keeps the pool alive.
+                let generation = unsafe { lease.cell.get() }.arm();
+                // With the reactor gone the operation is dropped, and its
+                // future stays pending.
+                let orphan = if pool.closed {
+                    Some(operation)
+                } else {
+                    pool.queue.push(Remote::Submit {
+                        lease,
+                        generation,
+                        task,
+                        operation,
+                    });
+                    None
                 };
+                drop(pool);
+                drop(orphan);
                 shared.wake.notify_one();
-                Ticket { worker, token }
-            }
-        }
-    }
 
-    /// Collects the result of `ticket`'s operation, or registers the task
-    /// to be woken for it. Once this returns `Ready` the ticket is spent.
-    ///
-    /// Stays pending forever if the reactor has gone away with its runtime.
-    pub(crate) fn poll_completion(&self, ticket: Ticket, cx: &mut Context<'_>) -> Poll<Completion> {
-        let mut operations = self.inner.workers[ticket.worker].operations();
-        if operations.closed {
-            return Poll::Pending;
-        }
-        let slot = operations
-            .get_mut(ticket.token)
-            .expect("ticket for an operation that is not in flight");
-        match &mut slot.stage {
-            Stage::Waiting(waker) => {
-                let replaced = (!waker.will_wake(cx.waker()))
-                    .then(|| std::mem::replace(waker, cx.waker().clone()));
-                // A waker's destructor is foreign code: run it unlocked.
-                drop(operations);
-                drop(replaced);
-                Poll::Pending
-            }
-            Stage::Done(result) => {
-                let result = *result;
-                let slot = operations.remove(ticket.token);
-                Poll::Ready(Completion::new(result, slot.operation))
-            }
-            Stage::Abandoned => unreachable!("ticket used after it was abandoned"),
-        }
-    }
-
-    /// Gives up on `ticket`'s operation. If the kernel already has it, it is
-    /// asked to cancel, and the operation's buffers are kept until it has
-    /// answered.
-    pub(crate) fn abandon(&self, ticket: Ticket) {
-        let Ticket { worker, token } = ticket;
-        let shared = &self.inner.workers[worker];
-        let local = self.local().filter(|reactor| reactor.index == worker);
-
-        let mut operations = shared.operations();
-        if operations.closed {
-            return;
-        }
-        let slot = operations
-            .get_mut(token)
-            .expect("ticket for an operation that is not in flight");
-        if let Stage::Done(_) = slot.stage {
-            let finished = operations.remove(token);
-            drop(operations);
-            drop(finished);
-            return;
-        }
-        let waiting = std::mem::replace(&mut slot.stage, Stage::Abandoned);
-        // Not queued yet: the reactor releases the slot when it gets to the
-        // pending `Remote::Submit`.
-        let in_kernel = slot.in_kernel;
-        if in_kernel && local.is_none() {
-            operations.remote.push(Remote::Cancel(token));
-        }
-        drop(operations);
-        drop(waiting);
-
-        if in_kernel {
-            match local {
-                Some(reactor) => {
-                    reactor.push_cancel(token);
-                    reactor.notify_driver();
+                Ticket {
+                    worker,
+                    token: token_of(generation, lease.index),
+                    cell: lease.cell,
                 }
-                None => shared.wake.notify_one(),
+            }
+        }
+    }
+
+    /// The arbiter of `ticket`'s operation.
+    pub(crate) fn arbiter(&self, ticket: &Ticket) -> &Arbiter {
+        // SAFETY: the ticket came from this sidecar, which keeps the pool
+        // alive for as long as it is borrowed.
+        unsafe { ticket.cell.get() }
+    }
+
+    /// Asks the kernel to cut short an operation whose future is gone.
+    pub(crate) fn cancel(&self, ticket: Ticket) {
+        match self.local() {
+            Some(reactor) if reactor.index == ticket.worker => {
+                reactor.cancel(ticket.token);
+                reactor.notify_driver();
+            }
+            _ => {
+                let shared = &self.inner.workers[ticket.worker];
+                let mut pool = shared.pool();
+                if !pool.closed {
+                    pool.queue.push(Remote::Cancel(ticket.token));
+                    drop(pool);
+                    shared.wake.notify_one();
+                }
             }
         }
     }
@@ -355,13 +329,27 @@ pub fn before_steal() {
     }
 }
 
+/// An operation the kernel has, or is about to get.
+struct InFlight {
+    token: u64,
+    cell: CellRef,
+    task: TaskRef,
+    operation: Operation,
+}
+
 /// One worker's ring. Only ever touched from that worker's thread.
 struct Reactor {
     ring: RefCell<IoUring>,
+    /// In-flight operations, indexed by the low half of their token.
+    slots: RefCell<Vec<Option<InFlight>>>,
+    /// Leases for slots that are empty.
+    free: RefCell<Vec<Lease>>,
+    /// Results whose future was busy with its waker when they came in.
+    deferred: RefCell<Vec<(u64, i32)>>,
     /// Scratch space for `turn` and `reap`, kept to reuse the allocations.
     remote: RefCell<Vec<Remote>>,
     wakers: RefCell<Vec<Waker>>,
-    released: RefCell<Vec<Slot>>,
+    released: RefCell<Vec<Operation>>,
     /// Whether the driver task has been woken since its last turn.
     driver_notified: Cell<bool>,
     /// Whether [`before_steal`] runs on this thread. Until it has been seen,
@@ -403,6 +391,9 @@ impl Reactor {
 
             let reactor = Rc::new(Reactor {
                 ring: RefCell::new(ring),
+                slots: RefCell::new(Vec::new()),
+                free: RefCell::new(Vec::new()),
+                deferred: RefCell::new(Vec::new()),
                 remote: RefCell::new(Vec::new()),
                 wakers: RefCell::new(Vec::new()),
                 released: RefCell::new(Vec::new()),
@@ -442,64 +433,134 @@ impl Reactor {
         }
     }
 
-    /// Queues the submission of an operation whose slot is marked
-    /// `in_kernel`. If it cannot be queued, the operation fails with the
-    /// error.
-    fn push_operation(&self, token: u64, entry: squeue::Entry) {
-        match self.push(&entry.user_data(token)) {
-            Ok(()) => {
-                self.shared().in_flight.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(error) => {
-                let result = -error.raw_os_error().unwrap_or(libc::EIO);
-                let mut wakers = self.wakers.take();
-                let mut released = self.released.take();
-                self.shared()
-                    .operations()
-                    .finish(token, result, &mut wakers, &mut released);
-                self.deliver(wakers, released);
-            }
+    fn lease(&self) -> Lease {
+        let mut free = self.free.borrow_mut();
+        if let Some(lease) = free.pop() {
+            return lease;
+        }
+        let mut pool = self.shared().pool();
+        while pool.free.len() < BATCH {
+            pool.grow();
+        }
+        let keep = pool.free.len() - BATCH;
+        free.extend(pool.free.drain(keep..));
+        free.pop().expect("a batch was just taken")
+    }
+
+    fn release(&self, lease: Lease) {
+        let mut free = self.free.borrow_mut();
+        free.push(lease);
+        // Operations submitted by other threads bring their lease from the
+        // pool and leave it here, so the surplus goes back.
+        if free.len() > 2 * BATCH {
+            self.shared().pool().free.extend(free.drain(BATCH..));
         }
     }
 
-    /// Submits an operation that another thread put into `Operations`.
-    fn submit_remote(&self, token: u64) {
-        let mut operations = self.shared().operations();
-        let slot = operations
-            .get_mut(token)
-            .expect("remote submission without a slot");
-        if let Stage::Abandoned = slot.stage {
-            let abandoned = operations.remove(token);
-            drop(operations);
-            drop(abandoned);
-            return;
+    /// Puts an operation with an armed arbiter into its slot and queues it
+    /// for the kernel. Returns its token.
+    fn start(&self, lease: Lease, generation: u32, task: TaskRef, mut operation: Operation) -> u64 {
+        let token = token_of(generation, lease.index);
+        let entry = operation.entry().user_data(token);
+        {
+            let mut slots = self.slots.borrow_mut();
+            let index = lease.index as usize;
+            if slots.len() <= index {
+                slots.resize_with(index + 1, || None);
+            }
+            debug_assert!(slots[index].is_none());
+            slots[index] = Some(InFlight {
+                token,
+                cell: lease.cell,
+                task,
+                operation,
+            });
         }
-        slot.in_kernel = true;
-        let entry = slot.operation.entry();
-        drop(operations);
-        self.push_operation(token, entry);
+        self.shared().in_flight.fetch_add(1, Ordering::Relaxed);
+
+        if let Err(error) = self.push(&entry) {
+            let result = -error.raw_os_error().unwrap_or(libc::EIO);
+            let mut wakers = self.wakers.take();
+            let mut released = self.released.take();
+            if !self.resolve(token, result, &mut wakers, &mut released) {
+                self.deferred.borrow_mut().push((token, result));
+                self.notify_driver();
+            }
+            self.deliver(wakers, released);
+        }
+        token
     }
 
-    /// Cancels `token` at another thread's request, unless its completion
-    /// has arrived in the meantime.
+    /// Ends the operation `token` with `result`: writes it into the waiting
+    /// future, or releases the operation if the future is gone. Returns
+    /// `false`, leaving everything in place, if the future is busy.
+    ///
+    /// Waking the future and dropping an abandoned operation are left to
+    /// the caller, to be done with no borrow held.
+    fn resolve(
+        &self,
+        token: u64,
+        result: i32,
+        wakers: &mut Vec<Waker>,
+        released: &mut Vec<Operation>,
+    ) -> bool {
+        let generation = generation_of(token);
+        let finished = {
+            let mut slots = self.slots.borrow_mut();
+            let slot = &mut slots[key_of(token)];
+            let in_flight = slot
+                .as_ref()
+                .expect("completion for an operation that is not in flight");
+            debug_assert_eq!(in_flight.token, token);
+
+            // SAFETY: the reactor keeps the pool alive.
+            let deliver = match unsafe { in_flight.cell.get() }.claim(generation) {
+                Claim::Deliver => true,
+                Claim::Abandoned => false,
+                Claim::Busy => return false,
+            };
+            let finished = slot.take().expect("checked above");
+            if deliver {
+                let completion = Completion::new(result, finished.operation);
+                // SAFETY: the claim was granted, so the future is alive and
+                // leaves its landing alone until the delivery is complete.
+                wakers.extend(unsafe { finished.task.get().deliver(completion) });
+            } else {
+                released.push(finished.operation);
+            }
+            finished.cell
+        };
+
+        // SAFETY: as above.
+        unsafe { finished.get() }.retire(generation);
+        self.release(Lease {
+            index: key_of(token) as u32,
+            cell: finished,
+        });
+        self.shared().in_flight.fetch_sub(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Cancels `token` if it is still in flight.
     fn cancel(&self, token: u64) {
-        let live = self.shared().operations().get_mut(token).is_some();
+        let live = self
+            .slots
+            .borrow()
+            .get(key_of(token))
+            .and_then(Option::as_ref)
+            .is_some_and(|in_flight| in_flight.token == token);
         if live {
-            self.push_cancel(token);
+            let entry = opcode::AsyncCancel::new(token).build().user_data(DETACHED);
+            // A cancel that cannot be queued is dropped: the operation then
+            // runs to its natural completion.
+            let _ = self.push(&entry);
         }
-    }
-
-    fn push_cancel(&self, token: u64) {
-        let entry = opcode::AsyncCancel::new(token).build().user_data(DETACHED);
-        // A cancel that cannot be queued is dropped: the operation then runs
-        // to its natural completion.
-        let _ = self.push(&entry);
     }
 
     /// Wakes the futures whose results are in and drops the operations
     /// nobody is waiting for. Both run foreign code, so the caller must hold
-    /// no lock or borrow.
-    fn deliver(&self, mut wakers: Vec<Waker>, mut released: Vec<Slot>) {
+    /// no borrow.
+    fn deliver(&self, mut wakers: Vec<Waker>, mut released: Vec<Operation>) {
         released.clear();
         for waker in wakers.drain(..) {
             waker.wake();
@@ -514,8 +575,8 @@ impl Reactor {
         let mut ring = self.ring.borrow_mut();
         loop {
             // SAFETY: every pointer in `entry` refers to heap memory owned by
-            // an operation whose slot is marked `in_kernel`. Such a slot is
-            // only released once the kernel has posted its completion.
+            // an operation held in `slots`, which is only released once the
+            // kernel has posted that operation's completion.
             if unsafe { ring.submission().push(entry) }.is_ok() {
                 return Ok(());
             }
@@ -531,10 +592,26 @@ impl Reactor {
     /// completions that are ready.
     fn turn(&self) {
         let mut remote = self.remote.take();
-        std::mem::swap(&mut remote, &mut self.shared().operations().remote);
+        std::mem::swap(&mut remote, &mut self.shared().pool().queue);
         for remote in remote.drain(..) {
             match remote {
-                Remote::Submit(token) => self.submit_remote(token),
+                Remote::Submit {
+                    lease,
+                    generation,
+                    task,
+                    operation,
+                } => {
+                    // SAFETY: the reactor keeps the pool alive.
+                    let cell = unsafe { lease.cell.get() };
+                    if cell.is_abandoned(generation) {
+                        // Dropped before it got here: not worth a trip to
+                        // the kernel.
+                        cell.retire(generation);
+                        self.release(lease);
+                    } else {
+                        self.start(lease, generation, task, operation);
+                    }
+                }
                 Remote::Cancel(token) => self.cancel(token),
             }
         }
@@ -595,41 +672,55 @@ impl Reactor {
     fn reap(&self) {
         let mut wakers = self.wakers.take();
         let mut released = self.released.take();
-        let mut finished = 0;
+        let mut deferred = self.deferred.take();
+
+        deferred
+            .retain(|&(token, result)| !self.resolve(token, result, &mut wakers, &mut released));
         {
             let mut ring = self.ring.borrow_mut();
-            let completions = ring.completion();
-            if !completions.is_empty() {
-                let mut operations = self.shared().operations();
-                for cqe in completions {
-                    let token = cqe.user_data();
-                    if token != DETACHED {
-                        operations.finish(token, cqe.result(), &mut wakers, &mut released);
-                        finished += 1;
-                    }
+            for cqe in ring.completion() {
+                let token = cqe.user_data();
+                if token != DETACHED
+                    && !self.resolve(token, cqe.result(), &mut wakers, &mut released)
+                {
+                    deferred.push((token, cqe.result()));
                 }
             }
         }
-        self.shared()
-            .in_flight
-            .fetch_sub(finished, Ordering::Relaxed);
+        // A future only keeps its waker locked for a moment: come back soon.
+        if !deferred.is_empty() {
+            self.notify_driver();
+        }
+        self.deferred.replace(deferred);
         self.deliver(wakers, released);
     }
 }
 
 impl Drop for Reactor {
     fn drop(&mut self) {
+        let unsent = {
+            let mut pool = self.shared().pool();
+            pool.closed = true;
+            std::mem::take(&mut pool.queue)
+        };
+        drop(unsent);
         // Closing the ring does not wait for in-flight operations to stop,
         // so the kernel may write into their buffers after this point. They
         // are leaked rather than freed.
-        let mut operations = self.shared().operations();
-        operations.closed = true;
-        std::mem::forget(std::mem::take(&mut operations.slots));
+        std::mem::forget(std::mem::take(self.slots.get_mut()));
     }
+}
+
+fn token_of(generation: u32, index: u32) -> u64 {
+    u64::from(generation) << 32 | u64::from(index)
 }
 
 fn key_of(token: u64) -> usize {
     (token & u64::from(u32::MAX)) as usize
+}
+
+fn generation_of(token: u64) -> u32 {
+    (token >> 32) as u32
 }
 
 /// The ring's descriptor, borrowed for readiness notifications. The ring

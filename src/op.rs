@@ -7,13 +7,15 @@ use std::task::{Context, Poll};
 
 use io_uring::{opcode, squeue, types};
 
+use crate::landing::{Landing, TaskRef};
 use crate::reactor::{Sidecar, Ticket};
 
 /// An operation and everything the kernel needs kept alive while it runs.
 ///
-/// While in flight the value lives in its reactor's slab, which moves its
-/// entries when it grows. A submission may therefore point at heap memory
-/// the operation owns, but never at the operation value itself.
+/// The value moves while in flight: into its reactor's slots, which are
+/// reallocated as they grow, and from there into the future. A submission
+/// may therefore point at heap memory the operation owns, but never at the
+/// operation value itself.
 pub(crate) enum Operation {
     Nop,
     ReadAt {
@@ -80,9 +82,14 @@ enum Progress {
 }
 
 /// Future of a single operation.
+///
+/// Once polled, the reactor running the operation holds a pointer to
+/// `landing`. `Landing` is `!Unpin`, which pins this future in place, and
+/// `Drop` makes sure the reactor has let go before the memory is released.
 pub(crate) struct Op {
     sidecar: Sidecar,
     progress: Progress,
+    landing: Landing,
 }
 
 impl Op {
@@ -90,6 +97,7 @@ impl Op {
         Self {
             sidecar: sidecar.clone(),
             progress: Progress::Idle(operation),
+            landing: Landing::new(),
         }
     }
 }
@@ -97,21 +105,38 @@ impl Op {
 impl Future for Op {
     type Output = Completion;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Completion> {
-        let this = &mut *self;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Completion> {
+        // SAFETY: nothing is moved out of `this` but `progress`, which
+        // nobody points at. The landing is only used through shared
+        // references.
+        let this = unsafe { self.get_unchecked_mut() };
         match std::mem::replace(&mut this.progress, Progress::Finished) {
             Progress::Idle(operation) => {
-                let ticket = this.sidecar.submit(operation, cx.waker());
+                // SAFETY: no reactor knows about the landing yet.
+                unsafe { this.landing.set_waker(cx.waker()) };
+                let ticket = this.sidecar.submit(operation, TaskRef::new(&this.landing));
                 this.progress = Progress::InFlight(ticket);
                 Poll::Pending
             }
-            Progress::InFlight(ticket) => match this.sidecar.poll_completion(ticket, cx) {
-                Poll::Ready(completion) => Poll::Ready(completion),
-                Poll::Pending => {
-                    this.progress = Progress::InFlight(ticket);
-                    Poll::Pending
+            Progress::InFlight(ticket) => {
+                // SAFETY: this future owns the landing.
+                if let Some(completion) = unsafe { this.landing.take() } {
+                    return Poll::Ready(completion);
                 }
-            },
+                this.progress = Progress::InFlight(ticket);
+
+                let arbiter = this.sidecar.arbiter(&ticket);
+                if arbiter.lock_waker(ticket.generation()) {
+                    // SAFETY: the waker lock is held.
+                    unsafe { this.landing.set_waker(cx.waker()) };
+                    arbiter.unlock_waker(ticket.generation());
+                } else {
+                    // The reactor is delivering right now. It wakes the
+                    // waker it finds, which may not be this one.
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            }
             Progress::Finished => panic!("operation polled after completion"),
         }
     }
@@ -119,8 +144,30 @@ impl Future for Op {
 
 impl Drop for Op {
     fn drop(&mut self) {
-        if let Progress::InFlight(ticket) = self.progress {
-            self.sidecar.abandon(ticket);
+        let Progress::InFlight(ticket) = self.progress else {
+            return;
+        };
+        let arbiter = self.sidecar.arbiter(&ticket);
+        let mut spins = 0u32;
+        loop {
+            if self.landing.is_done() {
+                return;
+            }
+            if arbiter.abandon(ticket.generation()) {
+                break;
+            }
+            // The reactor is in the middle of writing the result here. That
+            // is a handful of instructions, and this memory cannot be
+            // released until they are done.
+            spins += 1;
+            if spins % 64 == 0 {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
         }
+        // The kernel may be using the operation's buffers. They stay with
+        // the reactor, which is asked to cut the operation short.
+        self.sidecar.cancel(ticket);
     }
 }

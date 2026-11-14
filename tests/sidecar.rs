@@ -276,6 +276,126 @@ fn drop_on_another_thread_cancels_a_local_submission() {
     });
 }
 
+/// Futures are submitted on one worker and then polled or dropped on
+/// others, right as their completions are being delivered.
+#[test]
+fn completion_races_with_poll_and_drop_on_other_threads() {
+    type Boxed = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
+
+    runtime().block_on(async {
+        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Boxed>();
+
+        let consumers: Vec<_> = (0..2)
+            .map(|_| {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Boxed>();
+                let consumer = tokio::spawn(async move {
+                    let mut seen = 0u32;
+                    while let Some(op) = rx.recv().await {
+                        seen += 1;
+                        if seen % 2 == 0 {
+                            drop(op);
+                        } else {
+                            op.await.unwrap();
+                        }
+                    }
+                });
+                (tx, consumer)
+            })
+            .collect();
+        let fan_out = tokio::spawn({
+            let senders: Vec<_> = consumers.iter().map(|(tx, _)| tx.clone()).collect();
+            async move {
+                let mut next = 0;
+                while let Some(op) = rx.recv().await {
+                    senders[next % senders.len()].send(op).ok().unwrap();
+                    next += 1;
+                }
+            }
+        });
+
+        let producers: Vec<_> = (0..3)
+            .map(|_| {
+                let sidecar = sidecar.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    for round in 0..20_000 {
+                        let mut op: Boxed = Box::pin(sidecar.nop());
+                        std::future::poll_fn(|cx| {
+                            let _ = op.as_mut().poll(cx);
+                            Poll::Ready(())
+                        })
+                        .await;
+                        tx.send(op).ok().unwrap();
+                        if round % 8 == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+
+        for producer in producers {
+            producer.await.unwrap();
+        }
+        fan_out.await.unwrap();
+        for (tx, consumer) in consumers {
+            drop(tx);
+            consumer.await.unwrap();
+        }
+        wait_for_idle(&sidecar).await;
+    });
+}
+
+/// A read is left pending on a worker's ring. Another thread then completes
+/// it and, a varying few microseconds later, drops the future or polls it
+/// with a new waker, so that this lands before, during and after the
+/// worker's delivery of the result.
+#[test]
+fn delivery_races_with_drop_and_repoll() {
+    type Read = Pin<Box<dyn Future<Output = (std::io::Result<usize>, Vec<u8>)> + Send>>;
+
+    runtime().block_on(async {
+        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+        for round in 0..3000u32 {
+            let (reader, mut writer) = socket_pair();
+            let (parked, read) = tokio::sync::oneshot::channel::<Read>();
+            let handle = sidecar.clone();
+            tokio::spawn(async move {
+                let mut read: Read = Box::pin(handle.read_at(reader, Vec::with_capacity(4), 0));
+                std::future::poll_fn(|cx| {
+                    assert!(read.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert!(parked.send(read).is_ok());
+            });
+            let mut read = read.await.unwrap();
+
+            writer.write_all(b"x").unwrap();
+            let delay = Duration::from_micros(u64::from(round % 40));
+            let start = std::time::Instant::now();
+            while start.elapsed() < delay {
+                std::hint::spin_loop();
+            }
+
+            if round % 2 == 0 {
+                drop(read);
+            } else {
+                let early = std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+                let (result, buf) = match early {
+                    Poll::Ready(output) => output,
+                    Poll::Pending => read.await,
+                };
+                assert_eq!(result.unwrap(), 1);
+                assert_eq!(buf, b"x");
+            }
+        }
+        wait_for_idle(&sidecar).await;
+    });
+}
+
 /// Tasks migrate between workers at every yield, so operations are routinely
 /// polled to completion on a different thread than the one that submitted.
 #[test]
