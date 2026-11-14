@@ -536,13 +536,13 @@ impl Reactor {
                 Claim::Busy => return false,
             };
             let finished = slot.take().expect("checked above");
+            let completion = Completion::new(result, finished.operation);
             if deliver {
-                let completion = Completion::new(result, finished.operation);
                 // SAFETY: the claim was granted, so the future is alive and
                 // leaves its landing alone until the delivery is complete.
                 wakers.extend(unsafe { finished.task.get().deliver(completion) });
             } else {
-                released.push(finished.operation);
+                released.push(completion.operation);
             }
             finished.cell
         };

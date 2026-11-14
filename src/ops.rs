@@ -138,6 +138,88 @@ impl Sidecar {
         }
     }
 
+    /// Waits for a connection on `listener` and returns it, in blocking
+    /// mode and with close-on-exec set.
+    ///
+    /// Sockets used with a sidecar must be in blocking mode: on a
+    /// non-blocking one the kernel reports `WouldBlock` where it would
+    /// otherwise wait. Listeners and streams from `std` are fine as they
+    /// come; ones from tokio are not.
+    ///
+    /// If the future is dropped, a connection that had already been
+    /// accepted for it is closed.
+    pub fn accept(
+        &self,
+        listener: Arc<OwnedFd>,
+    ) -> impl Future<Output = io::Result<OwnedFd>> + Send + use<> {
+        let op = Op::new(
+            self,
+            Operation::Accept {
+                listener,
+                accepted: None,
+            },
+        );
+        async move {
+            let completion = op.await;
+            completion.result?;
+            let Operation::Accept { accepted, .. } = completion.operation else {
+                unreachable!("a completion carries the operation it was submitted with")
+            };
+            Ok(accepted.expect("a successful accept carries its connection"))
+        }
+    }
+
+    /// Receives from the socket `fd` into the spare capacity of `buf`,
+    /// extending its contents by the number of bytes received. Completes as
+    /// soon as any bytes have arrived; `Ok(0)` means the peer has shut down
+    /// its side, or that `buf` had no spare capacity.
+    ///
+    /// The buffer is handed back whether or not the receive succeeds. If the
+    /// future is dropped before it completes, the receive is cancelled and
+    /// the buffer returns to its pool once the kernel is done with it. Bytes
+    /// that arrived in between are lost with it.
+    pub fn recv(
+        &self,
+        fd: Arc<OwnedFd>,
+        buf: FixedBuf,
+    ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
+        let op = Op::new(self, Operation::Recv { fd, buf });
+        async move {
+            let completion = op.await;
+            let Operation::Recv { mut buf, .. } = completion.operation else {
+                unreachable!("a completion carries the operation it was submitted with")
+            };
+            let result = completion.result.map(|received| {
+                let received = received as usize;
+                buf.advance(received);
+                received
+            });
+            (result, buf)
+        }
+    }
+
+    /// Sends the contents of `buf` on the socket `fd`. The kernel keeps
+    /// going until everything is sent, so a count short of the contents
+    /// means the connection failed part of the way through.
+    ///
+    /// A peer that has gone away is reported as `BrokenPipe`, without
+    /// raising `SIGPIPE`. The buffer is handed back whether or not the send
+    /// succeeds.
+    pub fn send(
+        &self,
+        fd: Arc<OwnedFd>,
+        buf: FixedBuf,
+    ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
+        let op = Op::new(self, Operation::Send { fd, buf });
+        async move {
+            let completion = op.await;
+            let Operation::Send { buf, .. } = completion.operation else {
+                unreachable!("a completion carries the operation it was submitted with")
+            };
+            (completion.result.map(|sent| sent as usize), buf)
+        }
+    }
+
     /// A buffer's registered index only means something on rings that have
     /// its pool.
     fn check_registered(&self, buf: &FixedBuf) -> io::Result<()> {

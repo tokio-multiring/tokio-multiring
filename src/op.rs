@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -39,6 +39,19 @@ pub(crate) enum Operation {
         buf: FixedBuf,
         offset: u64,
     },
+    Accept {
+        listener: Arc<OwnedFd>,
+        /// The new connection, once the operation has succeeded.
+        accepted: Option<OwnedFd>,
+    },
+    Recv {
+        fd: Arc<OwnedFd>,
+        buf: FixedBuf,
+    },
+    Send {
+        fd: Arc<OwnedFd>,
+        buf: FixedBuf,
+    },
 }
 
 impl Operation {
@@ -76,6 +89,26 @@ impl Operation {
             )
             .offset(*offset)
             .build(),
+            Operation::Accept { listener, .. } => opcode::Accept::new(
+                types::Fd(listener.as_raw_fd()),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+            .flags(libc::SOCK_CLOEXEC)
+            .build(),
+            Operation::Recv { fd, buf } => opcode::Recv::new(
+                types::Fd(fd.as_raw_fd()),
+                buf.spare_ptr(),
+                io_len(buf.spare_len()),
+            )
+            .build(),
+            // WAITALL has the kernel keep sending until the whole buffer is
+            // out, where it would otherwise stop at a full socket buffer.
+            Operation::Send { fd, buf } => {
+                opcode::Send::new(types::Fd(fd.as_raw_fd()), buf.as_ptr(), io_len(buf.len()))
+                    .flags(libc::MSG_NOSIGNAL | libc::MSG_WAITALL)
+                    .build()
+            }
         }
     }
 }
@@ -92,7 +125,13 @@ pub(crate) struct Completion {
 }
 
 impl Completion {
-    pub(crate) fn new(result: i32, operation: Operation) -> Self {
+    pub(crate) fn new(result: i32, mut operation: Operation) -> Self {
+        if let (Operation::Accept { accepted, .. }, 0..) = (&mut operation, result) {
+            // SAFETY: a successful accept returns a new descriptor that
+            // nothing else owns. Taking it here, before anyone can drop
+            // the completion, is what keeps it from leaking.
+            *accepted = Some(unsafe { OwnedFd::from_raw_fd(result) });
+        }
         let result = if result < 0 {
             Err(io::Error::from_raw_os_error(-result))
         } else {
