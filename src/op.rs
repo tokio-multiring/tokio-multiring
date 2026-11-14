@@ -34,6 +34,8 @@ pub(crate) enum Operation {
         fd: Arc<OwnedFd>,
         buf: FixedBuf,
         offset: u64,
+        /// The most bytes to read.
+        limit: usize,
         /// Whether it runs on the polled disk ring.
         polled: bool,
     },
@@ -123,11 +125,15 @@ impl Operation {
                     .build()
             }
             Operation::ReadFixedAt {
-                fd, buf, offset, ..
+                fd,
+                buf,
+                offset,
+                limit,
+                ..
             } => opcode::ReadFixed::new(
                 types::Fd(fd.as_raw_fd()),
                 buf.spare_ptr(),
-                io_len(buf.spare_len()),
+                io_len(buf.spare_len().min(*limit)),
                 buf.registered_index(),
             )
             .offset(*offset)

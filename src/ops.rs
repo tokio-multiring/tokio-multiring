@@ -64,14 +64,16 @@ impl Sidecar {
         }
     }
 
-    /// Reads from `fd` at `offset` into the spare capacity of `buf`, like
-    /// [`read_at`](Self::read_at), but without the kernel having to map and
-    /// pin the buffer for the operation.
+    /// Reads up to `limit` bytes from `fd` at `offset` into the spare
+    /// capacity of `buf`, like [`read_at`](Self::read_at), but without the
+    /// kernel having to map and pin the buffer for the operation.
     ///
     /// `buf` must come from the pool in [`Config::buffers`]. With an
     /// `O_DIRECT` file, the buffer's contents so far, the offset and the
-    /// buffer size must all be multiples of the device's block size; an
-    /// empty buffer always is.
+    /// length asked for must all be multiples of the device's block size.
+    /// Asking for much more than the file holds is wasteful there: the
+    /// kernel fills what lies past the end of the file with zeroes before
+    /// it reports the shorter count.
     ///
     /// The buffer is handed back whether or not the read succeeds. If the
     /// future is dropped before it completes, the read is cancelled and the
@@ -83,8 +85,9 @@ impl Sidecar {
         fd: Arc<OwnedFd>,
         buf: FixedBuf,
         offset: u64,
+        limit: usize,
     ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
-        self.read_fixed(fd, buf, offset, false)
+        self.read_fixed(fd, buf, offset, limit, false)
     }
 
     /// Writes the contents of `buf` to `fd` at `offset`, like
@@ -126,8 +129,9 @@ impl Sidecar {
         fd: Arc<OwnedFd>,
         buf: FixedBuf,
         offset: u64,
+        limit: usize,
     ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
-        self.read_fixed(fd, buf, offset, true)
+        self.read_fixed(fd, buf, offset, limit, true)
     }
 
     /// Like [`write_fixed_at`](Self::write_fixed_at), on the worker's polled
@@ -148,6 +152,7 @@ impl Sidecar {
         fd: Arc<OwnedFd>,
         buf: FixedBuf,
         offset: u64,
+        limit: usize,
         polled: bool,
     ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
         let op = match self.check_fixed(&buf, polled) {
@@ -157,6 +162,7 @@ impl Sidecar {
                     fd,
                     buf,
                     offset,
+                    limit,
                     polled,
                 },
             )),

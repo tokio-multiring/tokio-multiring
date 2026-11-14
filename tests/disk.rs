@@ -95,7 +95,9 @@ async fn round_trip(
     assert_eq!(written.unwrap(), BUF_SIZE);
 
     buf.clear();
-    let (read, buf) = sidecar.read_polled_at(fd.clone(), buf, offset).await;
+    let (read, buf) = sidecar
+        .read_polled_at(fd.clone(), buf, offset, usize::MAX)
+        .await;
     assert_eq!(read.unwrap(), BUF_SIZE);
     assert!(buf.iter().all(|&byte| byte == fill));
 }
@@ -186,7 +188,7 @@ fn many_operations_at_once() {
                 let fd = fd.clone();
                 tokio::spawn(async move {
                     let (read, buf) = sidecar
-                        .read_polled_at(fd, pool.acquire().await, offset)
+                        .read_polled_at(fd, pool.acquire().await, offset, usize::MAX)
                         .await;
                     assert_eq!(read.unwrap(), 4096);
                     assert!(buf.iter().all(|&byte| byte == 0x33));
@@ -227,7 +229,7 @@ fn dropped_operation_runs_to_its_end() {
                 let buf = tokio::time::timeout(Duration::from_secs(5), pool.acquire())
                     .await
                     .expect("buffer never came back");
-                let (read, buf) = sidecar.read_polled_at(fd, buf, offset).await;
+                let (read, buf) = sidecar.read_polled_at(fd, buf, offset, usize::MAX).await;
                 assert_eq!(read.unwrap(), BUF_SIZE);
                 assert!(buf.iter().all(|&byte| byte == 0x44));
             }
@@ -254,7 +256,9 @@ fn buffered_files_are_refused() {
     let (runtime, disk) = setup();
     runtime.block_on(async {
         let sidecar = start(&pool, disk).await.unwrap();
-        let (read, _buf) = sidecar.read_polled_at(fd, pool.acquire().await, 0).await;
+        let (read, _buf) = sidecar
+            .read_polled_at(fd, pool.acquire().await, 0, usize::MAX)
+            .await;
         assert_eq!(read.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
     });
 }
@@ -272,7 +276,7 @@ fn polled_operations_need_disk_rings() {
         .await
         .unwrap();
         let (read, _buf) = sidecar
-            .read_polled_at(fd, pool.acquire().await, offset)
+            .read_polled_at(fd, pool.acquire().await, offset, usize::MAX)
             .await;
         assert_eq!(read.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     });

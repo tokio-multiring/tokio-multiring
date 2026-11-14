@@ -138,9 +138,13 @@ fn main() {
                         buf.clear();
                         let started = Instant::now();
                         let (read, returned) = if polled {
-                            sidecar.read_polled_at(fd.clone(), buf, offset).await
+                            sidecar
+                                .read_polled_at(fd.clone(), buf, offset, usize::MAX)
+                                .await
                         } else {
-                            sidecar.read_fixed_at(fd.clone(), buf, offset).await
+                            sidecar
+                                .read_fixed_at(fd.clone(), buf, offset, usize::MAX)
+                                .await
                         };
                         let finished = Instant::now();
                         assert_eq!(read.unwrap(), block);

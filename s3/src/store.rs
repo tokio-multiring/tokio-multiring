@@ -177,19 +177,20 @@ impl Store {
         }
     }
 
-    /// Reads from `offset`, a multiple of [`BLOCK`], into the spare capacity
-    /// of `buf`.
+    /// Reads up to `limit` bytes from `offset`, both multiples of [`BLOCK`],
+    /// into the spare capacity of `buf`.
     pub(crate) async fn read(
         &self,
         stored: &Stored,
         buf: FixedBuf,
         offset: u64,
+        limit: usize,
     ) -> (io::Result<usize>, FixedBuf) {
         let file = stored.file.clone();
         if self.sidecar.has_disk_rings() {
-            self.sidecar.read_polled_at(file, buf, offset).await
+            self.sidecar.read_polled_at(file, buf, offset, limit).await
         } else {
-            self.sidecar.read_fixed_at(file, buf, offset).await
+            self.sidecar.read_fixed_at(file, buf, offset, limit).await
         }
     }
 

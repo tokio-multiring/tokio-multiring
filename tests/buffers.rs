@@ -158,13 +158,15 @@ fn direct_io_round_trip() {
                 assert_eq!(written.unwrap(), BLOCK);
 
                 buf.clear();
-                let (read, mut buf) = sidecar.read_fixed_at(fd.clone(), buf, 0).await;
+                let (read, mut buf) = sidecar.read_fixed_at(fd.clone(), buf, 0, usize::MAX).await;
                 assert_eq!(read.unwrap(), BUF_SIZE);
                 assert!(buf.iter().all(|&byte| byte == 0xa5));
 
                 // The file ends one block into this read.
                 buf.clear();
-                let (read, buf) = sidecar.read_fixed_at(fd, buf, BUF_SIZE as u64).await;
+                let (read, buf) = sidecar
+                    .read_fixed_at(fd, buf, BUF_SIZE as u64, usize::MAX)
+                    .await;
                 assert_eq!(read.unwrap(), BLOCK);
                 assert_eq!(buf.len(), BLOCK);
                 assert!(buf.iter().all(|&byte| byte == 0x5a));
@@ -174,6 +176,25 @@ fn direct_io_round_trip() {
         .unwrap();
     });
     assert_eq!(pool.available(), 4);
+}
+
+#[test]
+fn read_stops_at_its_limit() {
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    let reader = Arc::new(OwnedFd::from(reader));
+    writer.write_all(b"onetwo").unwrap();
+
+    let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
+    runtime().block_on(async {
+        let sidecar = sidecar_with(&pool).await;
+        let (read, buf) = sidecar
+            .read_fixed_at(reader.clone(), pool.acquire().await, 0, 3)
+            .await;
+        assert_eq!(read.unwrap(), 3);
+        let (read, buf) = sidecar.read_fixed_at(reader, buf, 0, usize::MAX).await;
+        assert_eq!(read.unwrap(), 3);
+        assert_eq!(&buf[..], b"onetwo");
+    });
 }
 
 #[test]
@@ -187,7 +208,7 @@ fn read_appends_to_the_contents() {
         let sidecar = sidecar_with(&pool).await;
         let mut buf = pool.acquire().await;
         buf.extend_from_slice(b"hello ");
-        let (read, buf) = sidecar.read_fixed_at(reader, buf, 0).await;
+        let (read, buf) = sidecar.read_fixed_at(reader, buf, 0, usize::MAX).await;
         assert_eq!(read.unwrap(), 5);
         assert_eq!(&buf[..], b"hello world");
     });
@@ -201,7 +222,7 @@ fn cancelled_read_returns_its_buffer() {
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
     runtime().block_on(async {
         let sidecar = sidecar_with(&pool).await;
-        let read = sidecar.read_fixed_at(reader, pool.acquire().await, 0);
+        let read = sidecar.read_fixed_at(reader, pool.acquire().await, 0, usize::MAX);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), read)
                 .await
@@ -226,7 +247,9 @@ fn buffers_from_elsewhere_are_refused() {
         let mut buf = other.acquire().await;
         buf.extend_from_slice(b"kept");
 
-        let (result, buf) = sidecar.read_fixed_at(reader.clone(), buf, 0).await;
+        let (result, buf) = sidecar
+            .read_fixed_at(reader.clone(), buf, 0, usize::MAX)
+            .await;
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
         let (result, buf) = sidecar.write_fixed_at(reader, buf, 0).await;
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
@@ -243,7 +266,9 @@ fn fixed_operations_need_a_pool() {
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
     runtime().block_on(async {
         let sidecar = Sidecar::start(Config::default()).await.unwrap();
-        let (result, _buf) = sidecar.read_fixed_at(reader, pool.acquire().await, 0).await;
+        let (result, _buf) = sidecar
+            .read_fixed_at(reader, pool.acquire().await, 0, usize::MAX)
+            .await;
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     });
 }

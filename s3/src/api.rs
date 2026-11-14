@@ -670,8 +670,12 @@ async fn send_object(
         // Direct reads start on a block boundary, which may be short of
         // where the range does.
         let block_start = position - position % BLOCK as u64;
+        // No more than the range needs, in whole blocks. A read that runs
+        // far past the end of the file costs as much as one that does not.
+        let wanted = (range.end - block_start).next_multiple_of(BLOCK as u64);
+        let limit = usize::try_from(wanted).unwrap_or(usize::MAX);
         buf.clear();
-        let (read, returned) = server.store.read(stored, buf, block_start).await;
+        let (read, returned) = server.store.read(stored, buf, block_start, limit).await;
         buf = returned;
         let read_end = block_start + read? as u64;
         if read_end <= position {
