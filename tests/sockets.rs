@@ -149,6 +149,28 @@ fn recv_limit_and_send_offset() {
     assert_eq!(&echoed, b"body");
 }
 
+/// After shutting down writing, the peer sees the end of the stream, and
+/// what it sends still arrives.
+#[test]
+fn shutdown_of_one_direction() {
+    let (ours, mut theirs) = socket_pair();
+    let pool = BufferPool::new(4096, 1).unwrap();
+
+    runtime().block_on(async {
+        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+        sidecar
+            .shutdown(ours.clone(), std::net::Shutdown::Write)
+            .await
+            .unwrap();
+        assert_eq!(theirs.read(&mut [0; 8]).unwrap(), 0);
+
+        theirs.write_all(b"still open").unwrap();
+        let (received, buf) = sidecar.recv(ours, pool.acquire().await, usize::MAX).await;
+        assert_eq!(received.unwrap(), 10);
+        assert_eq!(&buf[..], b"still open");
+    });
+}
+
 /// Without `MSG_NOSIGNAL` this would kill the test process.
 #[test]
 fn send_to_a_closed_peer_is_an_error() {

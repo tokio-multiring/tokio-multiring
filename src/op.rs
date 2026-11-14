@@ -61,6 +61,10 @@ pub(crate) enum Operation {
         /// Where in the contents to start.
         start: usize,
     },
+    Shutdown {
+        fd: Arc<OwnedFd>,
+        how: i32,
+    },
     OpenAt {
         dir: Arc<OwnedFd>,
         path: CString,
@@ -158,6 +162,9 @@ impl Operation {
                 opcode::Send::new(types::Fd(fd.as_raw_fd()), rest.as_ptr(), io_len(rest.len()))
                     .flags(libc::MSG_NOSIGNAL | libc::MSG_WAITALL)
                     .build()
+            }
+            Operation::Shutdown { fd, how } => {
+                opcode::Shutdown::new(types::Fd(fd.as_raw_fd()), *how).build()
             }
             Operation::OpenAt {
                 dir,

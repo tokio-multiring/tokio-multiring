@@ -312,6 +312,22 @@ impl Sidecar {
         }
     }
 
+    /// Shuts down one or both directions of the socket `fd`. Shutting down
+    /// writing tells the peer that nothing more is coming, while what it
+    /// sends can still be received.
+    pub fn shutdown(
+        &self,
+        fd: Arc<OwnedFd>,
+        how: std::net::Shutdown,
+    ) -> impl Future<Output = io::Result<()>> + Send + use<> {
+        let how = match how {
+            std::net::Shutdown::Read => libc::SHUT_RD,
+            std::net::Shutdown::Write => libc::SHUT_WR,
+            std::net::Shutdown::Both => libc::SHUT_RDWR,
+        };
+        self.unit(Operation::Shutdown { fd, how })
+    }
+
     /// Opens `path`, relative to the directory `dir`, as `openat(2)` does.
     /// Close-on-exec is always set.
     pub fn open_at(
