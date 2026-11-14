@@ -134,7 +134,9 @@ impl Sidecar {
         match self.local() {
             Some(reactor) => {
                 reactor.submit(entry, op);
-                reactor.notify_driver();
+                if !reactor.hook_seen.get() {
+                    reactor.notify_driver();
+                }
                 reactor.index
             }
             None => {
@@ -176,6 +178,34 @@ impl Sidecar {
     }
 }
 
+/// Flushes the current worker's ring: submits what its tasks have queued and
+/// delivers the completions that are ready. Install it with
+/// [`Builder::on_before_steal`], or call it from your own before-steal
+/// callback if the runtime needs that slot for something else.
+///
+/// The hook runs when a worker has emptied its local queue, so everything
+/// the worker's tasks queued since the last flush goes to the kernel in one
+/// `io_uring_enter`, without a trip through the scheduler.
+///
+/// A worker that never runs out of local work never reaches the hook. A
+/// full submission queue is flushed on the spot, so at most
+/// [`Config::sq_entries`] operations are left waiting there, until the
+/// worker goes idle or a completion on its ring wakes the driver task.
+///
+/// Without the hook the sidecar still works: each worker's driver task does
+/// the flushing, at the cost of one extra task poll per batch.
+///
+/// Does nothing on a thread that has no reactor.
+///
+/// [`Builder::on_before_steal`]: tokio::runtime::Builder::on_before_steal
+pub fn before_steal() {
+    let reactor = CURRENT.with(|current| current.borrow().clone());
+    if let Some(reactor) = reactor {
+        reactor.hook_seen.set(true);
+        reactor.turn();
+    }
+}
+
 struct Submitted {
     token: u64,
     op: Arc<dyn InFlight>,
@@ -192,6 +222,9 @@ struct Reactor {
     generation: Cell<u32>,
     /// Whether the driver task has been woken since its last turn.
     driver_notified: Cell<bool>,
+    /// Whether [`before_steal`] runs on this thread. Until it has been seen,
+    /// local submissions wake the driver task to get flushed.
+    hook_seen: Cell<bool>,
     stopped: Cell<bool>,
     sidecar: Arc<Inner>,
     index: usize,
@@ -232,6 +265,7 @@ impl Reactor {
                 completed: RefCell::new(Vec::new()),
                 generation: Cell::new(0),
                 driver_notified: Cell::new(false),
+                hook_seen: Cell::new(false),
                 stopped: Cell::new(false),
                 sidecar,
                 index,

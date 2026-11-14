@@ -1,12 +1,26 @@
+use std::future::Future;
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio_sidecar::{Config, Sidecar};
 
 fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .on_before_steal(tokio_sidecar::before_steal)
+        .build()
+        .unwrap()
+}
+
+/// A runtime whose rings are flushed by the driver tasks alone.
+fn runtime_without_hook() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -37,6 +51,98 @@ fn nop_on_a_worker() {
             .await
             .unwrap()
             .unwrap();
+    });
+}
+
+#[test]
+fn works_without_the_hook() {
+    let (reader, mut writer) = socket_pair();
+    runtime_without_hook().block_on(async {
+        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+        let read = tokio::spawn(async move {
+            sidecar.nop().await.unwrap();
+            sidecar.read_at(reader, Vec::with_capacity(16), 0).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::thread::spawn(move || writer.write_all(b"late").unwrap());
+
+        let (result, buf) = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .expect("worker was never woken")
+            .unwrap();
+        assert_eq!(result.unwrap(), 4);
+        assert_eq!(buf, b"late");
+    });
+}
+
+/// Reschedules itself on every poll, so its worker never runs out of local
+/// work and the hook never fires. (`yield_now` would not do: its wake-up is
+/// deferred until the worker is otherwise idle.)
+struct Spin;
+
+impl Future for Spin {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+/// With the hook installed nothing wakes the driver task for a local
+/// submission. On a worker that stays busy, operations reach the kernel when
+/// the submission queue fills, and at most one queue's worth is left waiting
+/// for the worker to go idle.
+#[test]
+fn busy_worker_flushes_when_the_queue_fills() {
+    const SQ_ENTRIES: usize = 4;
+    const OPS: usize = 64;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .on_before_steal(tokio_sidecar::before_steal)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let sidecar = Sidecar::start(Config {
+            sq_entries: SQ_ENTRIES as u32,
+        })
+        .await
+        .unwrap();
+        tokio::spawn(async move {
+            // Let the hook be seen before the worker gets busy.
+            sidecar.nop().await.unwrap();
+
+            let spinner = tokio::spawn(Spin);
+            let done = Arc::new(AtomicUsize::new(0));
+            let nops: Vec<_> = (0..OPS)
+                .map(|_| {
+                    let sidecar = sidecar.clone();
+                    let done = done.clone();
+                    tokio::spawn(async move {
+                        sidecar.nop().await.unwrap();
+                        done.fetch_add(1, Ordering::Relaxed);
+                    })
+                })
+                .collect();
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while done.load(Ordering::Relaxed) < OPS - SQ_ENTRIES {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("full submission queues were not flushed");
+
+            spinner.abort();
+            for nop in nops {
+                nop.await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
     });
 }
 

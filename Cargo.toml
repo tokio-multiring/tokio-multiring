@@ -11,9 +11,10 @@ publish = false
 io-uring = "0.7.15"
 libc = "0.2"
 slab = "0.4"
-# Worker-local tasks (`spawn_worker_local`, `run_on_each_worker`) are not in
-# upstream tokio; this is the `local-worker-v3` branch of the fork.
-tokio = { git = "https://github.com/lthiery/tokio", rev = "db6b53fcd31ab29594867dc44d04adecad5c82a8", features = ["rt-multi-thread", "net", "sync", "macros", "worker-local"] }
+# Worker-local tasks (`spawn_worker_local`, `run_on_each_worker`) and the
+# `on_before_steal` hook are not in upstream tokio; this is the
+# `local-worker-v3-full` branch of the fork.
+tokio = { git = "https://github.com/lthiery/tokio", rev = "0faaf1094b2ca4f27fc0a7a82de184f16ab707a6", features = ["rt-multi-thread", "net", "sync", "macros", "worker-local"] }
 
 [dev-dependencies]
-tokio = { git = "https://github.com/lthiery/tokio", rev = "db6b53fcd31ab29594867dc44d04adecad5c82a8", features = ["time"] }
+tokio = { git = "https://github.com/lthiery/tokio", rev = "0faaf1094b2ca4f27fc0a7a82de184f16ab707a6", features = ["time"] }
