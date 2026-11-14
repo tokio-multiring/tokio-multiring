@@ -7,6 +7,7 @@ use std::task::{Context, Poll};
 
 use io_uring::{opcode, squeue, types};
 
+use crate::buffers::FixedBuf;
 use crate::landing::{Landing, TaskRef};
 use crate::reactor::{Sidecar, Ticket};
 
@@ -26,6 +27,16 @@ pub(crate) enum Operation {
     WriteAt {
         fd: Arc<OwnedFd>,
         buf: Vec<u8>,
+        offset: u64,
+    },
+    ReadFixedAt {
+        fd: Arc<OwnedFd>,
+        buf: FixedBuf,
+        offset: u64,
+    },
+    WriteFixedAt {
+        fd: Arc<OwnedFd>,
+        buf: FixedBuf,
         offset: u64,
     },
 }
@@ -49,6 +60,22 @@ impl Operation {
                     .offset(*offset)
                     .build()
             }
+            Operation::ReadFixedAt { fd, buf, offset } => opcode::ReadFixed::new(
+                types::Fd(fd.as_raw_fd()),
+                buf.spare_ptr(),
+                io_len(buf.spare_len()),
+                buf.registered_index(),
+            )
+            .offset(*offset)
+            .build(),
+            Operation::WriteFixedAt { fd, buf, offset } => opcode::WriteFixed::new(
+                types::Fd(fd.as_raw_fd()),
+                buf.as_ptr(),
+                io_len(buf.len()),
+                buf.registered_index(),
+            )
+            .offset(*offset)
+            .build(),
         }
     }
 }

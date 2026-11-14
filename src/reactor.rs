@@ -13,6 +13,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc};
 
+use crate::buffers::BufferPool;
 use crate::landing::{Arbiter, CellRef, Claim, TaskRef};
 use crate::op::{Completion, Operation};
 
@@ -120,6 +121,7 @@ impl Shared {
 struct Inner {
     workers: Box<[Shared]>,
     next_remote: AtomicUsize,
+    buffers: Option<BufferPool>,
 }
 
 /// Names an in-flight operation: the worker whose ring runs it, its token
@@ -138,16 +140,21 @@ impl Ticket {
 }
 
 /// Settings for the per-worker rings.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     /// Submission queue size of each ring. The completion queue is twice
     /// this.
     pub sq_entries: u32,
+    /// Buffers to register on every ring, for the `*_fixed` operations.
+    pub buffers: Option<BufferPool>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { sq_entries: 256 }
+        Self {
+            sq_entries: 256,
+            buffers: None,
+        }
     }
 }
 
@@ -173,6 +180,7 @@ impl Sidecar {
         let inner = Arc::new(Inner {
             workers: (0..workers).map(|_| Shared::default()).collect(),
             next_remote: AtomicUsize::new(0),
+            buffers: config.buffers.clone(),
         });
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -197,6 +205,11 @@ impl Sidecar {
             return Err(error);
         }
         Ok(Sidecar { inner })
+    }
+
+    /// The pool registered on the rings, if [`Config::buffers`] named one.
+    pub fn buffers(&self) -> Option<&BufferPool> {
+        self.inner.buffers.as_ref()
     }
 
     /// Number of operations handed to a ring and not yet completed, across
@@ -381,6 +394,9 @@ impl Reactor {
                 .setup_coop_taskrun()
                 .setup_taskrun_flag()
                 .build(config.sq_entries)?;
+            if let Some(buffers) = &config.buffers {
+                buffers.register_on(&ring)?;
+            }
             // SAFETY: the descriptor is the ring's, and the ring outlives
             // `readiness`: the driver task owns both and drops `readiness`
             // first.

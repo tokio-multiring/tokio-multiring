@@ -108,6 +108,7 @@ fn busy_worker_flushes_when_the_queue_fills() {
     runtime.block_on(async {
         let sidecar = Sidecar::start(Config {
             sq_entries: SQ_ENTRIES as u32,
+            ..Config::default()
         })
         .await
         .unwrap();
@@ -424,7 +425,12 @@ fn many_tasks_across_workers() {
 #[test]
 fn submission_queue_overflow() {
     runtime().block_on(async {
-        let sidecar = Sidecar::start(Config { sq_entries: 8 }).await.unwrap();
+        let sidecar = Sidecar::start(Config {
+            sq_entries: 8,
+            ..Config::default()
+        })
+        .await
+        .unwrap();
         tokio::spawn(async move {
             let nops: Vec<_> = (0..1000).map(|_| tokio::spawn(sidecar.nop())).collect();
             for nop in nops {

@@ -29,9 +29,11 @@
 //!
 //! Requires the `local-worker-v3-full` tokio fork and `--cfg tokio_unstable`.
 
+mod buffers;
 mod landing;
 mod op;
 mod ops;
 mod reactor;
 
+pub use buffers::{BufferPool, FixedBuf};
 pub use reactor::{Config, Sidecar, before_steal};

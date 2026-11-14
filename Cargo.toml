@@ -16,4 +16,5 @@ libc = "0.2"
 tokio = { git = "https://github.com/lthiery/tokio", rev = "0faaf1094b2ca4f27fc0a7a82de184f16ab707a6", features = ["rt-multi-thread", "net", "sync", "macros", "worker-local"] }
 
 [dev-dependencies]
+libc = "0.2"
 tokio = { git = "https://github.com/lthiery/tokio", rev = "0faaf1094b2ca4f27fc0a7a82de184f16ab707a6", features = ["time"] }
