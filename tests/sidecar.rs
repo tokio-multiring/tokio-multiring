@@ -248,6 +248,34 @@ fn drop_cancels_from_another_thread() {
     });
 }
 
+/// The read is submitted on a worker's own ring and dropped by the
+/// `block_on` thread, so only the cancel crosses threads.
+#[test]
+fn drop_on_another_thread_cancels_a_local_submission() {
+    let (reader, _writer) = socket_pair();
+    runtime().block_on(async {
+        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+        let handle = sidecar.clone();
+        let (parked, read) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut read = Box::pin(handle.read_at(reader, Vec::with_capacity(16), 0));
+            std::future::poll_fn(|cx| {
+                assert!(read.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(parked.send(read).is_ok());
+        })
+        .await
+        .unwrap();
+        let read = read.await.unwrap();
+        assert_eq!(sidecar.in_flight(), 1);
+
+        drop(read);
+        wait_for_idle(&sidecar).await;
+    });
+}
+
 /// Tasks migrate between workers at every yield, so operations are routinely
 /// polled to completion on a different thread than the one that submitted.
 #[test]

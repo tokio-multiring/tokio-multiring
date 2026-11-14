@@ -1,161 +1,126 @@
 use std::future::Future;
 use std::io;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use io_uring::squeue;
+use io_uring::{opcode, squeue, types};
 
-use crate::reactor::{InFlight, Sidecar};
+use crate::reactor::{Sidecar, Ticket};
 
-/// One io_uring operation together with everything the kernel needs kept
-/// alive while it runs.
-pub(crate) trait Operation: Send + 'static {
-    type Output;
-
-    /// Builds the submission. Called once, after `self` has reached its
-    /// final address, so the entry may point into `self`.
-    fn entry(&mut self) -> squeue::Entry;
-
-    fn finish(self, result: io::Result<u32>) -> Self::Output;
+/// An operation and everything the kernel needs kept alive while it runs.
+///
+/// While in flight the value lives in its reactor's slab, which moves its
+/// entries when it grows. A submission may therefore point at heap memory
+/// the operation owns, but never at the operation value itself.
+pub(crate) enum Operation {
+    Nop,
+    ReadAt {
+        fd: Arc<OwnedFd>,
+        buf: Vec<u8>,
+        offset: u64,
+    },
+    WriteAt {
+        fd: Arc<OwnedFd>,
+        buf: Vec<u8>,
+        offset: u64,
+    },
 }
 
-enum Stage {
-    Pending(Waker),
-    Done(i32),
-    /// The future was dropped. The operation is kept alive by the reactor
-    /// until its completion arrives.
-    Abandoned,
-}
-
-struct State<T> {
-    stage: Stage,
-    /// Set once the reactor has queued the submission.
-    token: Option<u64>,
-    op: Option<T>,
-}
-
-struct Inner<T> {
-    state: Mutex<State<T>>,
-}
-
-impl<T: Operation> InFlight for Inner<T> {
-    fn submitted(&self, token: u64) -> bool {
-        let mut state = self.state.lock().unwrap();
-        if matches!(state.stage, Stage::Abandoned) {
-            return false;
-        }
-        state.token = Some(token);
-        true
-    }
-
-    fn complete(&self, result: i32) {
-        let mut state = self.state.lock().unwrap();
-        if let Stage::Pending(_) = state.stage {
-            let Stage::Pending(waker) = std::mem::replace(&mut state.stage, Stage::Done(result))
-            else {
-                unreachable!()
-            };
-            drop(state);
-            waker.wake();
+impl Operation {
+    pub(crate) fn entry(&mut self) -> squeue::Entry {
+        match self {
+            Operation::Nop => opcode::Nop::new().build(),
+            Operation::ReadAt { fd, buf, offset } => {
+                let spare = buf.spare_capacity_mut();
+                opcode::Read::new(
+                    types::Fd(fd.as_raw_fd()),
+                    spare.as_mut_ptr().cast(),
+                    io_len(spare.len()),
+                )
+                .offset(*offset)
+                .build()
+            }
+            Operation::WriteAt { fd, buf, offset } => {
+                opcode::Write::new(types::Fd(fd.as_raw_fd()), buf.as_ptr(), io_len(buf.len()))
+                    .offset(*offset)
+                    .build()
+            }
         }
     }
 }
 
-enum Progress<T> {
-    Idle(T),
-    InFlight { inner: Arc<Inner<T>>, worker: usize },
+/// io_uring lengths are 32 bits wide.
+fn io_len(len: usize) -> u32 {
+    len.min(u32::MAX as usize) as u32
+}
+
+/// A finished operation, handed back with the kernel's result.
+pub(crate) struct Completion {
+    pub(crate) result: io::Result<u32>,
+    pub(crate) operation: Operation,
+}
+
+impl Completion {
+    pub(crate) fn new(result: i32, operation: Operation) -> Self {
+        let result = if result < 0 {
+            Err(io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as u32)
+        };
+        Self { result, operation }
+    }
+}
+
+enum Progress {
+    Idle(Operation),
+    InFlight(Ticket),
     Finished,
 }
 
 /// Future of a single operation.
-pub(crate) struct Op<T: Operation> {
+pub(crate) struct Op {
     sidecar: Sidecar,
-    progress: Progress<T>,
+    progress: Progress,
 }
 
-impl<T: Operation> Op<T> {
-    pub(crate) fn new(sidecar: &Sidecar, op: T) -> Self {
+impl Op {
+    pub(crate) fn new(sidecar: &Sidecar, operation: Operation) -> Self {
         Self {
             sidecar: sidecar.clone(),
-            progress: Progress::Idle(op),
+            progress: Progress::Idle(operation),
         }
     }
 }
 
-// The operation is never pinned in place: it is moved into an `Arc` before
-// the kernel sees it.
-impl<T: Operation> Unpin for Op<T> {}
+impl Future for Op {
+    type Output = Completion;
 
-impl<T: Operation> Future for Op<T> {
-    type Output = T::Output;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Completion> {
         let this = &mut *self;
         match std::mem::replace(&mut this.progress, Progress::Finished) {
-            Progress::Idle(op) => {
-                let inner = Arc::new(Inner {
-                    state: Mutex::new(State {
-                        stage: Stage::Pending(cx.waker().clone()),
-                        token: None,
-                        op: Some(op),
-                    }),
-                });
-                let entry = inner
-                    .state
-                    .lock()
-                    .unwrap()
-                    .op
-                    .as_mut()
-                    .expect("operation present until finished")
-                    .entry();
-                let worker = this.sidecar.submit(entry, inner.clone());
-                this.progress = Progress::InFlight { inner, worker };
+            Progress::Idle(operation) => {
+                let ticket = this.sidecar.submit(operation, cx.waker());
+                this.progress = Progress::InFlight(ticket);
                 Poll::Pending
             }
-            Progress::InFlight { inner, worker } => {
-                let mut state = inner.state.lock().unwrap();
-                match &mut state.stage {
-                    Stage::Pending(waker) => {
-                        waker.clone_from(cx.waker());
-                        drop(state);
-                        this.progress = Progress::InFlight { inner, worker };
-                        Poll::Pending
-                    }
-                    Stage::Done(result) => {
-                        let result = if *result < 0 {
-                            Err(io::Error::from_raw_os_error(-*result))
-                        } else {
-                            Ok(*result as u32)
-                        };
-                        let op = state.op.take().expect("operation present until finished");
-                        Poll::Ready(op.finish(result))
-                    }
-                    Stage::Abandoned => unreachable!("only set when the future is dropped"),
+            Progress::InFlight(ticket) => match this.sidecar.poll_completion(ticket, cx) {
+                Poll::Ready(completion) => Poll::Ready(completion),
+                Poll::Pending => {
+                    this.progress = Progress::InFlight(ticket);
+                    Poll::Pending
                 }
-            }
+            },
             Progress::Finished => panic!("operation polled after completion"),
         }
     }
 }
 
-impl<T: Operation> Drop for Op<T> {
+impl Drop for Op {
     fn drop(&mut self) {
-        let Progress::InFlight { inner, worker } = &self.progress else {
-            return;
-        };
-        let token = {
-            let mut state = inner.state.lock().unwrap();
-            if !matches!(state.stage, Stage::Pending(_)) {
-                return;
-            }
-            state.stage = Stage::Abandoned;
-            state.token
-        };
-        // Without a token the submission has not been queued yet, and the
-        // reactor will skip it.
-        if let Some(token) = token {
-            self.sidecar.cancel(*worker, token);
+        if let Progress::InFlight(ticket) = self.progress {
+            self.sidecar.abandon(ticket);
         }
     }
 }
