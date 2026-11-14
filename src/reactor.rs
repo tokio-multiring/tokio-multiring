@@ -17,6 +17,7 @@ use tokio::sync::{Notify, mpsc};
 use crate::buffers::BufferPool;
 use crate::landing::{Arbiter, CellRef, Claim, TaskRef};
 use crate::op::{Completion, Operation};
+use crate::plan::Plan;
 
 /// `user_data` of submissions whose completion nobody waits for. Operation
 /// tokens carry a slot index in their low 32 bits, which never reaches
@@ -151,7 +152,7 @@ pub struct Config {
     /// operations.
     pub buffers: Option<BufferPool>,
     /// Polled rings for `O_DIRECT` file I/O, for the `*_polled` operations.
-    /// Needs `buffers`.
+    /// Needs `buffers`, and a runtime built with [`Plan::build`].
     pub disk: Option<DiskConfig>,
 }
 
@@ -171,8 +172,8 @@ impl Default for Config {
 /// the worker: a kernel thread takes submissions off the ring and busy-polls
 /// the device for their completions, so a disk operation costs the worker no
 /// system call and the device raises no interrupt. One such thread serves
-/// the disk rings of a whole group of workers, and spins on a core of its
-/// own while they are busy.
+/// the disk rings of all the workers of a domain of the plan, and spins on
+/// its CPU while they are busy.
 #[derive(Clone, Debug)]
 pub struct DiskConfig {
     /// Submission queue size of each worker's disk ring.
@@ -180,57 +181,31 @@ pub struct DiskConfig {
     /// How long a kernel thread keeps spinning with nothing to do before it
     /// goes to sleep. Waking it again takes a system call.
     pub sq_thread_idle: Duration,
-    /// The kernel threads. Every worker must be listed under exactly one.
-    pub sq_threads: Vec<SqThread>,
+    /// The plan that built the runtime.
+    pub plan: Plan,
 }
 
-/// One kernel submission thread and the workers it serves.
-#[derive(Clone, Debug)]
-pub struct SqThread {
-    /// The CPU to pin the thread to. `None` leaves it to the scheduler.
-    pub cpu: Option<u32>,
-    /// Indices of the workers whose disk rings this thread drives.
-    pub workers: Vec<usize>,
-}
-
-/// The kernel submission threads of a sidecar. Each is kept alive by a ring
-/// that does no I/O, which the workers' disk rings attach to.
+/// The kernel submission threads of a sidecar, one per domain of the plan.
+/// Each is kept alive by a ring that does no I/O, which the disk rings of
+/// the domain's workers attach to.
 struct Disk {
     anchors: Vec<IoUring>,
-    /// Index into `anchors`, per worker.
-    anchor_of: Box<[usize]>,
+    plan: Plan,
     sq_entries: u32,
     idle_ms: u32,
 }
 
 impl Disk {
-    fn new(config: &DiskConfig, workers: usize) -> io::Result<Disk> {
-        let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+    fn new(config: &DiskConfig) -> io::Result<Disk> {
         let idle_ms = u32::try_from(config.sq_thread_idle.as_millis()).unwrap_or(u32::MAX);
-
-        let mut anchor_of = vec![None; workers];
-        for (anchor, thread) in config.sq_threads.iter().enumerate() {
-            for &worker in &thread.workers {
-                let slot = anchor_of.get_mut(worker).ok_or_else(|| {
-                    invalid("disk config names a worker the runtime does not have")
-                })?;
-                if slot.replace(anchor).is_some() {
-                    return Err(invalid("disk config lists a worker under two threads"));
-                }
-            }
-        }
-        let anchor_of = anchor_of
-            .into_iter()
-            .collect::<Option<_>>()
-            .ok_or_else(|| invalid("disk config leaves a worker without a thread"))?;
-
         let anchors = config
-            .sq_threads
+            .plan
+            .domains()
             .iter()
-            .map(|thread| {
+            .map(|domain| {
                 let mut builder = IoUring::builder();
                 builder.setup_iopoll().setup_sqpoll(idle_ms);
-                if let Some(cpu) = thread.cpu {
+                if let Some(cpu) = domain.sq_thread {
                     builder.setup_sqpoll_cpu(cpu);
                 }
                 builder.build(1)
@@ -239,19 +214,25 @@ impl Disk {
 
         Ok(Disk {
             anchors,
-            anchor_of,
+            plan: config.plan.clone(),
             sq_entries: config.sq_entries,
             idle_ms,
         })
     }
 
-    /// Creates `worker`'s disk ring, served by its group's kernel thread.
-    fn ring(&self, worker: usize) -> io::Result<IoUring> {
-        let anchor = &self.anchors[self.anchor_of[worker]];
+    /// Creates the current worker's disk ring, served by the kernel thread
+    /// of the domain the plan placed it in.
+    fn ring(&self) -> io::Result<IoUring> {
+        let domain = self.plan.domain_of_current_thread().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the disk plan did not place this runtime's workers",
+            )
+        })?;
         IoUring::builder()
             .setup_iopoll()
             .setup_sqpoll(self.idle_ms)
-            .setup_attach_wq(anchor.as_raw_fd())
+            .setup_attach_wq(self.anchors[domain].as_raw_fd())
             .build(self.sq_entries)
     }
 }
@@ -282,7 +263,7 @@ impl Sidecar {
                     "disk rings need a buffer pool",
                 ));
             }
-            Some(disk) => Some(Disk::new(disk, workers)?),
+            Some(disk) => Some(Disk::new(disk)?),
             None => None,
         };
         let inner = Arc::new(Inner {
@@ -526,7 +507,7 @@ impl Reactor {
             let mut disk_readiness = None;
             let disk = match (&sidecar.disk, &config.buffers) {
                 (Some(disk), Some(buffers)) => {
-                    let ring = disk.ring(index)?;
+                    let ring = disk.ring()?;
                     buffers.register_on(&ring)?;
                     // SAFETY: as for `readiness`.
                     disk_readiness = Some(

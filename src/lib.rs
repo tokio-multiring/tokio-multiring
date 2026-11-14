@@ -8,9 +8,10 @@
 //! the stock driver keep working unchanged, and io_uring is used only for the
 //! operations submitted through a [`Sidecar`].
 //!
-//! With [`Config::disk`], each worker also gets a polled ring for `O_DIRECT`
-//! file I/O, driven by a kernel thread that it shares with a group of other
-//! workers.
+//! A [`Plan`] pins every thread of the runtime to a CPU as it starts. With
+//! [`Config::disk`], each worker also gets a polled ring for `O_DIRECT` file
+//! I/O, driven by a kernel thread that it shares with the other workers of
+//! its domain in the plan.
 //!
 //! Operation futures are `Send`. A future submits to the ring of the worker
 //! that first polls it, and may then be polled, completed or dropped on any
@@ -37,7 +38,9 @@ mod buffers;
 mod landing;
 mod op;
 mod ops;
+mod plan;
 mod reactor;
 
 pub use buffers::{BufferPool, FixedBuf};
-pub use reactor::{Config, DiskConfig, Sidecar, SqThread, before_steal};
+pub use plan::{Domain, Hyperthreads, Plan};
+pub use reactor::{Config, DiskConfig, Sidecar, before_steal};
