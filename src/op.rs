@@ -33,11 +33,15 @@ pub(crate) enum Operation {
         fd: Arc<OwnedFd>,
         buf: FixedBuf,
         offset: u64,
+        /// Whether it runs on the polled disk ring.
+        polled: bool,
     },
     WriteFixedAt {
         fd: Arc<OwnedFd>,
         buf: FixedBuf,
         offset: u64,
+        /// Whether it runs on the polled disk ring.
+        polled: bool,
     },
     Accept {
         listener: Arc<OwnedFd>,
@@ -73,7 +77,9 @@ impl Operation {
                     .offset(*offset)
                     .build()
             }
-            Operation::ReadFixedAt { fd, buf, offset } => opcode::ReadFixed::new(
+            Operation::ReadFixedAt {
+                fd, buf, offset, ..
+            } => opcode::ReadFixed::new(
                 types::Fd(fd.as_raw_fd()),
                 buf.spare_ptr(),
                 io_len(buf.spare_len()),
@@ -81,7 +87,9 @@ impl Operation {
             )
             .offset(*offset)
             .build(),
-            Operation::WriteFixedAt { fd, buf, offset } => opcode::WriteFixed::new(
+            Operation::WriteFixedAt {
+                fd, buf, offset, ..
+            } => opcode::WriteFixed::new(
                 types::Fd(fd.as_raw_fd()),
                 buf.as_ptr(),
                 io_len(buf.len()),
@@ -110,6 +118,17 @@ impl Operation {
                     .build()
             }
         }
+    }
+}
+
+impl Operation {
+    /// Whether the operation belongs on the polled disk ring.
+    pub(crate) fn polled(&self) -> bool {
+        matches!(
+            self,
+            Operation::ReadFixedAt { polled: true, .. }
+                | Operation::WriteFixedAt { polled: true, .. }
+        )
     }
 }
 

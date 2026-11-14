@@ -83,25 +83,7 @@ impl Sidecar {
         buf: FixedBuf,
         offset: u64,
     ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
-        let op = match self.check_registered(&buf) {
-            Ok(()) => Ok(Op::new(self, Operation::ReadFixedAt { fd, buf, offset })),
-            Err(error) => Err((error, buf)),
-        };
-        async move {
-            let completion = match op {
-                Ok(op) => op.await,
-                Err((error, buf)) => return (Err(error), buf),
-            };
-            let Operation::ReadFixedAt { mut buf, .. } = completion.operation else {
-                unreachable!("a completion carries the operation it was submitted with")
-            };
-            let result = completion.result.map(|read| {
-                let read = read as usize;
-                buf.advance(read);
-                read
-            });
-            (result, buf)
-        }
+        self.read_fixed(fd, buf, offset, false)
     }
 
     /// Writes the contents of `buf` to `fd` at `offset`, like
@@ -122,8 +104,97 @@ impl Sidecar {
         buf: FixedBuf,
         offset: u64,
     ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
-        let op = match self.check_registered(&buf) {
-            Ok(()) => Ok(Op::new(self, Operation::WriteFixedAt { fd, buf, offset })),
+        self.write_fixed(fd, buf, offset, false)
+    }
+
+    /// Like [`read_fixed_at`](Self::read_fixed_at), on the worker's polled
+    /// disk ring: submitting takes no system call and the device raises no
+    /// interrupt. Needs [`Config::disk`].
+    ///
+    /// `fd` must be open with `O_DIRECT`, with everything aligned as that
+    /// requires; the kernel refuses anything else. On a device without
+    /// polling support the operation still works, completed by interrupt.
+    ///
+    /// A polled operation cannot be cancelled once the kernel has it. If the
+    /// future is dropped the read runs to its end, and the buffer returns to
+    /// its pool then.
+    ///
+    /// [`Config::disk`]: crate::Config::disk
+    pub fn read_polled_at(
+        &self,
+        fd: Arc<OwnedFd>,
+        buf: FixedBuf,
+        offset: u64,
+    ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
+        self.read_fixed(fd, buf, offset, true)
+    }
+
+    /// Like [`write_fixed_at`](Self::write_fixed_at), on the worker's polled
+    /// disk ring. See [`read_polled_at`](Self::read_polled_at) for what that
+    /// asks of `fd`. If the future is dropped once the kernel has the
+    /// operation, the write still happens.
+    pub fn write_polled_at(
+        &self,
+        fd: Arc<OwnedFd>,
+        buf: FixedBuf,
+        offset: u64,
+    ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
+        self.write_fixed(fd, buf, offset, true)
+    }
+
+    fn read_fixed(
+        &self,
+        fd: Arc<OwnedFd>,
+        buf: FixedBuf,
+        offset: u64,
+        polled: bool,
+    ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
+        let op = match self.check_fixed(&buf, polled) {
+            Ok(()) => Ok(Op::new(
+                self,
+                Operation::ReadFixedAt {
+                    fd,
+                    buf,
+                    offset,
+                    polled,
+                },
+            )),
+            Err(error) => Err((error, buf)),
+        };
+        async move {
+            let completion = match op {
+                Ok(op) => op.await,
+                Err((error, buf)) => return (Err(error), buf),
+            };
+            let Operation::ReadFixedAt { mut buf, .. } = completion.operation else {
+                unreachable!("a completion carries the operation it was submitted with")
+            };
+            let result = completion.result.map(|read| {
+                let read = read as usize;
+                buf.advance(read);
+                read
+            });
+            (result, buf)
+        }
+    }
+
+    fn write_fixed(
+        &self,
+        fd: Arc<OwnedFd>,
+        buf: FixedBuf,
+        offset: u64,
+        polled: bool,
+    ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
+        let op = match self.check_fixed(&buf, polled) {
+            Ok(()) => Ok(Op::new(
+                self,
+                Operation::WriteFixedAt {
+                    fd,
+                    buf,
+                    offset,
+                    polled,
+                },
+            )),
             Err(error) => Err((error, buf)),
         };
         async move {
@@ -136,6 +207,19 @@ impl Sidecar {
             };
             (completion.result.map(|written| written as usize), buf)
         }
+    }
+
+    /// A buffer's registered index only means something on rings that have
+    /// its pool, and a polled operation needs a disk ring to run on.
+    fn check_fixed(&self, buf: &FixedBuf, polled: bool) -> io::Result<()> {
+        let invalid = |message| Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        if !self.buffers().is_some_and(|pool| pool.owns(buf)) {
+            return invalid("buffer is not from the pool registered on this sidecar");
+        }
+        if polled && !self.has_disk_rings() {
+            return invalid("this sidecar has no disk rings");
+        }
+        Ok(())
     }
 
     /// Waits for a connection on `listener` and returns it, in blocking
@@ -217,19 +301,6 @@ impl Sidecar {
                 unreachable!("a completion carries the operation it was submitted with")
             };
             (completion.result.map(|sent| sent as usize), buf)
-        }
-    }
-
-    /// A buffer's registered index only means something on rings that have
-    /// its pool.
-    fn check_registered(&self, buf: &FixedBuf) -> io::Result<()> {
-        if self.buffers().is_some_and(|pool| pool.owns(buf)) {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "buffer is not from the pool registered on this sidecar",
-            ))
         }
     }
 }

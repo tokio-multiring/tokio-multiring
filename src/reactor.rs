@@ -6,6 +6,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Waker;
+use std::time::Duration;
 
 use io_uring::{IoUring, opcode, squeue};
 use tokio::io::Interest;
@@ -122,6 +123,7 @@ struct Inner {
     workers: Box<[Shared]>,
     next_remote: AtomicUsize,
     buffers: Option<BufferPool>,
+    disk: Option<Disk>,
 }
 
 /// Names an in-flight operation: the worker whose ring runs it, its token
@@ -145,8 +147,12 @@ pub struct Config {
     /// Submission queue size of each ring. The completion queue is twice
     /// this.
     pub sq_entries: u32,
-    /// Buffers to register on every ring, for the `*_fixed` operations.
+    /// Buffers to register on every ring, for the `*_fixed` and `*_polled`
+    /// operations.
     pub buffers: Option<BufferPool>,
+    /// Polled rings for `O_DIRECT` file I/O, for the `*_polled` operations.
+    /// Needs `buffers`.
+    pub disk: Option<DiskConfig>,
 }
 
 impl Default for Config {
@@ -154,7 +160,99 @@ impl Default for Config {
         Self {
             sq_entries: 256,
             buffers: None,
+            disk: None,
         }
+    }
+}
+
+/// Settings for the polled disk rings.
+///
+/// Every worker gets a second ring that the kernel drives without help from
+/// the worker: a kernel thread takes submissions off the ring and busy-polls
+/// the device for their completions, so a disk operation costs the worker no
+/// system call and the device raises no interrupt. One such thread serves
+/// the disk rings of a whole group of workers, and spins on a core of its
+/// own while they are busy.
+#[derive(Clone, Debug)]
+pub struct DiskConfig {
+    /// Submission queue size of each worker's disk ring.
+    pub sq_entries: u32,
+    /// How long a kernel thread keeps spinning with nothing to do before it
+    /// goes to sleep. Waking it again takes a system call.
+    pub sq_thread_idle: Duration,
+    /// The kernel threads. Every worker must be listed under exactly one.
+    pub sq_threads: Vec<SqThread>,
+}
+
+/// One kernel submission thread and the workers it serves.
+#[derive(Clone, Debug)]
+pub struct SqThread {
+    /// The CPU to pin the thread to. `None` leaves it to the scheduler.
+    pub cpu: Option<u32>,
+    /// Indices of the workers whose disk rings this thread drives.
+    pub workers: Vec<usize>,
+}
+
+/// The kernel submission threads of a sidecar. Each is kept alive by a ring
+/// that does no I/O, which the workers' disk rings attach to.
+struct Disk {
+    anchors: Vec<IoUring>,
+    /// Index into `anchors`, per worker.
+    anchor_of: Box<[usize]>,
+    sq_entries: u32,
+    idle_ms: u32,
+}
+
+impl Disk {
+    fn new(config: &DiskConfig, workers: usize) -> io::Result<Disk> {
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        let idle_ms = u32::try_from(config.sq_thread_idle.as_millis()).unwrap_or(u32::MAX);
+
+        let mut anchor_of = vec![None; workers];
+        for (anchor, thread) in config.sq_threads.iter().enumerate() {
+            for &worker in &thread.workers {
+                let slot = anchor_of.get_mut(worker).ok_or_else(|| {
+                    invalid("disk config names a worker the runtime does not have")
+                })?;
+                if slot.replace(anchor).is_some() {
+                    return Err(invalid("disk config lists a worker under two threads"));
+                }
+            }
+        }
+        let anchor_of = anchor_of
+            .into_iter()
+            .collect::<Option<_>>()
+            .ok_or_else(|| invalid("disk config leaves a worker without a thread"))?;
+
+        let anchors = config
+            .sq_threads
+            .iter()
+            .map(|thread| {
+                let mut builder = IoUring::builder();
+                builder.setup_iopoll().setup_sqpoll(idle_ms);
+                if let Some(cpu) = thread.cpu {
+                    builder.setup_sqpoll_cpu(cpu);
+                }
+                builder.build(1)
+            })
+            .collect::<io::Result<_>>()?;
+
+        Ok(Disk {
+            anchors,
+            anchor_of,
+            sq_entries: config.sq_entries,
+            idle_ms,
+        })
+    }
+
+    /// Creates `worker`'s disk ring, served by its group's kernel thread.
+    fn ring(&self, worker: usize) -> io::Result<IoUring> {
+        let anchor = &self.anchors[self.anchor_of[worker]];
+        IoUring::builder()
+            .setup_iopoll()
+            .setup_sqpoll(self.idle_ms)
+            .setup_attach_wq(anchor.as_raw_fd())
+            .build(self.sq_entries)
     }
 }
 
@@ -177,10 +275,21 @@ impl Sidecar {
     /// Panics if called from outside a multi-threaded runtime.
     pub async fn start(config: Config) -> io::Result<Sidecar> {
         let workers = Handle::current().metrics().num_workers();
+        let disk = match &config.disk {
+            Some(_) if config.buffers.is_none() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "disk rings need a buffer pool",
+                ));
+            }
+            Some(disk) => Some(Disk::new(disk, workers)?),
+            None => None,
+        };
         let inner = Arc::new(Inner {
             workers: (0..workers).map(|_| Shared::default()).collect(),
             next_remote: AtomicUsize::new(0),
             buffers: config.buffers.clone(),
+            disk,
         });
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -210,6 +319,11 @@ impl Sidecar {
     /// The pool registered on the rings, if [`Config::buffers`] named one.
     pub fn buffers(&self) -> Option<&BufferPool> {
         self.inner.buffers.as_ref()
+    }
+
+    /// Whether the workers have polled disk rings.
+    pub(crate) fn has_disk_rings(&self) -> bool {
+        self.inner.disk.is_some()
     }
 
     /// Number of operations handed to a ring and not yet completed, across
@@ -345,6 +459,8 @@ pub fn before_steal() {
 /// An operation the kernel has, or is about to get.
 struct InFlight {
     token: u64,
+    /// Whether it went to the disk ring.
+    polled: bool,
     cell: CellRef,
     task: TaskRef,
     operation: Operation,
@@ -353,6 +469,8 @@ struct InFlight {
 /// One worker's ring. Only ever touched from that worker's thread.
 struct Reactor {
     ring: RefCell<IoUring>,
+    /// The polled ring, if the sidecar has them.
+    disk: Option<RefCell<IoUring>>,
     /// In-flight operations, indexed by the low half of their token.
     slots: RefCell<Vec<Option<InFlight>>>,
     /// Leases for slots that are empty.
@@ -405,8 +523,29 @@ impl Reactor {
             }
             .map_err(io::Error::from)?;
 
+            let mut disk_readiness = None;
+            let disk = match (&sidecar.disk, &config.buffers) {
+                (Some(disk), Some(buffers)) => {
+                    let ring = disk.ring(index)?;
+                    buffers.register_on(&ring)?;
+                    // SAFETY: as for `readiness`.
+                    disk_readiness = Some(
+                        unsafe {
+                            AsyncFd::register_with_interest(
+                                RingFd(ring.as_raw_fd()),
+                                Interest::READABLE,
+                            )
+                        }
+                        .map_err(io::Error::from)?,
+                    );
+                    Some(RefCell::new(ring))
+                }
+                _ => None,
+            };
+
             let reactor = Rc::new(Reactor {
                 ring: RefCell::new(ring),
+                disk,
                 slots: RefCell::new(Vec::new()),
                 free: RefCell::new(Vec::new()),
                 deferred: RefCell::new(Vec::new()),
@@ -419,7 +558,7 @@ impl Reactor {
                 sidecar,
                 index,
             });
-            tokio::task::spawn_worker_local(drive(reactor.clone(), readiness));
+            tokio::task::spawn_worker_local(drive(reactor.clone(), readiness, disk_readiness));
             *current = Some(reactor);
             Ok(())
         })
@@ -477,6 +616,7 @@ impl Reactor {
     /// for the kernel. Returns its token.
     fn start(&self, lease: Lease, generation: u32, task: TaskRef, mut operation: Operation) -> u64 {
         let token = token_of(generation, lease.index);
+        let polled = operation.polled();
         let entry = operation.entry().user_data(token);
         {
             let mut slots = self.slots.borrow_mut();
@@ -487,6 +627,7 @@ impl Reactor {
             debug_assert!(slots[index].is_none());
             slots[index] = Some(InFlight {
                 token,
+                polled,
                 cell: lease.cell,
                 task,
                 operation,
@@ -494,7 +635,12 @@ impl Reactor {
         }
         self.shared().in_flight.fetch_add(1, Ordering::Relaxed);
 
-        if let Err(error) = self.push(&entry) {
+        let pushed = if polled {
+            self.push_disk(&entry)
+        } else {
+            self.push(&entry)
+        };
+        if let Err(error) = pushed {
             let result = -error.raw_os_error().unwrap_or(libc::EIO);
             let mut wakers = self.wakers.take();
             let mut released = self.released.take();
@@ -557,15 +703,17 @@ impl Reactor {
         true
     }
 
-    /// Cancels `token` if it is still in flight.
+    /// Cancels `token` if it is still in flight. Polled operations are left
+    /// to finish: block I/O that has been issued cannot be called back, and
+    /// it is over quickly.
     fn cancel(&self, token: u64) {
-        let live = self
+        let cancellable = self
             .slots
             .borrow()
             .get(key_of(token))
             .and_then(Option::as_ref)
-            .is_some_and(|in_flight| in_flight.token == token);
-        if live {
+            .is_some_and(|in_flight| in_flight.token == token && !in_flight.polled);
+        if cancellable {
             let entry = opcode::AsyncCancel::new(token).build().user_data(DETACHED);
             // A cancel that cannot be queued is dropped: the operation then
             // runs to its natural completion.
@@ -604,6 +752,55 @@ impl Reactor {
         }
     }
 
+    /// Queues `entry` on the disk ring, where the kernel thread picks it up
+    /// by itself.
+    fn push_disk(&self, entry: &squeue::Entry) -> io::Result<()> {
+        let disk = self
+            .disk
+            .as_ref()
+            .expect("polled operations are only accepted with disk rings");
+        // SAFETY: as in `push`.
+        while unsafe { disk.borrow_mut().submission().push(entry) }.is_err() {
+            // The queue is full, and only the kernel thread empties it.
+            self.kick_disk();
+            match disk.borrow().submitter().squeue_wait() {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.kick_disk();
+        Ok(())
+    }
+
+    /// Wakes the disk ring's kernel thread if it has gone to sleep, and has
+    /// the kernel hand over completions that did not fit in the completion
+    /// queue. Costs a system call only in those two cases.
+    fn kick_disk(&self) {
+        let Some(disk) = &self.disk else {
+            return;
+        };
+        let ring = disk.borrow();
+        loop {
+            match ring.submit() {
+                Ok(_) => return,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                // Out of completion-queue space: reaping makes room.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ResourceBusy | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    self.notify_driver();
+                    return;
+                }
+                // As in `enter`, there is no safe way to carry on.
+                Err(error) => panic!("io_uring_enter failed on the disk ring: {error}"),
+            }
+        }
+    }
+
     /// Takes in remote work, submits everything queued, and delivers the
     /// completions that are ready.
     fn turn(&self) {
@@ -636,6 +833,7 @@ impl Reactor {
 
         loop {
             self.enter();
+            self.kick_disk();
             self.reap();
             if !self.kernel_holds_completions() {
                 break;
@@ -651,7 +849,14 @@ impl Reactor {
         // SAFETY: the submission queue is only accessed from this thread,
         // and no other handle to it is alive here.
         let queue = unsafe { ring.submission_shared() };
-        queue.taskrun() || queue.cq_overflow()
+        if queue.taskrun() || queue.cq_overflow() {
+            return true;
+        }
+        self.disk.as_ref().is_some_and(|disk| {
+            let ring = disk.borrow();
+            // SAFETY: as above. The kernel thread only reads the queue.
+            unsafe { ring.submission_shared() }.cq_overflow()
+        })
     }
 
     /// Submits queued entries and collects completions held by the kernel.
@@ -692,9 +897,8 @@ impl Reactor {
 
         deferred
             .retain(|&(token, result)| !self.resolve(token, result, &mut wakers, &mut released));
-        {
-            let mut ring = self.ring.borrow_mut();
-            for cqe in ring.completion() {
+        for ring in std::iter::once(&self.ring).chain(&self.disk) {
+            for cqe in ring.borrow_mut().completion() {
                 let token = cqe.user_data();
                 if token != DETACHED
                     && !self.resolve(token, cqe.result(), &mut wakers, &mut released)
@@ -749,20 +953,33 @@ impl AsRawFd for RingFd {
     }
 }
 
-/// Arguments drop in reverse order, so `readiness` is deregistered while the
-/// ring it watches is still open.
-async fn drive(reactor: Rc<Reactor>, readiness: AsyncFd<RingFd>) {
+/// Arguments drop in reverse order, so the rings are deregistered from
+/// tokio's driver while they are still open.
+async fn drive(
+    reactor: Rc<Reactor>,
+    readiness: AsyncFd<RingFd>,
+    disk_readiness: Option<AsyncFd<RingFd>>,
+) {
     while !reactor.stopped.get() {
         reactor.turn();
         tokio::select! {
             biased;
             () = reactor.shared().wake.notified() => {}
-            ready = readiness.readable() => match ready {
-                // Cleared before the next turn reaps, so a completion that
-                // lands in between raises readiness again.
-                Ok(mut guard) => guard.clear_ready(),
-                Err(error) => panic!("ring readiness failed: {error}"),
-            },
+            () = completions(Some(&readiness)) => {}
+            () = completions(disk_readiness.as_ref()) => {}
         }
+    }
+}
+
+/// Waits until `ring` has completions to reap. Never returns for `None`.
+async fn completions(ring: Option<&AsyncFd<RingFd>>) {
+    let Some(ring) = ring else {
+        return std::future::pending().await;
+    };
+    match ring.readable().await {
+        // Cleared before the next turn reaps, so a completion that lands in
+        // between raises readiness again.
+        Ok(mut guard) => guard.clear_ready(),
+        Err(error) => panic!("ring readiness failed: {error}"),
     }
 }
