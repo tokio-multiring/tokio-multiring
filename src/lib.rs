@@ -14,3 +14,9 @@
 //! memory the caller can free.
 //!
 //! Requires the `local-worker-v3` tokio fork and `--cfg tokio_unstable`.
+
+mod op;
+mod ops;
+mod reactor;
+
+pub use reactor::{Config, Sidecar};
