@@ -1,0 +1,4 @@
+# The fork's `worker-local` feature is unstable.
+[build]
+rustflags = ["--cfg", "tokio_unstable"]
+rustdocflags = ["--cfg", "tokio_unstable"]
