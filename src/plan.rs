@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use tokio::runtime::{Builder, Runtime, RuntimeFlavor};
 
@@ -14,7 +14,7 @@ thread_local! {
     static PLACEMENT: RefCell<Option<Placement>> = const { RefCell::new(None) };
 }
 
-/// The seat a worker thread took when it started.
+/// Where a worker thread was placed.
 struct Placement {
     plan: Arc<Inner>,
     domain: usize,
@@ -45,23 +45,11 @@ pub enum Hyperthreads {
 
 struct Inner {
     domains: Vec<Domain>,
-    /// Domain and CPU of each worker thread, in the order threads claim
-    /// them.
+    /// Domain and CPU of each worker, by the worker's index in the runtime.
     seats: Vec<(usize, u32)>,
     /// Where the runtime's other threads may run.
     worker_cpus: Vec<u32>,
-    progress: Mutex<Progress>,
-    /// Signalled when a worker has taken its seat.
-    seated: Condvar,
     built: AtomicBool,
-}
-
-#[derive(Default)]
-struct Progress {
-    /// How many of the runtime's threads have started.
-    started: usize,
-    /// Why a worker could not be pinned, if one could not.
-    failure: Option<io::Error>,
 }
 
 /// Decides, before a runtime is built, which CPU each of its threads runs
@@ -117,8 +105,6 @@ impl Plan {
                 worker_cpus: seats.iter().map(|&(_, cpu)| cpu).collect(),
                 seats,
                 domains,
-                progress: Mutex::default(),
-                seated: Condvar::new(),
                 built: AtomicBool::new(false),
             }),
         })
@@ -180,63 +166,49 @@ impl Plan {
             return invalid("a plan places the threads of one runtime");
         }
 
+        // Every thread starts out confined to the workers' CPUs. If that
+        // fails there is nobody to tell, and the thread keeps the CPUs of
+        // the one that started it.
         let plan = self.clone();
         let runtime = builder
             .worker_threads(self.worker_count())
-            .on_thread_start(move || plan.place_current_thread())
+            .on_thread_start(move || drop(pin(&plan.inner.worker_cpus)))
             .build()?;
         if runtime.handle().runtime_flavor() != RuntimeFlavor::MultiThread {
             return invalid("a plan needs a multi-threaded runtime");
         }
 
-        // The workers exist by now, but each takes its seat when it gets to
-        // run. Nothing else can start a thread on this runtime until it is
-        // handed out, so waiting here is what guarantees the seats go to the
-        // workers and not to a thread started later for blocking work.
-        let mut progress = self.progress();
-        while progress.started < self.worker_count() {
-            progress = self
-                .inner
-                .seated
-                .wait(progress)
-                .unwrap_or_else(PoisonError::into_inner);
+        // A thread cannot tell at its start whether it will run a worker:
+        // the runtime starts workers and threads for blocking work the same
+        // way, and whichever thread gets to a worker's task first runs it.
+        // So each worker is given its CPU by a task that runs on it.
+        let (placed, results) = std::sync::mpsc::channel();
+        {
+            let _context = runtime.enter();
+            let plan = self.clone();
+            tokio::task::run_on_each_worker(move |worker| {
+                let _ = placed.send(plan.place_current_worker(worker));
+            });
         }
-        match progress.failure.take() {
-            Some(error) => Err(error),
-            None => Ok(runtime),
+        for _ in 0..self.worker_count() {
+            let result = results
+                .recv()
+                .map_err(|_| io::Error::other("a worker went away before it was placed"))?;
+            result?;
         }
+        Ok(runtime)
     }
 
-    fn progress(&self) -> std::sync::MutexGuard<'_, Progress> {
-        self.inner
-            .progress
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Runs on every thread of the runtime as it starts. The first threads
-    /// to get here are the workers: see `build`.
-    fn place_current_thread(&self) {
-        let mut progress = self.progress();
-        let seat = progress.started;
-        progress.started += 1;
-
-        let Some(&(domain, cpu)) = self.inner.seats.get(seat) else {
-            drop(progress);
-            // There is nobody to report a failure to here. The thread then
-            // keeps the CPUs of the thread that started it.
-            let _ = pin(&self.inner.worker_cpus);
-            return;
-        };
-        match pin(&[cpu]) {
-            Ok(()) => PLACEMENT.set(Some(Placement {
-                plan: self.inner.clone(),
-                domain,
-            })),
-            Err(error) => progress.failure = progress.failure.take().or(Some(error)),
-        }
-        drop(progress);
-        self.inner.seated.notify_all();
+    /// Pins the calling thread, which runs the worker with index `worker`,
+    /// to that worker's CPU.
+    fn place_current_worker(&self, worker: usize) -> io::Result<()> {
+        let (domain, cpu) = self.inner.seats[worker];
+        pin(&[cpu])?;
+        PLACEMENT.set(Some(Placement {
+            plan: self.inner.clone(),
+            domain,
+        }));
+        Ok(())
     }
 
     /// Index of the domain the current thread was placed in, if it is one
