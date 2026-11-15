@@ -179,6 +179,18 @@ impl BufferPool {
         (0..count).map(|_| self.take()).collect()
     }
 
+    /// Takes `count` buffers if that many are free, and none otherwise.
+    /// Never ahead of a task that is waiting for buffers.
+    pub fn try_acquire_many(&self, count: usize) -> Option<Vec<FixedBuf>> {
+        let permits = u32::try_from(count).ok()?;
+        self.inner
+            .available
+            .try_acquire_many(permits)
+            .ok()?
+            .forget();
+        Some((0..count).map(|_| self.take()).collect())
+    }
+
     /// Takes a buffer if one is free.
     pub fn try_acquire(&self) -> Option<FixedBuf> {
         self.inner.available.try_acquire().ok()?.forget();

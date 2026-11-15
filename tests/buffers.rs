@@ -111,6 +111,20 @@ fn acquire_many_waits_for_all_of_them() {
     });
 }
 
+#[test]
+fn try_acquire_many_takes_all_or_none() {
+    let pool = BufferPool::new(BUF_SIZE, 3).unwrap();
+    let two = pool.try_acquire_many(2).unwrap();
+    assert_eq!((two.len(), pool.available()), (2, 1));
+    assert!(pool.try_acquire_many(2).is_none());
+    assert_eq!(pool.available(), 1);
+    assert_eq!(pool.try_acquire_many(1).unwrap().len(), 1);
+    assert!(pool.try_acquire_many(0).unwrap().is_empty());
+    drop(two);
+    assert!(pool.try_acquire_many(4).is_none());
+    assert_eq!(pool.try_acquire_many(2).unwrap().len(), 2);
+}
+
 /// Tasks that each need the whole pool take turns. Taking the buffers one
 /// by one would leave them holding one apiece, waiting for the other.
 #[test]
