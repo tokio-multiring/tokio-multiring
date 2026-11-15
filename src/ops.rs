@@ -5,7 +5,7 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use crate::buffers::FixedBuf;
-use crate::op::{Op, Operation};
+use crate::op::{Message, Op, Operation};
 use crate::reactor::Sidecar;
 
 impl Sidecar {
@@ -318,6 +318,65 @@ impl Sidecar {
         }
     }
 
+    /// Sends the regions `segments` of the buffers' contents on the socket
+    /// `fd`, one after the other, as a single stream of bytes. Like
+    /// [`send`](Self::send), it keeps going until everything is sent.
+    ///
+    /// The buffers are handed back in the order they came, whether or not
+    /// the send succeeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a segment reaches past the contents of its buffer, or if
+    /// there are more than 1024 segments.
+    pub fn send_vectored(
+        &self,
+        fd: Arc<OwnedFd>,
+        bufs: Vec<FixedBuf>,
+        segments: &[Segment],
+    ) -> impl Future<Output = (io::Result<usize>, Vec<FixedBuf>)> + Send + use<> {
+        let message = Message::new(&bufs, segments, true);
+        let op = Op::new(self, Operation::SendMsg { fd, bufs, message });
+        async move {
+            let completion = op.await;
+            let Operation::SendMsg { bufs, .. } = completion.operation else {
+                unreachable!("a completion carries the operation it was submitted with")
+            };
+            (completion.result.map(|sent| sent as usize), bufs)
+        }
+    }
+
+    /// Receives from the socket `fd` into the regions `segments` of the
+    /// buffers, filling them one after the other. Unlike
+    /// [`recv`](Self::recv), it waits until all of them are full: a count
+    /// short of that means the peer has shut down its side.
+    ///
+    /// The regions may lie anywhere within the buffers' capacity. The
+    /// lengths of the buffers' contents are left as they are, for the caller
+    /// to [`grow`](FixedBuf::grow). The buffers are handed back in the order
+    /// they came, whether or not the receive succeeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a segment reaches past the capacity of its buffer, or if
+    /// there are more than 1024 segments.
+    pub fn recv_vectored(
+        &self,
+        fd: Arc<OwnedFd>,
+        bufs: Vec<FixedBuf>,
+        segments: &[Segment],
+    ) -> impl Future<Output = (io::Result<usize>, Vec<FixedBuf>)> + Send + use<> {
+        let message = Message::new(&bufs, segments, false);
+        let op = Op::new(self, Operation::RecvMsg { fd, bufs, message });
+        async move {
+            let completion = op.await;
+            let Operation::RecvMsg { bufs, .. } = completion.operation else {
+                unreachable!("a completion carries the operation it was submitted with")
+            };
+            (completion.result.map(|received| received as usize), bufs)
+        }
+    }
+
     /// Shuts down one or both directions of the socket `fd`. Shutting down
     /// writing tells the peer that nothing more is coming, while what it
     /// sends can still be received.
@@ -465,6 +524,16 @@ impl Sidecar {
         let op = Op::new(self, operation);
         async move { op.await.result.map(drop) }
     }
+}
+
+/// A region of one of the buffers given to a vectored operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    /// Index of the buffer.
+    pub buf: usize,
+    /// Where in the buffer the region starts.
+    pub start: usize,
+    pub len: usize,
 }
 
 /// What [`Sidecar::stat`] reports about a file.

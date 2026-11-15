@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use tokio_sidecar::{BufferPool, Config, Sidecar};
+use tokio_sidecar::{BufferPool, Config, Segment, Sidecar};
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -147,6 +147,116 @@ fn recv_limit_and_send_offset() {
     let mut echoed = [0; 4];
     theirs.read_exact(&mut echoed).unwrap();
     assert_eq!(&echoed, b"body");
+}
+
+fn segment(buf: usize, start: usize, len: usize) -> Segment {
+    Segment { buf, start, len }
+}
+
+/// Regions of two buffers go out interleaved, as one stream.
+#[test]
+fn send_vectored_interleaves_buffers() {
+    let (ours, mut theirs) = socket_pair();
+    let pool = BufferPool::new(4096, 2).unwrap();
+
+    runtime().block_on(async {
+        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+        let mut bufs = pool.acquire_many(2).await;
+        bufs[0].extend_from_slice(b"ACExx");
+        bufs[1].extend_from_slice(b"..BD");
+        let segments = [
+            segment(0, 0, 1),
+            segment(1, 2, 1),
+            segment(0, 1, 1),
+            segment(1, 3, 1),
+            segment(0, 2, 1),
+        ];
+        let (sent, bufs) = sidecar.send_vectored(ours.clone(), bufs, &segments).await;
+        assert_eq!(sent.unwrap(), 5);
+        assert_eq!((&bufs[0][..], &bufs[1][..]), (&b"ACExx"[..], &b"..BD"[..]));
+
+        let (sent, _) = sidecar.send_vectored(ours, bufs, &[]).await;
+        assert_eq!(sent.unwrap(), 0);
+    });
+
+    let mut received = [0; 5];
+    theirs.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"ABCDE");
+}
+
+/// A stream is dealt out over regions of two buffers, and the receive holds
+/// out for all of it though it arrives in pieces.
+#[test]
+fn recv_vectored_fills_every_region() {
+    let (ours, mut theirs) = socket_pair();
+    let pool = BufferPool::new(4096, 2).unwrap();
+
+    let writer = std::thread::spawn(move || {
+        for piece in [&b"01"[..], b"234", b"5", b"6789"] {
+            theirs.write_all(piece).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        theirs
+    });
+
+    runtime().block_on(async {
+        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+        let bufs = pool.acquire_many(2).await;
+        let segments = [segment(0, 0, 3), segment(1, 100, 4), segment(0, 3, 3)];
+        let (received, mut bufs) = sidecar.recv_vectored(ours.clone(), bufs, &segments).await;
+        assert_eq!(received.unwrap(), 10);
+        assert!(bufs[0].is_empty() && bufs[1].is_empty());
+        bufs[0].grow(6);
+        bufs[1].grow(104);
+        assert_eq!(&bufs[0][..], b"012789");
+        assert_eq!(&bufs[1][100..], b"3456");
+
+        // The peer stops short of what is asked for.
+        let mut theirs = writer.join().unwrap();
+        theirs.write_all(b"ab").unwrap();
+        drop(theirs);
+        let (received, bufs) = sidecar.recv_vectored(ours, bufs, &[segment(1, 0, 8)]).await;
+        assert_eq!(received.unwrap(), 2);
+        assert_eq!(&bufs[1][..2], b"ab");
+    });
+}
+
+/// More than a socket buffer holds, through many regions.
+#[test]
+fn vectored_transfers_larger_than_the_socket_buffer() {
+    const UNIT: usize = 128 * 1024;
+    const UNITS: usize = 8;
+
+    let (ours, theirs) = socket_pair();
+    let theirs = Arc::new(OwnedFd::from(theirs));
+    let pool = BufferPool::new(UNITS * UNIT, 4).unwrap();
+    // Units alternate between the two buffers.
+    let segments: Vec<Segment> = (0..2 * UNITS)
+        .map(|unit| segment(unit % 2, unit / 2 * UNIT, UNIT))
+        .collect();
+
+    runtime().block_on(async {
+        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+        let mut sending = pool.acquire_many(2).await;
+        for (index, buf) in sending.iter_mut().enumerate() {
+            let fill: Vec<u8> = (0..UNITS * UNIT)
+                .map(|byte| (index + byte / UNIT * 2) as u8)
+                .collect();
+            buf.extend_from_slice(&fill);
+        }
+        let receiving = pool.acquire_many(2).await;
+
+        let send = tokio::spawn(sidecar.send_vectored(ours, sending, &segments));
+        let (received, mut receiving) = sidecar.recv_vectored(theirs, receiving, &segments).await;
+        assert_eq!(received.unwrap(), 2 * UNITS * UNIT);
+        let (sent, sending) = send.await.unwrap();
+        assert_eq!(sent.unwrap(), 2 * UNITS * UNIT);
+
+        for (sent, received) in sending.iter().zip(&mut receiving) {
+            received.grow(UNITS * UNIT);
+            assert!(sent[..] == received[..]);
+        }
+    });
 }
 
 /// After shutting down writing, the peer sees the end of the stream, and

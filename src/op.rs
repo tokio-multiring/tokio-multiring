@@ -10,6 +10,7 @@ use io_uring::{opcode, squeue, types};
 
 use crate::buffers::FixedBuf;
 use crate::landing::{Landing, TaskRef};
+use crate::ops::Segment;
 use crate::reactor::{Sidecar, Ticket};
 
 /// An operation and everything the kernel needs kept alive while it runs.
@@ -62,6 +63,16 @@ pub(crate) enum Operation {
         buf: FixedBuf,
         /// Where in the contents to start.
         start: usize,
+    },
+    SendMsg {
+        fd: Arc<OwnedFd>,
+        bufs: Vec<FixedBuf>,
+        message: Message,
+    },
+    RecvMsg {
+        fd: Arc<OwnedFd>,
+        bufs: Vec<FixedBuf>,
+        message: Message,
     },
     Shutdown {
         fd: Arc<OwnedFd>,
@@ -169,6 +180,16 @@ impl Operation {
                     .flags(libc::MSG_NOSIGNAL | libc::MSG_WAITALL)
                     .build()
             }
+            Operation::SendMsg { fd, message, .. } => {
+                opcode::SendMsg::new(types::Fd(fd.as_raw_fd()), &raw const *message.header)
+                    .flags((libc::MSG_NOSIGNAL | libc::MSG_WAITALL) as u32)
+                    .build()
+            }
+            Operation::RecvMsg { fd, message, .. } => {
+                opcode::RecvMsg::new(types::Fd(fd.as_raw_fd()), &raw mut *message.header)
+                    .flags(libc::MSG_WAITALL as u32)
+                    .build()
+            }
             Operation::Shutdown { fd, how } => {
                 opcode::Shutdown::new(types::Fd(fd.as_raw_fd()), *how).build()
             }
@@ -210,6 +231,56 @@ impl Operation {
             Operation::Truncate { fd, len } => {
                 opcode::Ftruncate::new(types::Fd(fd.as_raw_fd()), *len).build()
             }
+        }
+    }
+}
+
+/// The most regions one vectored operation can name.
+const MAX_SEGMENTS: usize = 1024;
+
+/// What `sendmsg` and `recvmsg` take: a list of memory regions, here ones
+/// inside buffers that the operation owns.
+pub(crate) struct Message {
+    header: Box<libc::msghdr>,
+    /// What `header` points at.
+    _regions: Vec<libc::iovec>,
+}
+
+// SAFETY: the pointers lead to the heap allocation of `_regions` and into
+// pool buffers, both owned by the operation the message is part of.
+unsafe impl Send for Message {}
+
+impl Message {
+    /// Names the regions `segments` of `bufs`. With `sending`, they must lie
+    /// within the buffers' contents, otherwise within their capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a segment does not.
+    pub(crate) fn new(bufs: &[FixedBuf], segments: &[Segment], sending: bool) -> Message {
+        assert!(segments.len() <= MAX_SEGMENTS, "too many segments");
+        let mut regions: Vec<libc::iovec> = segments
+            .iter()
+            .map(|segment| {
+                let buf = &bufs[segment.buf];
+                let bound = if sending { buf.len() } else { buf.capacity() };
+                let end = segment.start.checked_add(segment.len);
+                assert!(end.is_some_and(|end| end <= bound), "segment out of bounds");
+                libc::iovec {
+                    // SAFETY: the segment lies within the buffer.
+                    iov_base: unsafe { buf.ptr().add(segment.start) }.cast(),
+                    iov_len: segment.len,
+                }
+            })
+            .collect();
+
+        // SAFETY: `msghdr` is plain data, for which all zeroes is valid.
+        let mut header: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
+        header.msg_iov = regions.as_mut_ptr();
+        header.msg_iovlen = regions.len();
+        Message {
+            header,
+            _regions: regions,
         }
     }
 }

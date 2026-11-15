@@ -136,6 +136,11 @@ impl BufferPool {
         self.inner.buf_size
     }
 
+    /// Number of buffers in the pool.
+    pub fn count(&self) -> usize {
+        self.inner.mapped / self.inner.buf_size
+    }
+
     /// Number of buffers not currently handed out.
     pub fn available(&self) -> usize {
         self.inner.available.available_permits()
@@ -151,6 +156,27 @@ impl BufferPool {
             .expect("the pool never closes its semaphore")
             .forget();
         self.take()
+    }
+
+    /// Takes `count` buffers at once, waiting until that many are free.
+    ///
+    /// A task that needs several buffers at a time must get them this way.
+    /// Taking them one by one can leave tasks each holding some and waiting
+    /// for the rest, forever.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pool has fewer than `count` buffers.
+    pub async fn acquire_many(&self, count: usize) -> Vec<FixedBuf> {
+        assert!(count <= self.count(), "the pool is smaller than that");
+        let permits = u32::try_from(count).expect("a pool holds at most u32::MAX buffers");
+        self.inner
+            .available
+            .acquire_many(permits)
+            .await
+            .expect("the pool never closes its semaphore")
+            .forget();
+        (0..count).map(|_| self.take()).collect()
     }
 
     /// Takes a buffer if one is free.
@@ -224,7 +250,8 @@ impl FixedBuf {
         count
     }
 
-    fn ptr(&self) -> *mut u8 {
+    /// Start of the buffer.
+    pub(crate) fn ptr(&self) -> *mut u8 {
         // SAFETY: `id` names a buffer of the mapping.
         unsafe { self.pool.base.add(self.id as usize * self.pool.buf_size) }.as_ptr()
     }

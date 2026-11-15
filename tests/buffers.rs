@@ -89,6 +89,56 @@ fn acquire_waits_for_a_buffer() {
     });
 }
 
+#[test]
+fn acquire_many_waits_for_all_of_them() {
+    runtime().block_on(async {
+        let pool = BufferPool::new(BUF_SIZE, 3).unwrap();
+        assert_eq!(pool.count(), 3);
+        let held = pool.acquire_many(2).await;
+        assert_eq!(held.len(), 2);
+
+        let waiter = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.acquire_many(2).await.len() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished());
+
+        drop(held);
+        let got = tokio::time::timeout(Duration::from_secs(5), waiter).await;
+        assert_eq!(got.expect("waiter was never woken").unwrap(), 2);
+        assert_eq!(pool.available(), 3);
+    });
+}
+
+/// Tasks that each need the whole pool take turns. Taking the buffers one
+/// by one would leave them holding one apiece, waiting for the other.
+#[test]
+fn acquire_many_does_not_deadlock() {
+    runtime().block_on(async {
+        let pool = BufferPool::new(BUF_SIZE, 2).unwrap();
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    for _ in 0..500 {
+                        let bufs = pool.acquire_many(2).await;
+                        tokio::task::yield_now().await;
+                        drop(bufs);
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(20), task)
+                .await
+                .expect("tasks are stuck")
+                .unwrap();
+        }
+        assert_eq!(pool.available(), 2);
+    });
+}
+
 /// Every worker's ring takes the pool's registration, and a second runtime
 /// can take it as well.
 #[test]
