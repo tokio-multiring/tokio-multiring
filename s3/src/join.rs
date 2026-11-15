@@ -34,3 +34,35 @@ pub(crate) async fn join_all<F: Future>(mut futures: Vec<F>) -> Vec<F::Output> {
         .map(|output| output.expect("every future has finished"))
         .collect()
 }
+
+/// A future that has been polled once, so that the operations it begins
+/// with are under way, to be finished later.
+///
+/// The sidecar's operations go to the kernel the first time they are polled
+/// and complete whether or not anyone polls them again. Starting several
+/// futures and finishing them one at a time therefore runs their I/O side
+/// by side.
+pub(crate) struct Started<F: Future>(State<F>);
+
+enum State<F: Future> {
+    Running(Pin<Box<F>>),
+    Done(F::Output),
+}
+
+impl<F: Future> Started<F> {
+    pub(crate) async fn start(future: F) -> Started<F> {
+        let mut future = Box::pin(future);
+        let first = std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await;
+        Started(match first {
+            Poll::Ready(output) => State::Done(output),
+            Poll::Pending => State::Running(future),
+        })
+    }
+
+    pub(crate) async fn finish(self) -> F::Output {
+        match self.0 {
+            State::Running(future) => future.await,
+            State::Done(output) => output,
+        }
+    }
+}

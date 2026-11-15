@@ -1,6 +1,7 @@
 //! The HTTP exchange: one request in, one response out, as often as the
 //! client keeps the connection.
 
+use std::collections::VecDeque;
 use std::io;
 use std::ops::Range;
 
@@ -13,6 +14,7 @@ use crate::Inner;
 use crate::conn::{Conn, Filled};
 use crate::date;
 use crate::error::ApiError;
+use crate::join::Started;
 use crate::name::{Bucket, Object, Target};
 use crate::store::{Meta, StoreError, Stored, Upload};
 
@@ -555,9 +557,27 @@ async fn store_object(
     Ok(Outcome::new(reply, answer))
 }
 
+/// Takes the buffers for a transfer that moves through `per_round` buffers
+/// at a time and could keep `rounds` rounds going at once. One round's worth
+/// is waited for. More are taken only if they are free, up to the server's
+/// window, so a lone transfer gets a deep pipeline and a crowd of them
+/// shares the pool.
+async fn acquire_window(server: &Inner, per_round: usize, rounds: u64) -> Vec<Vec<FixedBuf>> {
+    let wanted = rounds.min(server.window as u64) as usize;
+    let mut window = vec![server.bodies.acquire_many(per_round).await];
+    while window.len() < wanted {
+        match server.bodies.try_acquire_many(per_round) {
+            Some(bufs) => window.push(bufs),
+            None => break,
+        }
+    }
+    window
+}
+
 /// Moves a request body into `upload`, a round at a time: from the socket
-/// into one buffer per drive, and from each buffer onto its drive. Hands
-/// back the buffers it used.
+/// into one buffer per drive, and from each buffer onto its drive. A round
+/// is written while the next ones are received. Hands back the buffers it
+/// used.
 async fn receive(
     server: &Inner,
     conn: &mut Conn,
@@ -566,14 +586,27 @@ async fn receive(
 ) -> Result<Vec<FixedBuf>, BodyError> {
     let geometry = server.store.geometry();
     let round_len = geometry.round_len();
-    // An object of known size takes no more buffers than it has parts.
-    let parts = body
-        .remaining()
-        .map_or(geometry.drives(), |left| geometry.parts(left));
-    let mut bufs = server.bodies.acquire_many(parts).await;
+    // An object of known size takes no more buffers than it has parts, and
+    // no more rounds than it has.
+    let (parts, rounds) = match body.remaining() {
+        Some(left) => (geometry.parts(left), left.div_ceil(round_len as u64)),
+        None => (geometry.drives(), u64::MAX),
+    };
+    let mut free = acquire_window(server, parts, rounds).await;
+    let mut writing = VecDeque::new();
 
-    let mut round = 0;
     loop {
+        let mut bufs = match free.pop() {
+            Some(bufs) => bufs,
+            None => {
+                let oldest: Started<_> = writing.pop_front().expect("every buffer is in use");
+                let (written, bufs): (io::Result<()>, Vec<FixedBuf>) = oldest.finish().await;
+                written.map_err(BodyError::Store)?;
+                bufs
+            }
+        };
+        bufs.iter_mut().for_each(FixedBuf::clear);
+
         let mut filled = 0;
         while filled < round_len && !body.is_ended() {
             match body.remaining() {
@@ -603,18 +636,25 @@ async fn receive(
             }
         }
         if filled == 0 {
-            return Ok(bufs);
+            free.push(bufs);
+            break;
         }
 
-        let (written, returned) = server.store.write_round(upload, round, bufs, filled).await;
-        bufs = returned;
-        written.map_err(BodyError::Store)?;
+        let round = server.store.begin_round(upload, filled).await;
+        let round = round.map_err(BodyError::Store)?;
+        writing.push_back(Started::start(server.store.write(round, bufs)).await);
         if body.is_ended() {
-            return Ok(bufs);
+            break;
         }
-        bufs.iter_mut().for_each(FixedBuf::clear);
-        round += 1;
     }
+
+    // The upload cannot be finished before everything is written.
+    for write in writing {
+        let (written, bufs) = write.finish().await;
+        written.map_err(BodyError::Store)?;
+        free.push(bufs);
+    }
+    Ok(free.into_iter().flatten().collect())
 }
 
 /// Sends `answer`. Returns whether the connection can take another request.
@@ -676,7 +716,8 @@ async fn respond(
 
 /// Sends the bytes `range` of an object, a round at a time: from every
 /// drive into a buffer of its own, and from the buffers to the socket in the
-/// order the bytes have in the object.
+/// order the bytes have in the object. The rounds to come are read while one
+/// is sent.
 async fn send_object(
     server: &Inner,
     conn: &mut Conn,
@@ -685,16 +726,33 @@ async fn send_object(
     range: Range<u64>,
 ) -> Result<(), Fatal> {
     let geometry = server.store.geometry();
-    let mut bufs = server.bodies.acquire_many(stored.parts()).await;
-    for round in geometry.rounds(&range) {
+    let mut rounds = geometry.rounds(&range);
+    if rounds.is_empty() {
+        return Ok(());
+    }
+    let window = acquire_window(server, stored.parts(), rounds.end - rounds.start).await;
+    let mut read = |bufs| {
+        let round = rounds.next()?;
         let plan = geometry.plan(round, &range);
-        let (read, returned) = server.store.read_round(stored, &plan, bufs).await;
-        bufs = returned;
-        read?;
-        let (sent, returned) = conn.send_vectored(bufs, &plan.segments).await;
-        bufs = returned;
+        Some(server.store.read_round(stored, plan, bufs))
+    };
+
+    let mut reading = VecDeque::new();
+    for bufs in window {
+        let next = read(bufs).expect("the window is no deeper than the rounds");
+        reading.push_back(Started::start(next).await);
+    }
+    while let Some(oldest) = reading.pop_front() {
+        let (got, bufs, plan) = oldest.finish().await;
+        got?;
+        let (sent, bufs) = conn.send_vectored(bufs, &plan.segments).await;
         sent?;
         body.consume_direct_write(plan.len)?;
+        // The buffers go straight back to work on the round after the ones
+        // already under way.
+        if let Some(next) = read(bufs) {
+            reading.push_back(Started::start(next).await);
+        }
     }
     Ok(())
 }

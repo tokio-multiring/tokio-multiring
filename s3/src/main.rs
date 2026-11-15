@@ -14,6 +14,8 @@ usage: sidecar-s3 --root DIR [--root DIR ...] [options]
                         order and the stripe unit must stay as they are for
                         the objects stored under them to remain readable.
   --stripe-unit BYTES   size of the units objects are cut into  [131072]
+  --window N            rounds of an object a transfer keeps going at once,
+                        a round being one buffer per drive      [4]
   --listen ADDR         address to listen on                [127.0.0.1:9000]
   --connections N       connections served at a time        [1024]
   --buffers N           buffers for object data             [256]
@@ -26,6 +28,7 @@ usage: sidecar-s3 --root DIR [--root DIR ...] [options]
 struct Options {
     roots: Vec<PathBuf>,
     stripe_unit: Option<usize>,
+    window: Option<usize>,
     listen: String,
     connections: usize,
     buffers: usize,
@@ -40,6 +43,7 @@ impl Options {
         let mut options = Options {
             roots: Vec::new(),
             stripe_unit: None,
+            window: None,
             listen: String::from("127.0.0.1:9000"),
             connections: 1024,
             buffers: 256,
@@ -62,6 +66,7 @@ impl Options {
                     options.roots.push(PathBuf::from(root));
                 }
                 "--stripe-unit" => options.stripe_unit = Some(number(&flag, args.next())?),
+                "--window" => options.window = Some(number(&flag, args.next())?),
                 "--listen" => {
                     options.listen = args.next().ok_or("--listen needs a value")?;
                 }
@@ -132,6 +137,9 @@ fn run(options: Options) -> std::io::Result<()> {
         config.connections = options.connections;
         if let Some(unit) = options.stripe_unit {
             config.stripe_unit = unit;
+        }
+        if let Some(window) = options.window {
+            config.window = window;
         }
         Server::new(sidecar, config)?.listen(listener);
         let roots: Vec<_> = options.roots.iter().map(|root| root.display()).collect();

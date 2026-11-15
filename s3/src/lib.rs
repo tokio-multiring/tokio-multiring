@@ -63,6 +63,12 @@ pub struct Config {
     /// roots: a multiple of 4096 that the size of the sidecar's buffers is a
     /// multiple of. Part of how objects are stored, like the roots.
     pub stripe_unit: usize,
+    /// How many rounds of an object a transfer keeps going at once, a round
+    /// being one sidecar buffer per drive: at least 1. A download reads
+    /// that far ahead of what it is sending, and an upload writes that far
+    /// behind what it is receiving. A transfer waits for the buffers of one
+    /// round and takes the rest only while they are free.
+    pub window: usize,
     /// How many connections are served at a time. Further ones wait to be
     /// accepted.
     pub connections: usize,
@@ -77,6 +83,7 @@ impl Config {
         Config {
             roots: roots.into_iter().map(Into::into).collect(),
             stripe_unit: 128 * 1024,
+            window: 4,
             connections: 1024,
             head_buffer: 16 * 1024,
         }
@@ -88,6 +95,8 @@ struct Inner {
     store: Store,
     /// The sidecar's registered buffers, which object data moves through.
     bodies: BufferPool,
+    /// How many rounds a transfer keeps going at once.
+    window: usize,
     heads: BufferPool,
     /// One permit per connection that can be served. A permit stands for
     /// two buffers of `heads`.
@@ -113,6 +122,9 @@ impl Server {
         if config.connections == 0 {
             return Err(invalid("a server needs room for a connection"));
         }
+        if config.window == 0 {
+            return Err(invalid("a transfer needs a window of at least one round"));
+        }
         let heads = BufferPool::new(config.head_buffer, 2 * config.connections)?;
         let store = Store::open(sidecar.clone(), &config.roots, config.stripe_unit)?;
         Ok(Server {
@@ -120,6 +132,7 @@ impl Server {
                 sidecar,
                 store,
                 bodies,
+                window: config.window,
                 heads,
                 slots: Arc::new(Semaphore::new(config.connections)),
             }),

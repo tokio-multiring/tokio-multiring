@@ -33,6 +33,11 @@ fn start(name: &str) -> Fixture {
 }
 
 fn start_with(name: &str, drives: usize, polled: bool) -> Fixture {
+    start_on(name, drives, polled, 8)
+}
+
+/// A server whose pool for object data has `buffers` buffers.
+fn start_on(name: &str, drives: usize, polled: bool, buffers: usize) -> Fixture {
     let roots: Vec<PathBuf> = (0..drives)
         .map(|drive| {
             std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -42,11 +47,11 @@ fn start_with(name: &str, drives: usize, polled: bool) -> Fixture {
     for root in &roots {
         std::fs::create_dir(root).unwrap();
     }
-    serve(roots, polled)
+    serve(roots, polled, buffers)
 }
 
 /// Starts a server on the directories `roots`.
-fn serve(roots: Vec<PathBuf>, polled: bool) -> Fixture {
+fn serve(roots: Vec<PathBuf>, polled: bool, buffers: usize) -> Fixture {
     // Two workers on whichever CPUs this process may use.
     let detected = Plan::detect(Hyperthreads::Use).unwrap();
     let cpus = detected
@@ -69,7 +74,7 @@ fn serve(roots: Vec<PathBuf>, polled: bool) -> Fixture {
     let address = listener.local_addr().unwrap();
     runtime.block_on(async {
         let sidecar = Sidecar::start(tokio_sidecar::Config {
-            buffers: Some(BufferPool::new(BUFFER, 8).unwrap()),
+            buffers: Some(BufferPool::new(BUFFER, buffers).unwrap()),
             disk: polled.then(|| DiskConfig {
                 sq_entries: 32,
                 sq_thread_idle: Duration::from_millis(50),
@@ -484,6 +489,62 @@ fn small_objects_use_every_drive() {
     for object in 0..32 {
         assert_eq!(server.reassemble(&format!("object-{object}")), b"small");
     }
+}
+
+/// An object of many rounds, so that a transfer runs with its whole window
+/// of rounds under way: the pool has room for four at a time.
+fn many_rounds(server: &Fixture) {
+    let mut client = server.with_bucket();
+    let round = 2 * BUFFER;
+    let body = pattern(21 * round + 3 * UNIT + 77);
+    assert_eq!(client.put("/bucket/object", &body).status, 200);
+    assert!(server.reassemble("object") == body);
+    assert!(client.get("/bucket/object").body == body);
+
+    // Starting and ending in the middle of rounds, several rounds apart.
+    for range in [
+        round + 5..9 * round - 5,
+        3 * round..4 * round,
+        17 * round - 1..body.len(),
+    ] {
+        let header = format!("bytes={}-{}", range.start, range.end - 1);
+        let part = client.request("GET", "/bucket/object", &[("range", &header)], b"");
+        assert!(part.body == body[range], "{header}");
+    }
+
+    // The same through chunked encoding, where the length is not known.
+    let mut request = Client::head(
+        "PUT",
+        "/bucket/chunked",
+        &[("transfer-encoding", "chunked")],
+    );
+    request.extend_from_slice(b"\r\n");
+    for chunk in body.chunks(100_003) {
+        request.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        request.extend_from_slice(chunk);
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"0\r\n\r\n");
+    client.send(&request);
+    assert_eq!(client.reply(false).status, 200);
+    assert!(server.reassemble("chunked") == body);
+}
+
+#[test]
+fn objects_of_many_rounds() {
+    many_rounds(&start("rounds"));
+}
+
+/// With buffers for one round only, a transfer has no window to speak of
+/// and takes its rounds one at a time.
+#[test]
+fn objects_of_many_rounds_in_a_starved_pool() {
+    many_rounds(&start_on("rounds-starved", 2, false, 2));
+}
+
+#[test]
+fn objects_of_many_rounds_through_polled_rings() {
+    many_rounds(&start_with("rounds-polled", 2, true));
 }
 
 #[test]
@@ -1019,7 +1080,7 @@ fn leftovers_are_swept_at_start() {
     for root in &roots {
         std::fs::write(root.join("bucket/.upload-7"), b"half an object").unwrap();
     }
-    let server = serve(roots, false);
+    let server = serve(roots, false, 8);
     assert_eq!(server.files(), kept);
     assert!(server.connect().get("/bucket/.upload-7").body == body);
 }
@@ -1041,7 +1102,7 @@ fn another_arrangement_of_drives_is_refused() {
         std::fs::create_dir_all(root.join("bucket")).unwrap();
         roots.push(root);
     }
-    let server = serve(roots, false);
+    let server = serve(roots, false, 8);
     // Where the key hashes to now may or may not be where the object is.
     let reply = server.connect().get("/bucket/object");
     assert!(

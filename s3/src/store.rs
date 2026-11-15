@@ -92,6 +92,14 @@ pub(crate) struct Upload {
     ended: bool,
 }
 
+/// A round of an upload that is ready to be written.
+pub(crate) struct RoundWrite {
+    round: u64,
+    /// For each part the round reaches: its file, and how many bytes of
+    /// the round are its own.
+    parts: Vec<(Arc<OwnedFd>, usize)>,
+}
+
 /// A part that is being written.
 struct Staged {
     file: Arc<OwnedFd>,
@@ -390,13 +398,13 @@ impl Store {
     }
 
     /// Reads what `plan` asks for into `bufs`, one buffer per part of the
-    /// object, from all drives at once.
+    /// object, from all drives at once. Hands the plan back with the result.
     pub(crate) async fn read_round(
         &self,
         stored: &Stored,
-        plan: &Plan,
+        plan: Plan,
         bufs: Vec<FixedBuf>,
-    ) -> (io::Result<()>, Vec<FixedBuf>) {
+    ) -> (io::Result<()>, Vec<FixedBuf>, Plan) {
         let reads: Vec<_> = bufs
             .into_iter()
             .enumerate()
@@ -425,7 +433,7 @@ impl Store {
             result = result.and(got);
             bufs.push(buf);
         }
-        (result, bufs)
+        (result, bufs, plan)
     }
 
     /// The header of what `object` names at the moment, if it names
@@ -530,70 +538,73 @@ impl Store {
         Ok(upload)
     }
 
-    /// Appends a round to the upload: the next `filled` bytes of the object,
-    /// laid out from the start of each of `bufs` as
+    /// Accounts for the next round of the upload: `filled` bytes of the
+    /// object, laid out from the start of one buffer per part as
     /// [`Geometry::fill`] has them. Every round but the last must be a full
-    /// one. Writes to all drives at once.
-    pub(crate) async fn write_round(
+    /// one. Hands back what [`write`](Self::write) needs to put the round on
+    /// the drives, which it can do while later rounds are being received.
+    pub(crate) async fn begin_round(
         &self,
         upload: &mut Upload,
-        round: u64,
-        bufs: Vec<FixedBuf>,
         filled: usize,
-    ) -> (io::Result<()>, Vec<FixedBuf>) {
+    ) -> io::Result<RoundWrite> {
         assert!(!upload.ended, "a short round ends the upload");
-        let lens: Vec<usize> = (0..bufs.len())
-            .map(|part| self.geometry.part_len(filled as u64, part) as usize)
-            .collect();
-        assert_eq!(lens.iter().sum::<usize>(), filled, "too few buffers");
-
-        for (part, &len) in lens.iter().enumerate() {
-            if len > 0 && upload.parts[part].is_none() {
-                match self.stage(upload, part).await {
-                    Ok(staged) => upload.parts[part] = Some(staged),
-                    Err(error) => return (Err(error), bufs),
-                }
+        let round = upload.size / self.geometry.round_len() as u64;
+        let mut parts = Vec::new();
+        for part in 0..self.drives.len() {
+            let len = self.geometry.part_len(filled as u64, part) as usize;
+            if len == 0 {
+                break;
             }
+            if upload.parts[part].is_none() {
+                upload.parts[part] = Some(self.stage(upload, part).await?);
+            }
+            let staged = upload.parts[part].as_mut().expect("staged above");
+            // Direct writes are whole blocks. Only the last round can fall
+            // short of one, and its padding is cut off when the upload
+            // finishes.
+            staged.padded |= len % BLOCK != 0;
+            parts.push((staged.file.clone(), len));
         }
+        upload.size += filled as u64;
+        upload.ended = filled < self.geometry.round_len();
+        Ok(RoundWrite { round, parts })
+    }
 
+    /// Writes a round from `bufs`, to all drives at once.
+    pub(crate) async fn write(
+        &self,
+        round: RoundWrite,
+        bufs: Vec<FixedBuf>,
+    ) -> (io::Result<()>, Vec<FixedBuf>) {
+        assert!(round.parts.len() <= bufs.len(), "too few buffers");
         let chunk = self.geometry.chunk() as u64;
+        let mut parts = round.parts.into_iter();
         let writes: Vec<_> = bufs
             .into_iter()
-            .zip(&lens)
             .enumerate()
-            .map(|(part, (mut buf, &len))| {
-                let file = upload.parts[part]
-                    .as_ref()
-                    .map(|staged| staged.file.clone());
+            .map(|(part, mut buf)| {
+                let target = parts.next();
                 async move {
-                    let Some(file) = file.filter(|_| len > 0) else {
-                        return (Ok(false), buf);
+                    let Some((file, len)) = target else {
+                        return (Ok(()), buf);
                     };
-                    // Direct writes are whole blocks. The padding of the
-                    // last one is cut off when the upload finishes.
                     let padding = len.next_multiple_of(BLOCK) - len;
                     buf.clear();
                     buf.grow(len);
                     buf.extend_from_slice(&ZEROS[..padding]);
-                    let offset = round * chunk + if part == 0 { HEADER as u64 } else { 0 };
-                    let (written, buf) = self.write_at(&file, buf, offset).await;
-                    (written.map(|()| padding > 0), buf)
+                    let offset = round.round * chunk + if part == 0 { HEADER as u64 } else { 0 };
+                    self.write_at(&file, buf, offset).await
                 }
             })
             .collect();
 
         let mut result = Ok(());
         let mut bufs = Vec::with_capacity(writes.len());
-        for (part, (written, buf)) in join_all(writes).await.into_iter().enumerate() {
+        for (written, buf) in join_all(writes).await {
+            result = result.and(written);
             bufs.push(buf);
-            match (written, upload.parts[part].as_mut()) {
-                (Ok(padded), Some(staged)) => staged.padded |= padded,
-                (Ok(_), None) => {}
-                (Err(error), _) => result = result.and(Err(error)),
-            }
         }
-        upload.size += filled as u64;
-        upload.ended = filled < self.geometry.round_len();
         (result, bufs)
     }
 
