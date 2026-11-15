@@ -24,6 +24,8 @@ struct Inner {
     buf_size: usize,
     /// How many buffers share one registered buffer.
     bufs_per_registered: usize,
+    /// Whether the mapping was made with transparent huge pages asked for.
+    huge_pages: bool,
     /// Holds the registration that other rings clone.
     registry: IoUring,
     free: Mutex<Vec<u32>>,
@@ -63,6 +65,23 @@ impl BufferPool {
     /// start page-aligned, as `O_DIRECT` requires, and the pool asks for
     /// transparent huge pages, which it gets where its size allows.
     pub fn new(buf_size: usize, count: usize) -> io::Result<BufferPool> {
+        BufferPool::map(buf_size, count, true)
+    }
+
+    /// Like [`new`](Self::new), on ordinary pages.
+    ///
+    /// Huge pages make a registered buffer cheaper for the kernel to walk,
+    /// which helps file I/O. They cannot be combined with registered
+    /// zero-copy sends, though: see
+    /// [`Sidecar::send_zc_vectored`](crate::Sidecar::send_zc_vectored),
+    /// which registers nothing for a pool on huge pages and has the kernel
+    /// pin the pages on every send instead. A pool on ordinary pages spares
+    /// it that.
+    pub fn without_huge_pages(buf_size: usize, count: usize) -> io::Result<BufferPool> {
+        BufferPool::map(buf_size, count, false)
+    }
+
+    fn map(buf_size: usize, count: usize, huge_pages: bool) -> io::Result<BufferPool> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
         if buf_size == 0 || buf_size % PAGE != 0 || buf_size > MAX_REGISTERED {
             return Err(invalid(
@@ -97,9 +116,13 @@ impl BufferPool {
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        // Advice only: without huge pages the pool works the same, slower.
+        // Advice only: the pool works the same either way.
+        let advice = match huge_pages {
+            true => libc::MADV_HUGEPAGE,
+            false => libc::MADV_NOHUGEPAGE,
+        };
         // SAFETY: the range is the mapping just created.
-        unsafe { libc::madvise(base, mapped, libc::MADV_HUGEPAGE) };
+        unsafe { libc::madvise(base, mapped, advice) };
 
         // From here on `inner` owns the mapping and unmaps it on any error.
         let inner = Inner {
@@ -107,6 +130,7 @@ impl BufferPool {
             mapped,
             buf_size,
             bufs_per_registered,
+            huge_pages,
             registry: IoUring::new(1)?,
             free: Mutex::new((0..ids).rev().collect()),
             available: Semaphore::new(count),
@@ -218,6 +242,11 @@ impl BufferPool {
     pub(crate) fn register_on(&self, ring: &IoUring) -> io::Result<()> {
         ring.submitter()
             .register_buffers_clone(self.inner.registry.as_raw_fd())
+    }
+
+    /// Whether the pool asked for huge pages.
+    pub(crate) fn huge_pages(&self) -> bool {
+        self.inner.huge_pages
     }
 
     pub(crate) fn owns(&self, buf: &FixedBuf) -> bool {

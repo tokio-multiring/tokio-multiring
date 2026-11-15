@@ -2,7 +2,11 @@ use std::ffi::CString;
 use std::future::Future;
 use std::io;
 use std::os::fd::OwnedFd;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use tokio::sync::oneshot;
 
 use crate::buffers::FixedBuf;
 use crate::op::{Message, Op, Operation};
@@ -377,6 +381,69 @@ impl Sidecar {
         }
     }
 
+    /// Like [`send_vectored`](Self::send_vectored), without copying: the
+    /// network stack sends from the buffers themselves.
+    ///
+    /// The send is complete when everything is queued on the socket, as any
+    /// send is. The kernel goes on referring to the buffers after that, for
+    /// as long as it may have to transmit their contents again, which is
+    /// until the peer has acknowledged them. So the buffers do not come back
+    /// with the result. In their place comes a [`Reclaim`], which yields
+    /// them once the kernel has let go.
+    ///
+    /// That makes the buffers a sender holds the measure of what it has in
+    /// flight. A caller that sends only from buffers it has reclaimed can
+    /// never have more outstanding than it owns buffers, however fast it is
+    /// and however slow its peer.
+    ///
+    /// Avoiding the copy pays for sends of some size: tens of kilobytes and
+    /// up. Whether the copy is in fact avoided is up to the route the data
+    /// takes. Loopback, for one, copies. See [`Reclaimed::copied`].
+    ///
+    /// Buffers from this sidecar's pool are sent as registered buffers if
+    /// the pool is on ordinary pages. For a pool on huge pages, and for
+    /// other buffers, the kernel pins the pages of each send as it goes.
+    /// The reason is a mistake in Linux, in every release up to 7.0 at
+    /// least: a region of a registered buffer on a huge page is charged to
+    /// the socket as if it began at the start of that page, so a socket
+    /// counts as full after a small fraction of what it could hold, and
+    /// sends crawl.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a segment reaches past the contents of its buffer, or if
+    /// there are more than 1024 segments.
+    pub fn send_zc_vectored(
+        &self,
+        fd: Arc<OwnedFd>,
+        bufs: Vec<FixedBuf>,
+        segments: &[Segment],
+    ) -> impl Future<Output = (io::Result<usize>, Reclaim)> + Send + use<> {
+        let message = Message::new(&bufs, segments, true);
+        // One send names one registered buffer, which all of it must be in.
+        let registered = self
+            .buffers()
+            .filter(|pool| !pool.huge_pages() && bufs.iter().all(|buf| pool.owns(buf)))
+            .and_then(|_| bufs.first().map(FixedBuf::registered_index))
+            .filter(|&index| bufs.iter().all(|buf| buf.registered_index() == index));
+        let (reclaim, reclaimed) = oneshot::channel();
+        let op = Op::new(
+            self,
+            Operation::SendMsgZc {
+                fd,
+                bufs,
+                message,
+                registered,
+                copied: false,
+                reclaim,
+            },
+        );
+        async move {
+            let sent = op.await.result.map(|sent| sent as usize);
+            (sent, Reclaim(reclaimed))
+        }
+    }
+
     /// Shuts down one or both directions of the socket `fd`. Shutting down
     /// writing tells the peer that nothing more is coming, while what it
     /// sends can still be received.
@@ -524,6 +591,45 @@ impl Sidecar {
         let op = Op::new(self, operation);
         async move { op.await.result.map(drop) }
     }
+}
+
+/// The buffers of a zero-copy send, on their way back from the kernel. A
+/// future that yields them when the kernel has let go of them.
+///
+/// Dropping it does not lose the buffers: they return to their pool when
+/// the kernel is done.
+pub struct Reclaim(oneshot::Receiver<Reclaimed>);
+
+impl Reclaim {
+    /// Takes the buffers if the kernel has already let go of them.
+    pub fn try_take(&mut self) -> Option<Reclaimed> {
+        self.0.try_recv().ok()
+    }
+}
+
+impl Future for Reclaim {
+    type Output = Reclaimed;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Reclaimed> {
+        Pin::new(&mut self.0).poll(cx).map(|reclaimed| {
+            // An operation that never reached the kernel is dropped whole,
+            // and its buffers are back in their pool.
+            reclaimed.unwrap_or(Reclaimed {
+                bufs: Vec::new(),
+                copied: false,
+            })
+        })
+    }
+}
+
+/// What a [`Reclaim`] yields.
+pub struct Reclaimed {
+    /// The buffers, in the order they were given. None if the send was
+    /// given up before it reached the kernel: they are in their pool then.
+    pub bufs: Vec<FixedBuf>,
+    /// Whether the kernel could not confirm that it sent without copying.
+    /// It copies when the data's route calls for it, as loopback does.
+    pub copied: bool,
 }
 
 /// A region of one of the buffers given to a vectored operation.

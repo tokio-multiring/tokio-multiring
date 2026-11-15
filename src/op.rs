@@ -7,10 +7,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use io_uring::{opcode, squeue, types};
+use tokio::sync::oneshot;
 
 use crate::buffers::FixedBuf;
 use crate::landing::{Landing, TaskRef};
-use crate::ops::Segment;
+use crate::ops::{Reclaimed, Segment};
 use crate::reactor::{Sidecar, Ticket};
 
 /// An operation and everything the kernel needs kept alive while it runs.
@@ -74,6 +75,23 @@ pub(crate) enum Operation {
         bufs: Vec<FixedBuf>,
         message: Message,
     },
+    /// A send that the kernel completes twice: once with the result, and
+    /// once more when it no longer refers to the buffers.
+    SendMsgZc {
+        fd: Arc<OwnedFd>,
+        bufs: Vec<FixedBuf>,
+        message: Message,
+        /// The registered buffer that all of the message lies in, if it is
+        /// to be sent as one.
+        registered: Option<u16>,
+        /// Whether the kernel reported copying the data after all.
+        copied: bool,
+        /// Where the buffers go when the kernel is done with them.
+        reclaim: oneshot::Sender<Reclaimed>,
+    },
+    /// What a completion carries in place of an operation that the reactor
+    /// keeps, because the kernel is not done with it.
+    Retained,
     Shutdown {
         fd: Arc<OwnedFd>,
         how: i32,
@@ -190,6 +208,17 @@ impl Operation {
                     .flags(libc::MSG_WAITALL as u32)
                     .build()
             }
+            Operation::SendMsgZc {
+                fd,
+                message,
+                registered,
+                ..
+            } => opcode::SendMsgZc::new(types::Fd(fd.as_raw_fd()), &raw const *message.header)
+                .flags((libc::MSG_NOSIGNAL | libc::MSG_WAITALL) as u32)
+                .ioprio(SEND_ZC_REPORT_USAGE)
+                .buf_index(*registered)
+                .build(),
+            Operation::Retained => unreachable!("never submitted"),
             Operation::Shutdown { fd, how } => {
                 opcode::Shutdown::new(types::Fd(fd.as_raw_fd()), *how).build()
             }
@@ -234,6 +263,13 @@ impl Operation {
         }
     }
 }
+
+/// Has the kernel say, when it lets go of a zero-copy send's buffers,
+/// whether it copied the data.
+const SEND_ZC_REPORT_USAGE: u16 = 1 << 3;
+
+/// Set in what the kernel says then, if it did.
+const NOTIF_USAGE_ZC_COPIED: u32 = 1 << 31;
 
 /// The most regions one vectored operation can name.
 const MAX_SEGMENTS: usize = 1024;
@@ -286,6 +322,35 @@ impl Message {
 }
 
 impl Operation {
+    /// Whether the kernel completes the operation a second time, when it
+    /// lets go of the operation's buffers.
+    pub(crate) fn completes_twice(&self) -> bool {
+        matches!(self, Operation::SendMsgZc { .. })
+    }
+
+    /// Records what the kernel said in the second completion.
+    pub(crate) fn note_release(&mut self, notice: i32) {
+        if let Operation::SendMsgZc { copied, .. } = self {
+            *copied = notice as u32 & NOTIF_USAGE_ZC_COPIED != 0;
+        }
+    }
+
+    /// Disposes of an operation that the kernel is done with and that no
+    /// future is going to collect. Runs foreign code: buffers go back to
+    /// their pool or on to whoever waits for them.
+    pub(crate) fn release(self) {
+        if let Operation::SendMsgZc {
+            bufs,
+            copied,
+            reclaim,
+            ..
+        } = self
+        {
+            // With nobody waiting, the buffers return to their pool.
+            let _ = reclaim.send(Reclaimed { bufs, copied });
+        }
+    }
+
     /// Whether the operation belongs on the polled disk ring.
     pub(crate) fn polled(&self) -> bool {
         matches!(

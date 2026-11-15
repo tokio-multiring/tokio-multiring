@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::task::Poll;
@@ -16,6 +16,14 @@ fn runtime() -> tokio::runtime::Runtime {
         .on_before_steal(tokio_sidecar::before_steal)
         .build()
         .unwrap()
+}
+
+/// A connected pair of TCP sockets, ours first.
+fn tcp_pair() -> (Arc<OwnedFd>, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let ours = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (theirs, _) = listener.accept().unwrap();
+    (Arc::new(OwnedFd::from(ours)), theirs)
 }
 
 fn socket_pair() -> (Arc<OwnedFd>, UnixStream) {
@@ -256,6 +264,224 @@ fn vectored_transfers_larger_than_the_socket_buffer() {
             received.grow(UNITS * UNIT);
             assert!(sent[..] == received[..]);
         }
+    });
+}
+
+/// A pool of two buffers of `size` bytes, on huge pages or not. The two
+/// kinds are sent in different ways: see `Sidecar::send_zc_vectored`.
+fn pool_of(size: usize, huge_pages: bool) -> BufferPool {
+    match huge_pages {
+        true => BufferPool::new(size, 2).unwrap(),
+        false => BufferPool::without_huge_pages(size, 2).unwrap(),
+    }
+}
+
+async fn sidecar_with(pool: &BufferPool) -> Sidecar {
+    Sidecar::start(Config {
+        buffers: Some(pool.clone()),
+        ..Config::default()
+    })
+    .await
+    .unwrap()
+}
+
+fn zero_copy_send(huge_pages: bool) {
+    const UNIT: usize = 128 * 1024;
+    const UNITS: usize = 8;
+
+    let (ours, mut theirs) = tcp_pair();
+    let pool = pool_of(UNITS * UNIT, huge_pages);
+    // Units alternate between the two buffers, and the first is cut short.
+    let mut segments: Vec<Segment> = (0..2 * UNITS)
+        .map(|unit| segment(unit % 2, unit / 2 * UNIT, UNIT))
+        .collect();
+    segments[0] = segment(0, 5, UNIT - 5);
+    let total = 2 * UNITS * UNIT - 5;
+
+    let reader = std::thread::spawn(move || {
+        let mut received = vec![0; total];
+        theirs.read_exact(&mut received).unwrap();
+        received
+    });
+
+    runtime().block_on(async {
+        let sidecar = sidecar_with(&pool).await;
+        let mut bufs = pool.acquire_many(2).await;
+        for (index, buf) in bufs.iter_mut().enumerate() {
+            let fill: Vec<u8> = (0..UNITS * UNIT)
+                .map(|byte| (index + byte / UNIT * 2 + byte % 7) as u8)
+                .collect();
+            buf.extend_from_slice(&fill);
+        }
+        let expected: Vec<u8> = segments
+            .iter()
+            .flat_map(|segment| bufs[segment.buf][segment.start..][..segment.len].to_vec())
+            .collect();
+
+        let (sent, reclaim) = sidecar.send_zc_vectored(ours, bufs, &segments).await;
+        assert_eq!(sent.unwrap(), total);
+        // The kernel still has the buffers, or has just handed them over:
+        // either way they are not in the pool.
+        assert_eq!(pool.available(), 0);
+
+        let reclaimed = tokio::time::timeout(Duration::from_secs(5), reclaim)
+            .await
+            .expect("the kernel never let go of the buffers");
+        assert_eq!(reclaimed.bufs.len(), 2);
+        assert_eq!(reclaimed.bufs[0].len(), UNITS * UNIT);
+        // Loopback delivers by copying.
+        assert!(reclaimed.copied);
+        assert!(reader.join().unwrap() == expected);
+
+        drop(reclaimed);
+        assert_eq!(pool.available(), 2);
+        assert_eq!(sidecar.in_flight(), 0);
+    });
+}
+
+#[test]
+fn zero_copy_send_from_registered_buffers() {
+    zero_copy_send(false);
+}
+
+#[test]
+fn zero_copy_send_from_huge_pages() {
+    zero_copy_send(true);
+}
+
+/// Nobody has to wait for the buffers: they find their own way back.
+#[test]
+fn unclaimed_zero_copy_buffers_return_to_the_pool() {
+    let (ours, mut theirs) = tcp_pair();
+    let pool = pool_of(4096, false);
+
+    runtime().block_on(async {
+        let sidecar = sidecar_with(&pool).await;
+        let mut bufs = pool.acquire_many(2).await;
+        bufs[0].extend_from_slice(b"zero ");
+        bufs[1].extend_from_slice(b"copy");
+        let segments = [segment(0, 0, 5), segment(1, 0, 4)];
+        let (sent, reclaim) = sidecar.send_zc_vectored(ours, bufs, &segments).await;
+        assert_eq!(sent.unwrap(), 9);
+        drop(reclaim);
+
+        let mut received = [0; 9];
+        theirs.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"zero copy");
+        tokio::time::timeout(Duration::from_secs(5), pool.acquire_many(2))
+            .await
+            .expect("buffers never came back");
+        assert_eq!(sidecar.in_flight(), 0);
+    });
+}
+
+/// With the peer not reading, what was sent stays the kernel's, and so do
+/// the buffers it is in. Sending only from buffers that have come back is
+/// what keeps a sender from running ahead of its peer.
+#[test]
+fn zero_copy_buffers_are_held_while_the_peer_does_not_read() {
+    const SIZE: usize = 1 << 20;
+
+    let (ours, mut theirs) = tcp_pair();
+    let pool = pool_of(SIZE, false);
+
+    runtime().block_on(async {
+        let sidecar = sidecar_with(&pool).await;
+        let mut bufs = pool.acquire_many(1).await;
+        bufs[0].extend_from_slice(&vec![7; SIZE]);
+        let whole = [segment(0, 0, SIZE)];
+        let (sent, mut reclaim) = sidecar.send_zc_vectored(ours, bufs, &whole).await;
+        assert_eq!(sent.unwrap(), SIZE);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(reclaim.try_take().is_none());
+        assert_eq!(pool.available(), 1);
+        assert_eq!(sidecar.in_flight(), 1);
+
+        let reader = std::thread::spawn(move || {
+            let mut received = vec![0; SIZE];
+            theirs.read_exact(&mut received).unwrap();
+            received
+        });
+        let reclaimed = tokio::time::timeout(Duration::from_secs(5), reclaim)
+            .await
+            .expect("the kernel never let go of the buffer");
+        assert_eq!(reclaimed.bufs.len(), 1);
+        assert!(reader.join().unwrap().iter().all(|&byte| byte == 7));
+    });
+}
+
+/// The future is dropped while the send is stuck behind a peer that is not
+/// reading. The send is cancelled, and the buffers come back once the
+/// kernel has dropped what it had queued.
+#[test]
+fn dropped_zero_copy_send_returns_its_buffers() {
+    const SIZE: usize = 8 << 20;
+
+    let (ours, theirs) = tcp_pair();
+    let pool = pool_of(SIZE, false);
+
+    runtime().block_on(async {
+        let sidecar = sidecar_with(&pool).await;
+        let mut bufs = pool.acquire_many(2).await;
+        for buf in &mut bufs {
+            buf.extend_from_slice(&vec![1; SIZE]);
+        }
+        // More than the socket takes with nobody reading.
+        let segments = [segment(0, 0, SIZE), segment(1, 0, SIZE)];
+        let send = sidecar.send_zc_vectored(ours, bufs, &segments);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), send)
+                .await
+                .is_err()
+        );
+        assert_eq!(pool.available(), 0);
+
+        // The connection goes away, and with it what was queued on it.
+        drop(theirs);
+        tokio::time::timeout(Duration::from_secs(5), pool.acquire_many(2))
+            .await
+            .expect("buffers never came back");
+        assert_eq!(sidecar.in_flight(), 0);
+    });
+}
+
+/// A send that fails still accounts for its buffers.
+#[test]
+fn failed_zero_copy_send_hands_its_buffers_back() {
+    let (ours, theirs) = tcp_pair();
+    let pool = pool_of(4096, false);
+    // Reset the connection: a later send finds it broken.
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let set = unsafe {
+        libc::setsockopt(
+            theirs.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            std::ptr::from_ref(&linger).cast(),
+            size_of::<libc::linger>() as u32,
+        )
+    };
+    assert_eq!(set, 0);
+    drop(theirs);
+
+    runtime().block_on(async {
+        let sidecar = sidecar_with(&pool).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut bufs = pool.acquire_many(1).await;
+        bufs[0].extend_from_slice(b"anyone?");
+        let (sent, reclaim) = sidecar
+            .send_zc_vectored(ours, bufs, &[segment(0, 0, 7)])
+            .await;
+        assert!(sent.is_err());
+        let reclaimed = tokio::time::timeout(Duration::from_secs(5), reclaim)
+            .await
+            .expect("the buffer never came back");
+        assert_eq!(&reclaimed.bufs[0][..], b"anyone?");
+        assert_eq!(sidecar.in_flight(), 0);
     });
 }
 

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Waker;
 use std::time::Duration;
 
-use io_uring::{IoUring, opcode, squeue};
+use io_uring::{IoUring, cqueue, opcode, squeue};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::runtime::Handle;
@@ -308,8 +308,9 @@ impl Sidecar {
         self.inner.disk.is_some()
     }
 
-    /// Number of operations handed to a ring and not yet completed, across
-    /// all workers.
+    /// Number of operations handed to a ring that the kernel is not done
+    /// with, across all workers. A zero-copy send counts until the kernel
+    /// has let go of its buffers.
     pub fn in_flight(&self) -> usize {
         self.inner
             .workers
@@ -446,6 +447,13 @@ struct InFlight {
     cell: CellRef,
     task: TaskRef,
     operation: Operation,
+    /// Set once the result has been delivered while the kernel still refers
+    /// to the operation's buffers. The slot is kept until it says it is done
+    /// with them.
+    lingering: bool,
+    /// What the kernel said when it let go of the buffers, if that came
+    /// before the result could be delivered.
+    let_go: Option<i32>,
 }
 
 /// One worker's ring. Only ever touched from that worker's thread.
@@ -457,8 +465,9 @@ struct Reactor {
     slots: RefCell<Vec<Option<InFlight>>>,
     /// Leases for slots that are empty.
     free: RefCell<Vec<Lease>>,
-    /// Results whose future was busy with its waker when they came in.
-    deferred: RefCell<Vec<(u64, i32)>>,
+    /// Completions whose future was busy with its waker when they came in:
+    /// token, result and flags.
+    deferred: RefCell<Vec<(u64, i32, u32)>>,
     /// Scratch space for `turn` and `reap`, kept to reuse the allocations.
     remote: RefCell<Vec<Remote>>,
     wakers: RefCell<Vec<Waker>>,
@@ -613,6 +622,8 @@ impl Reactor {
                 cell: lease.cell,
                 task,
                 operation,
+                lingering: false,
+                let_go: None,
             });
         }
         self.shared().in_flight.fetch_add(1, Ordering::Relaxed);
@@ -626,8 +637,8 @@ impl Reactor {
             let result = -error.raw_os_error().unwrap_or(libc::EIO);
             let mut wakers = self.wakers.take();
             let mut released = self.released.take();
-            if !self.resolve(token, result, &mut wakers, &mut released) {
-                self.deferred.borrow_mut().push((token, result));
+            if !self.resolve(token, result, 0, &mut wakers, &mut released) {
+                self.deferred.borrow_mut().push((token, result, 0));
                 self.notify_driver();
             }
             self.deliver(wakers, released);
@@ -635,51 +646,92 @@ impl Reactor {
         token
     }
 
-    /// Ends the operation `token` with `result`: writes it into the waiting
-    /// future, or releases the operation if the future is gone. Returns
-    /// `false`, leaving everything in place, if the future is busy.
+    /// Handles a completion of the operation `token`: writes its result into
+    /// the waiting future, or releases the operation if the future is gone.
+    /// Returns `false`, leaving everything in place, if the future is busy.
     ///
-    /// Waking the future and dropping an abandoned operation are left to
-    /// the caller, to be done with no borrow held.
+    /// An operation that completes twice keeps its slot between the two:
+    /// the first completion delivers the result, and the second, flagged as
+    /// a notification, says that the kernel no longer refers to the
+    /// operation's buffers.
+    ///
+    /// Waking the future and letting go of an operation are left to the
+    /// caller, to be done with no borrow held.
     fn resolve(
         &self,
         token: u64,
         result: i32,
+        flags: u32,
         wakers: &mut Vec<Waker>,
         released: &mut Vec<Operation>,
     ) -> bool {
         let generation = generation_of(token);
-        let finished = {
+        let cell = {
             let mut slots = self.slots.borrow_mut();
             let slot = &mut slots[key_of(token)];
             let in_flight = slot
-                .as_ref()
+                .as_mut()
                 .expect("completion for an operation that is not in flight");
             debug_assert_eq!(in_flight.token, token);
 
-            // SAFETY: the reactor keeps the pool alive.
-            let deliver = match unsafe { in_flight.cell.get() }.claim(generation) {
-                Claim::Deliver => true,
-                Claim::Abandoned => false,
-                Claim::Busy => return false,
-            };
-            let finished = slot.take().expect("checked above");
-            let completion = Completion::new(result, finished.operation);
-            if deliver {
-                // SAFETY: the claim was granted, so the future is alive and
-                // leaves its landing alone until the delivery is complete.
-                wakers.extend(unsafe { finished.task.get().deliver(completion) });
+            if cqueue::notif(flags) {
+                if !in_flight.lingering {
+                    // The result is still waiting for its future.
+                    in_flight.let_go = Some(result);
+                    return true;
+                }
+                let mut finished = slot.take().expect("checked above");
+                finished.operation.note_release(result);
+                released.push(finished.operation);
+                finished.cell
             } else {
-                released.push(completion.operation);
+                // SAFETY: the reactor keeps the pool alive.
+                let cell = unsafe { in_flight.cell.get() };
+                let deliver = match cell.claim(generation) {
+                    Claim::Deliver => true,
+                    Claim::Abandoned => false,
+                    Claim::Busy => return false,
+                };
+                let task = in_flight.task;
+                let mut deliver = |completion: Completion| {
+                    if deliver {
+                        // SAFETY: the claim was granted, so the future is
+                        // alive and leaves its landing alone until the
+                        // delivery is complete.
+                        wakers.extend(unsafe { task.get().deliver(completion) });
+                        None
+                    } else {
+                        Some(completion.operation)
+                    }
+                };
+
+                if !in_flight.operation.completes_twice() {
+                    let finished = slot.take().expect("checked above");
+                    released.extend(deliver(Completion::new(result, finished.operation)));
+                    cell.retire(generation);
+                    finished.cell
+                } else {
+                    // The future gets the result alone. The operation stays
+                    // for as long as the kernel refers to its buffers.
+                    deliver(Completion::new(result, Operation::Retained));
+                    cell.retire(generation);
+                    if cqueue::more(flags) && in_flight.let_go.is_none() {
+                        in_flight.lingering = true;
+                        return true;
+                    }
+                    let mut finished = slot.take().expect("checked above");
+                    finished
+                        .operation
+                        .note_release(finished.let_go.unwrap_or(0));
+                    released.push(finished.operation);
+                    finished.cell
+                }
             }
-            finished.cell
         };
 
-        // SAFETY: as above.
-        unsafe { finished.get() }.retire(generation);
         self.release(Lease {
             index: key_of(token) as u32,
-            cell: finished,
+            cell,
         });
         self.shared().in_flight.fetch_sub(1, Ordering::Relaxed);
         true
@@ -707,7 +759,7 @@ impl Reactor {
     /// nobody is waiting for. Both run foreign code, so the caller must hold
     /// no borrow.
     fn deliver(&self, mut wakers: Vec<Waker>, mut released: Vec<Operation>) {
-        released.clear();
+        released.drain(..).for_each(Operation::release);
         for waker in wakers.drain(..) {
             waker.wake();
         }
@@ -877,15 +929,16 @@ impl Reactor {
         let mut released = self.released.take();
         let mut deferred = self.deferred.take();
 
-        deferred
-            .retain(|&(token, result)| !self.resolve(token, result, &mut wakers, &mut released));
+        deferred.retain(|&(token, result, flags)| {
+            !self.resolve(token, result, flags, &mut wakers, &mut released)
+        });
         for ring in std::iter::once(&self.ring).chain(&self.disk) {
             for cqe in ring.borrow_mut().completion() {
-                let token = cqe.user_data();
+                let (token, result, flags) = (cqe.user_data(), cqe.result(), cqe.flags());
                 if token != DETACHED
-                    && !self.resolve(token, cqe.result(), &mut wakers, &mut released)
+                    && !self.resolve(token, result, flags, &mut wakers, &mut released)
                 {
-                    deferred.push((token, cqe.result()));
+                    deferred.push((token, result, flags));
                 }
             }
         }
