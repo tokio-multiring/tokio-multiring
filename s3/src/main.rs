@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use sidecar_s3::{Config, Server};
+use sidecar_s3::{Config, Server, ZeroCopy};
 use tokio_sidecar::{BufferPool, DiskConfig, Hyperthreads, Plan, Sidecar};
 
 const USAGE: &str = "\
@@ -20,6 +20,12 @@ usage: sidecar-s3 --root DIR [--root DIR ...] [options]
   --connections N       connections served at a time        [1024]
   --buffers N           buffers for object data             [256]
   --buffer-size BYTES   size of each, a multiple of 4096    [1048576]
+  --zero-copy WHO       whose downloads are sent from the buffers without
+                        copying: never, remote (clients on other machines)
+                        or always                               [remote]
+  --small-pages         keep the buffers on ordinary pages. Zero-copy sends
+                        then use them as registered buffers; on huge pages
+                        the kernel pins them send by send
   --domains N           use only the first N cache domains  [all]
   --hyperthreads        put workers on both threads of a core
   --polled              read and write objects through polled disk rings,
@@ -29,6 +35,8 @@ struct Options {
     roots: Vec<PathBuf>,
     stripe_unit: Option<usize>,
     window: Option<usize>,
+    zero_copy: ZeroCopy,
+    small_pages: bool,
     listen: String,
     connections: usize,
     buffers: usize,
@@ -44,6 +52,8 @@ impl Options {
             roots: Vec::new(),
             stripe_unit: None,
             window: None,
+            zero_copy: ZeroCopy::Remote,
+            small_pages: false,
             listen: String::from("127.0.0.1:9000"),
             connections: 1024,
             buffers: 256,
@@ -74,6 +84,15 @@ impl Options {
                 "--buffers" => options.buffers = number(&flag, args.next())?,
                 "--buffer-size" => options.buffer_size = number(&flag, args.next())?,
                 "--domains" => options.domains = Some(number(&flag, args.next())?),
+                "--zero-copy" => {
+                    options.zero_copy = match args.next().as_deref() {
+                        Some("never") => ZeroCopy::Never,
+                        Some("remote") => ZeroCopy::Remote,
+                        Some("always") => ZeroCopy::Always,
+                        _ => return Err(String::from("--zero-copy is never, remote or always")),
+                    };
+                }
+                "--small-pages" => options.small_pages = true,
                 "--hyperthreads" => options.hyperthreads = Hyperthreads::Use,
                 "--polled" => options.polled = true,
                 other => return Err(format!("unknown option `{other}`")),
@@ -117,7 +136,10 @@ fn run(options: Options) -> std::io::Result<()> {
 
     let listener = TcpListener::bind(&options.listen)?;
     let address = listener.local_addr()?;
-    let buffers = BufferPool::new(options.buffer_size, options.buffers)?;
+    let buffers = match options.small_pages {
+        true => BufferPool::without_huge_pages(options.buffer_size, options.buffers)?,
+        false => BufferPool::new(options.buffer_size, options.buffers)?,
+    };
     let workers = plan.worker_count();
     let domains = plan.domains().len();
 
@@ -141,6 +163,7 @@ fn run(options: Options) -> std::io::Result<()> {
         if let Some(window) = options.window {
             config.window = window;
         }
+        config.zero_copy = options.zero_copy;
         Server::new(sidecar, config)?.listen(listener);
         let roots: Vec<_> = options.roots.iter().map(|root| root.display()).collect();
         log::info!(

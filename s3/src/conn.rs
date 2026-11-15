@@ -5,7 +5,7 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio_sidecar::{FixedBuf, Segment, Sidecar};
+use tokio_sidecar::{FixedBuf, Reclaim, Segment, Sidecar};
 
 /// How long a connection being closed is kept open for the client to finish
 /// sending.
@@ -28,6 +28,8 @@ pub(crate) struct Conn {
     input: Option<FixedBuf>,
     consumed: usize,
     output: Option<FixedBuf>,
+    /// Whether downloads on this connection are sent without copying.
+    zero_copy: bool,
 }
 
 fn lost() -> io::Error {
@@ -35,14 +37,26 @@ fn lost() -> io::Error {
 }
 
 impl Conn {
-    pub(crate) fn new(sidecar: Sidecar, fd: OwnedFd, input: FixedBuf, output: FixedBuf) -> Conn {
+    pub(crate) fn new(
+        sidecar: Sidecar,
+        fd: OwnedFd,
+        input: FixedBuf,
+        output: FixedBuf,
+        zero_copy: bool,
+    ) -> Conn {
         Conn {
             sidecar,
             fd: Arc::new(fd),
             input: Some(input),
             consumed: 0,
             output: Some(output),
+            zero_copy,
         }
+    }
+
+    /// Whether downloads on this connection are sent without copying.
+    pub(crate) fn zero_copy(&self) -> bool {
+        self.zero_copy
     }
 
     /// Input that has been received and not consumed.
@@ -139,6 +153,27 @@ impl Conn {
             Err(error) => Err(error),
         };
         (result, bufs)
+    }
+
+    /// Like [`send_vectored`](Self::send_vectored), without copying. The
+    /// buffers stay with the kernel until the client has acknowledged what
+    /// is in them, and are had back through the [`Reclaim`].
+    pub(crate) async fn send_zero_copy(
+        &mut self,
+        bufs: Vec<FixedBuf>,
+        segments: &[Segment],
+    ) -> (io::Result<()>, Reclaim) {
+        let expected: usize = segments.iter().map(|segment| segment.len).sum();
+        let sent = self
+            .sidecar
+            .send_zc_vectored(self.fd.clone(), bufs, segments);
+        let (sent, reclaim) = sent.await;
+        let result = match sent {
+            Ok(sent) if sent == expected => Ok(()),
+            Ok(_) => Err(io::ErrorKind::WriteZero.into()),
+            Err(error) => Err(error),
+        };
+        (result, reclaim)
     }
 
     /// Closes the connection in a way that lets the client read the last

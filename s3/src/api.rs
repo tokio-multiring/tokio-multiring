@@ -6,7 +6,7 @@ use std::io;
 use std::ops::Range;
 
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
-use tokio_sidecar::FixedBuf;
+use tokio_sidecar::{FixedBuf, Reclaim};
 use ureq_proto::server::state::{ProvideResponse, RecvBody, Send100, SendBody};
 use ureq_proto::server::{RecvRequestResult, Reply, SendResponseResult};
 
@@ -21,6 +21,11 @@ use crate::store::{Meta, StoreError, Stored, Upload};
 /// The most bytes of an unwanted request body that are read and thrown
 /// away to keep the connection usable. Past that the connection is closed.
 const DISCARD_LIMIT: usize = 64 * 1024;
+
+/// The least a round of a download has to carry to be sent without copying.
+/// Below this, setting a zero-copy send up costs more than the copy, and
+/// keeps whole buffers from other use for the sake of a few bytes.
+const ZERO_COPY_MIN: usize = 64 * 1024;
 
 // Sent when there is no request to build an answer to.
 const BAD_REQUEST: &[u8] =
@@ -559,13 +564,16 @@ async fn store_object(
 
 /// Takes the buffers for a transfer that moves through `per_round` buffers
 /// at a time and could keep `rounds` rounds going at once. One round's worth
-/// is waited for. More are taken only if they are free, up to the server's
-/// window, so a lone transfer gets a deep pipeline and a crowd of them
-/// shares the pool.
+/// is waited for. More are taken only out of what the pool has to spare, up
+/// to the server's window: half the pool is left alone, for the first rounds
+/// of other transfers. So a lone transfer gets a deep pipeline, a crowd of
+/// them shares the pool, and one that is stuck behind a slow client cannot
+/// take the pool with it.
 async fn acquire_window(server: &Inner, per_round: usize, rounds: u64) -> Vec<Vec<FixedBuf>> {
     let wanted = rounds.min(server.window as u64) as usize;
+    let reserve = server.bodies.count() / 2;
     let mut window = vec![server.bodies.acquire_many(per_round).await];
-    while window.len() < wanted {
+    while window.len() < wanted && server.bodies.available() >= reserve + per_round {
         match server.bodies.try_acquire_many(per_round) {
             Some(bufs) => window.push(bufs),
             None => break,
@@ -718,6 +726,12 @@ async fn respond(
 /// drive into a buffer of its own, and from the buffers to the socket in the
 /// order the bytes have in the object. The rounds to come are read while one
 /// is sent.
+///
+/// Sent without copying, a round's buffers stay with the kernel until the
+/// client has acknowledged the round, and only then read another. The
+/// buffers of the window are therefore all a transfer ever has under way,
+/// between the drives and the client: a client that is slow to take its
+/// data holds up its own transfer and no more buffers than that.
 async fn send_object(
     server: &Inner,
     conn: &mut Conn,
@@ -730,31 +744,58 @@ async fn send_object(
     if rounds.is_empty() {
         return Ok(());
     }
-    let window = acquire_window(server, stored.parts(), rounds.end - rounds.start).await;
-    let mut read = |bufs| {
-        let round = rounds.next()?;
-        let plan = geometry.plan(round, &range);
-        Some(server.store.read_round(stored, plan, bufs))
-    };
-
+    let parts = stored.parts();
+    let mut free = acquire_window(server, parts, rounds.end - rounds.start).await;
     let mut reading = VecDeque::new();
-    for bufs in window {
-        let next = read(bufs).expect("the window is no deeper than the rounds");
-        reading.push_back(Started::start(next).await);
-    }
-    while let Some(oldest) = reading.pop_front() {
+    // Rounds sent without copying, oldest first.
+    let mut unacknowledged: VecDeque<Reclaim> = VecDeque::new();
+
+    loop {
+        // Every set of buffers at hand reads ahead.
+        while !rounds.is_empty() {
+            let Some(bufs) = free.pop() else { break };
+            let round = rounds.next().expect("checked above");
+            let plan = geometry.plan(round, &range);
+            let read = server.store.read_round(stored, plan, bufs);
+            reading.push_back(Started::start(read).await);
+        }
+        let Some(oldest) = reading.pop_front() else {
+            // Everything read has been sent. What is left is to hear from
+            // the client: for buffers to read the next round with, or, at
+            // the end, so that none are still out when the response is
+            // done. That keeps a connection to its window across requests.
+            let Some(oldest) = unacknowledged.pop_front() else {
+                debug_assert!(rounds.is_empty());
+                return Ok(());
+            };
+            let bufs = oldest.await.bufs;
+            if bufs.len() == parts {
+                free.push(bufs);
+            }
+            continue;
+        };
+
         let (got, bufs, plan) = oldest.finish().await;
         got?;
-        let (sent, bufs) = conn.send_vectored(bufs, &plan.segments).await;
-        sent?;
+        if conn.zero_copy() && plan.len >= ZERO_COPY_MIN {
+            let (sent, reclaim) = conn.send_zero_copy(bufs, &plan.segments).await;
+            unacknowledged.push_back(reclaim);
+            sent?;
+        } else {
+            let (sent, bufs) = conn.send_vectored(bufs, &plan.segments).await;
+            sent?;
+            free.push(bufs);
+        }
         body.consume_direct_write(plan.len)?;
-        // The buffers go straight back to work on the round after the ones
-        // already under way.
-        if let Some(next) = read(bufs) {
-            reading.push_back(Started::start(next).await);
+
+        // The buffers the client has acknowledged go straight back to work.
+        while let Some(reclaimed) = unacknowledged.front_mut().and_then(Reclaim::try_take) {
+            unacknowledged.pop_front();
+            if reclaimed.bufs.len() == parts {
+                free.push(reclaimed.bufs);
+            }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

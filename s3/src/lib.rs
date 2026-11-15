@@ -68,7 +68,13 @@ pub struct Config {
     /// that far ahead of what it is sending, and an upload writes that far
     /// behind what it is receiving. A transfer waits for the buffers of one
     /// round and takes the rest only while they are free.
+    ///
+    /// For a download sent without copying, a round is under way until the
+    /// client has acknowledged it, so this is also the most that a
+    /// connection has in flight to its client.
     pub window: usize,
+    /// Which clients get their downloads without copying.
+    pub zero_copy: ZeroCopy,
     /// How many connections are served at a time. Further ones wait to be
     /// accepted.
     pub connections: usize,
@@ -84,10 +90,25 @@ impl Config {
             roots: roots.into_iter().map(Into::into).collect(),
             stripe_unit: 128 * 1024,
             window: 4,
+            zero_copy: ZeroCopy::Remote,
             connections: 1024,
             head_buffer: 16 * 1024,
         }
     }
+}
+
+/// Which clients get their downloads without copying: sent straight from
+/// the buffers the drives filled, where otherwise the kernel copies them
+/// into the socket first. On a network card that copy is most of what a
+/// download costs in processor time. Over loopback the kernel copies either
+/// way, and asking it not to only adds work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZeroCopy {
+    Never,
+    /// Clients on other machines.
+    Remote,
+    /// Loopback clients too. For testing.
+    Always,
 }
 
 struct Inner {
@@ -97,6 +118,7 @@ struct Inner {
     bodies: BufferPool,
     /// How many rounds a transfer keeps going at once.
     window: usize,
+    zero_copy: ZeroCopy,
     heads: BufferPool,
     /// One permit per connection that can be served. A permit stands for
     /// two buffers of `heads`.
@@ -133,6 +155,7 @@ impl Server {
                 store,
                 bodies,
                 window: config.window,
+                zero_copy: config.zero_copy,
                 heads,
                 slots: Arc::new(Semaphore::new(config.connections)),
             }),
@@ -180,6 +203,13 @@ async fn accept(inner: Arc<Inner>, listener: Arc<OwnedFd>) {
         if let Err(error) = socket.set_nodelay(true) {
             log::debug!("could not disable Nagle's algorithm: {error}");
         }
+        let zero_copy = match inner.zero_copy {
+            ZeroCopy::Never => false,
+            ZeroCopy::Always => true,
+            ZeroCopy::Remote => socket
+                .peer_addr()
+                .is_ok_and(|peer| !peer.ip().to_canonical().is_loopback()),
+        };
 
         let buffer = || {
             inner
@@ -187,7 +217,13 @@ async fn accept(inner: Arc<Inner>, listener: Arc<OwnedFd>) {
                 .try_acquire()
                 .expect("a slot stands for two head buffers")
         };
-        let conn = Conn::new(inner.sidecar.clone(), socket.into(), buffer(), buffer());
+        let conn = Conn::new(
+            inner.sidecar.clone(),
+            socket.into(),
+            buffer(),
+            buffer(),
+            zero_copy,
+        );
         let inner = inner.clone();
         tokio::spawn(async move {
             api::serve(&inner, conn).await;

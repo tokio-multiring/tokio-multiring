@@ -7,7 +7,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use sidecar_s3::{Config, Server};
+use sidecar_s3::{Config, Server, ZeroCopy};
 use tokio_sidecar::{BufferPool, DiskConfig, Domain, Hyperthreads, Plan, Sidecar};
 
 /// Size of the units objects are cut into.
@@ -24,21 +24,43 @@ struct Fixture {
     address: SocketAddr,
     /// The directory of each drive.
     roots: Vec<PathBuf>,
+    /// The buffers object data moves through.
+    pool: BufferPool,
     runtime: tokio::runtime::Runtime,
+}
+
+/// How a test's server is set up.
+#[derive(Clone, Copy)]
+struct Setup {
+    drives: usize,
+    /// Whether objects go through polled disk rings.
+    polled: bool,
+    /// Number of buffers for object data. A round takes one per drive.
+    buffers: usize,
+    huge_pages: bool,
+    /// Whether downloads are sent without copying.
+    zero_copy: bool,
+}
+
+impl Default for Setup {
+    fn default() -> Self {
+        Setup {
+            drives: 2,
+            polled: false,
+            buffers: 8,
+            huge_pages: true,
+            zero_copy: true,
+        }
+    }
 }
 
 /// A server with two drives.
 fn start(name: &str) -> Fixture {
-    start_with(name, 2, false)
+    start_with(name, Setup::default())
 }
 
-fn start_with(name: &str, drives: usize, polled: bool) -> Fixture {
-    start_on(name, drives, polled, 8)
-}
-
-/// A server whose pool for object data has `buffers` buffers.
-fn start_on(name: &str, drives: usize, polled: bool, buffers: usize) -> Fixture {
-    let roots: Vec<PathBuf> = (0..drives)
+fn start_with(name: &str, setup: Setup) -> Fixture {
+    let roots: Vec<PathBuf> = (0..setup.drives)
         .map(|drive| {
             std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
                 .join(format!("{name}-{}-{drive}", std::process::id()))
@@ -47,11 +69,11 @@ fn start_on(name: &str, drives: usize, polled: bool, buffers: usize) -> Fixture 
     for root in &roots {
         std::fs::create_dir(root).unwrap();
     }
-    serve(roots, polled, buffers)
+    serve(roots, setup)
 }
 
 /// Starts a server on the directories `roots`.
-fn serve(roots: Vec<PathBuf>, polled: bool, buffers: usize) -> Fixture {
+fn serve(roots: Vec<PathBuf>, setup: Setup) -> Fixture {
     // Two workers on whichever CPUs this process may use.
     let detected = Plan::detect(Hyperthreads::Use).unwrap();
     let cpus = detected
@@ -72,10 +94,14 @@ fn serve(roots: Vec<PathBuf>, polled: bool, buffers: usize) -> Fixture {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let pool = match setup.huge_pages {
+        true => BufferPool::new(BUFFER, setup.buffers).unwrap(),
+        false => BufferPool::without_huge_pages(BUFFER, setup.buffers).unwrap(),
+    };
     runtime.block_on(async {
         let sidecar = Sidecar::start(tokio_sidecar::Config {
-            buffers: Some(BufferPool::new(BUFFER, buffers).unwrap()),
-            disk: polled.then(|| DiskConfig {
+            buffers: Some(pool.clone()),
+            disk: setup.polled.then(|| DiskConfig {
                 sq_entries: 32,
                 sq_thread_idle: Duration::from_millis(50),
                 plan,
@@ -88,11 +114,17 @@ fn serve(roots: Vec<PathBuf>, polled: bool, buffers: usize) -> Fixture {
         let mut config = Config::new(&roots);
         config.connections = 4;
         config.head_buffer = 4096;
+        // The tests' clients are all on loopback.
+        config.zero_copy = match setup.zero_copy {
+            true => ZeroCopy::Always,
+            false => ZeroCopy::Never,
+        };
         Server::new(sidecar, config).unwrap().listen(listener);
     });
     Fixture {
         address,
         roots,
+        pool,
         runtime,
     }
 }
@@ -407,7 +439,13 @@ fn object_round_trip() {
 /// truncation and the hand-over between drives and buffers happen. What
 /// comes back is checked, and so is what is on the drives.
 fn awkward_sizes(name: &str, drives: usize) {
-    let server = start_with(name, drives, false);
+    let server = start_with(
+        name,
+        Setup {
+            drives,
+            ..Setup::default()
+        },
+    );
     let mut client = server.with_bucket();
     let round = drives * BUFFER;
     // Some of these coincide when there is one drive.
@@ -491,8 +529,8 @@ fn small_objects_use_every_drive() {
     }
 }
 
-/// An object of many rounds, so that a transfer runs with its whole window
-/// of rounds under way: the pool has room for four at a time.
+/// An object of many rounds, so that a transfer runs with as many rounds
+/// under way as its pool lets it have.
 fn many_rounds(server: &Fixture) {
     let mut client = server.with_bucket();
     let round = 2 * BUFFER;
@@ -530,21 +568,111 @@ fn many_rounds(server: &Fixture) {
     assert!(server.reassemble("chunked") == body);
 }
 
+/// A pool with room to spare, where a transfer gets its full window.
+const ROOMY: Setup = Setup {
+    drives: 2,
+    polled: false,
+    buffers: 32,
+    huge_pages: true,
+    zero_copy: true,
+};
+
 #[test]
 fn objects_of_many_rounds() {
-    many_rounds(&start("rounds"));
+    many_rounds(&start_with("rounds", ROOMY));
 }
 
 /// With buffers for one round only, a transfer has no window to speak of
 /// and takes its rounds one at a time.
 #[test]
 fn objects_of_many_rounds_in_a_starved_pool() {
-    many_rounds(&start_on("rounds-starved", 2, false, 2));
+    many_rounds(&start_with(
+        "rounds-starved",
+        Setup {
+            buffers: 2,
+            ..Setup::default()
+        },
+    ));
+}
+
+/// Downloads copied into the socket, where the default is to send them
+/// from the buffers.
+#[test]
+fn objects_of_many_rounds_with_copied_sends() {
+    many_rounds(&start_with(
+        "rounds-copied",
+        Setup {
+            zero_copy: false,
+            ..ROOMY
+        },
+    ));
+}
+
+/// On ordinary pages, where zero-copy sends use the buffers as registered
+/// ones.
+#[test]
+fn objects_of_many_rounds_on_ordinary_pages() {
+    many_rounds(&start_with(
+        "rounds-pages",
+        Setup {
+            huge_pages: false,
+            ..ROOMY
+        },
+    ));
+}
+
+/// A client that asks for a large object and then takes its time does not
+/// tie up more than its window of buffers, and the server goes on serving
+/// others out of the rest.
+#[test]
+fn slow_reader_holds_no_more_than_its_window() {
+    let server = start_with(
+        "slow-reader",
+        Setup {
+            buffers: 16,
+            ..Setup::default()
+        },
+    );
+    let mut slow = server.with_bucket();
+    let round = 2 * BUFFER;
+    let body = pattern(40 * round);
+    assert_eq!(slow.put("/bucket/large", &body).status, 200);
+    assert_eq!(slow.put("/bucket/small", b"still served").status, 200);
+
+    slow.send(b"GET /bucket/large HTTP/1.1\r\n\r\n");
+    assert_eq!(slow.line(), "HTTP/1.1 200 OK");
+    // Long enough for the server to send all it can with nobody reading.
+    std::thread::sleep(Duration::from_millis(300));
+    // The default window of four rounds, at two buffers a round.
+    assert!(
+        server.pool.available() >= 16 - 4 * 2,
+        "{} free",
+        server.pool.available()
+    );
+
+    let mut other = server.connect();
+    assert_eq!(other.get("/bucket/small").body, b"still served");
+    assert!(other.get("/bucket/large").body == body);
+
+    // The slow client gets everything in the end.
+    let mut rest = Vec::new();
+    slow.0
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let _ = slow.0.read_to_end(&mut rest);
+    assert!(rest.ends_with(&body), "{} bytes read", rest.len());
 }
 
 #[test]
 fn objects_of_many_rounds_through_polled_rings() {
-    many_rounds(&start_with("rounds-polled", 2, true));
+    many_rounds(&start_with(
+        "rounds-polled",
+        Setup {
+            polled: true,
+            ..ROOMY
+        },
+    ));
 }
 
 #[test]
@@ -609,7 +737,13 @@ fn byte_ranges() {
 
 #[test]
 fn polled_disk_rings() {
-    let server = start_with("polled", 2, true);
+    let server = start_with(
+        "polled",
+        Setup {
+            polled: true,
+            ..Setup::default()
+        },
+    );
     let mut client = server.with_bucket();
     let body = pattern(5 * UNIT + 44_641);
     assert_eq!(client.put("/bucket/object", &body).status, 200);
@@ -1080,7 +1214,7 @@ fn leftovers_are_swept_at_start() {
     for root in &roots {
         std::fs::write(root.join("bucket/.upload-7"), b"half an object").unwrap();
     }
-    let server = serve(roots, false, 8);
+    let server = serve(roots, Setup::default());
     assert_eq!(server.files(), kept);
     assert!(server.connect().get("/bucket/.upload-7").body == body);
 }
@@ -1089,7 +1223,13 @@ fn leftovers_are_swept_at_start() {
 /// Under another, the server says so and serves nothing in their place.
 #[test]
 fn another_arrangement_of_drives_is_refused() {
-    let server = start_with("rearranged", 1, false);
+    let server = start_with(
+        "rearranged",
+        Setup {
+            drives: 1,
+            ..Setup::default()
+        },
+    );
     let mut client = server.with_bucket();
     assert_eq!(client.put("/bucket/object", &pattern(1000)).status, 200);
     drop(client);
@@ -1102,7 +1242,7 @@ fn another_arrangement_of_drives_is_refused() {
         std::fs::create_dir_all(root.join("bucket")).unwrap();
         roots.push(root);
     }
-    let server = serve(roots, false, 8);
+    let server = serve(roots, Setup::default());
     // Where the key hashes to now may or may not be where the object is.
     let reply = server.connect().get("/bucket/object");
     assert!(
