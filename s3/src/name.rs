@@ -1,10 +1,10 @@
 //! Bucket and key names, and where they live on disk.
 //!
-//! A bucket is a directory under the root, and an object is one file in it.
-//! Keys are arbitrary bytes, so a key is encoded into a single file name:
-//! anything but ASCII letters, digits, `-`, `_` and `.` is written as `%XX`,
-//! and so is a leading `.`. That keeps every key inside its bucket's
-//! directory and leaves names starting with `.` to the server.
+//! A bucket is a directory under each root, and an object is named by one
+//! file in it. Keys are arbitrary bytes, so a key is encoded into a single
+//! file name: anything but ASCII letters, digits, `-`, `_` and `.` is
+//! written as `%XX`, and so is a leading `.`. That keeps every key inside
+//! its bucket's directory and leaves names starting with `.` to the server.
 
 use std::ffi::CString;
 
@@ -15,6 +15,10 @@ const NAME_MAX: usize = 255;
 
 /// Starts the names of files that are still being uploaded.
 pub(crate) const UPLOAD_PREFIX: &str = ".upload-";
+
+/// Starts the names of the files that hold the parts of an object other
+/// than its first.
+pub(crate) const PART_PREFIX: &str = ".part-";
 
 /// What a request path names.
 #[derive(Debug, PartialEq, Eq)]
@@ -94,9 +98,26 @@ impl Bucket {
 }
 
 impl Object {
-    /// The object's file, relative to the root.
+    /// The file that names the object, relative to a root.
     pub(crate) fn path(&self) -> CString {
         self.bucket.file(&self.file)
+    }
+
+    /// A number that is the same for this object in every run of the
+    /// server: the 64-bit FNV-1a hash of its path.
+    pub(crate) fn hash(&self) -> u64 {
+        let path = [self.bucket.0.as_bytes(), b"/", self.file.as_bytes()];
+        path.into_iter()
+            .flatten()
+            .fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+    }
+
+    /// Which of `drives` drives holds the object's first part. Spreading
+    /// first parts over the drives spreads the objects that have no other.
+    pub(crate) fn first_drive(&self, drives: usize) -> usize {
+        (self.hash() % drives as u64) as usize
     }
 }
 
@@ -178,6 +199,21 @@ mod tests {
             object_path("/photos/na%C3%AFve%20caf%c3%a9"),
             "photos/na%C3%AFve%20caf%C3%A9"
         );
+    }
+
+    /// Where an object lives must not change from one build to the next.
+    #[test]
+    fn placement_is_stable() {
+        let Target::Object(object) = Target::parse("/photos/cat.jpg").unwrap() else {
+            panic!("not an object");
+        };
+        assert_eq!(object.hash(), 0x4664_4eaa_9e47_eeb2);
+        assert_eq!(object.first_drive(1), 0);
+        assert_eq!(object.first_drive(2), 0);
+        let Target::Object(object) = Target::parse("/photos/2026/cat.jpg").unwrap() else {
+            panic!("not an object");
+        };
+        assert_eq!(object.first_drive(2), 1);
     }
 
     #[test]

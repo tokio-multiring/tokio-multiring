@@ -3,8 +3,14 @@
 //! Buckets are directories and objects are files in them. HTTP is spoken
 //! with ureq-proto's server state machine, and all I/O goes through a
 //! [`tokio_sidecar::Sidecar`]: an object's bytes travel between the socket
-//! and the device in the sidecar's registered buffers, without being copied
+//! and the drives in the sidecar's registered buffers, without being copied
 //! on the way.
+//!
+//! Given several drives, the server stripes each object over them: the
+//! object is cut into units that are dealt out to the drives in turn, each
+//! drive keeping its share in a file of its own. A transfer reads or writes
+//! all drives at once, so one object moves at the speed of the drives
+//! together. Losing a drive loses every object larger than one unit.
 //!
 //! What it serves, in path style (`/bucket/key`):
 //!
@@ -26,8 +32,10 @@ mod api;
 mod conn;
 mod date;
 mod error;
+mod join;
 mod name;
 mod store;
+mod stripe;
 
 use std::io;
 use std::net::{TcpListener, TcpStream};
@@ -45,9 +53,16 @@ use crate::store::Store;
 /// Settings of a [`Server`].
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// The directory the buckets live in. It must exist, on a file system
-    /// that supports `O_DIRECT`.
-    pub root: PathBuf,
+    /// The directories the buckets live in, one per drive, each on a file
+    /// system that supports `O_DIRECT`. They must exist.
+    ///
+    /// The list is part of how objects are stored: adding, removing or
+    /// reordering roots makes the objects stored so far unreadable.
+    pub roots: Vec<PathBuf>,
+    /// Size of the units that objects are cut into when there are several
+    /// roots: a multiple of 4096 that the size of the sidecar's buffers is a
+    /// multiple of. Part of how objects are stored, like the roots.
+    pub stripe_unit: usize,
     /// How many connections are served at a time. Further ones wait to be
     /// accepted.
     pub connections: usize,
@@ -58,9 +73,10 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(root: impl Into<PathBuf>) -> Config {
+    pub fn new<Root: Into<PathBuf>>(roots: impl IntoIterator<Item = Root>) -> Config {
         Config {
-            root: root.into(),
+            roots: roots.into_iter().map(Into::into).collect(),
+            stripe_unit: 128 * 1024,
             connections: 1024,
             head_buffer: 16 * 1024,
         }
@@ -85,9 +101,9 @@ pub struct Server {
 }
 
 impl Server {
-    /// Sets the server up over `sidecar`, which must have a buffer pool.
-    /// Objects are read and written through the sidecar's polled disk rings
-    /// if it has them.
+    /// Sets the server up over `sidecar`, which must have a pool of at least
+    /// as many buffers as there are roots. Objects are read and written
+    /// through the sidecar's polled disk rings if it has them.
     pub fn new(sidecar: Sidecar, config: Config) -> io::Result<Server> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
         let bodies = sidecar
@@ -98,7 +114,7 @@ impl Server {
             return Err(invalid("a server needs room for a connection"));
         }
         let heads = BufferPool::new(config.head_buffer, 2 * config.connections)?;
-        let store = Store::open(sidecar.clone(), &config.root)?;
+        let store = Store::open(sidecar.clone(), &config.roots, config.stripe_unit)?;
         Ok(Server {
             inner: Arc::new(Inner {
                 sidecar,

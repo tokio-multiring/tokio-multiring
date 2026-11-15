@@ -5,7 +5,7 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio_sidecar::{FixedBuf, Sidecar};
+use tokio_sidecar::{FixedBuf, Segment, Sidecar};
 
 /// How long a connection being closed is kept open for the client to finish
 /// sending.
@@ -79,16 +79,17 @@ impl Conn {
         })
     }
 
-    /// Receives up to `limit` bytes straight into the spare capacity of
-    /// `buf`, past the input buffer, which must be empty. Returns how many
-    /// arrived; none means the client has closed its side.
-    pub(crate) async fn recv_into(
+    /// Receives straight into the regions `segments` of `bufs`, past the
+    /// input buffer, which must be empty. Waits for every region to fill: a
+    /// count short of that means the client has closed its side.
+    pub(crate) async fn recv_vectored(
         &mut self,
-        buf: FixedBuf,
-        limit: usize,
-    ) -> (io::Result<usize>, FixedBuf) {
+        bufs: Vec<FixedBuf>,
+        segments: &[Segment],
+    ) -> (io::Result<usize>, Vec<FixedBuf>) {
         assert!(self.pending().is_empty());
-        self.sidecar.recv(self.fd.clone(), buf, limit).await
+        let received = self.sidecar.recv_vectored(self.fd.clone(), bufs, segments);
+        received.await
     }
 
     /// The output buffer, for appending to.
@@ -120,6 +121,24 @@ impl Conn {
             Err(error) => Err(error),
         };
         (result, buf)
+    }
+
+    /// Sends the regions `segments` of `bufs`, one after the other. The
+    /// output buffer must have been flushed.
+    pub(crate) async fn send_vectored(
+        &mut self,
+        bufs: Vec<FixedBuf>,
+        segments: &[Segment],
+    ) -> (io::Result<()>, Vec<FixedBuf>) {
+        let expected: usize = segments.iter().map(|segment| segment.len).sum();
+        let sent = self.sidecar.send_vectored(self.fd.clone(), bufs, segments);
+        let (sent, bufs) = sent.await;
+        let result = match sent {
+            Ok(sent) if sent == expected => Ok(()),
+            Ok(_) => Err(io::ErrorKind::WriteZero.into()),
+            Err(error) => Err(error),
+        };
+        (result, bufs)
     }
 
     /// Closes the connection in a way that lets the client read the last

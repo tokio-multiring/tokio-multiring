@@ -5,7 +5,7 @@ use std::io;
 use std::ops::Range;
 
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
-use tokio_sidecar::FileStat;
+use tokio_sidecar::FixedBuf;
 use ureq_proto::server::state::{ProvideResponse, RecvBody, Send100, SendBody};
 use ureq_proto::server::{RecvRequestResult, Reply, SendResponseResult};
 
@@ -14,7 +14,7 @@ use crate::conn::{Conn, Filled};
 use crate::date;
 use crate::error::ApiError;
 use crate::name::{Bucket, Object, Target};
-use crate::store::{BLOCK, StoreError, Stored, Upload};
+use crate::store::{Meta, StoreError, Stored, Upload};
 
 /// The most bytes of an unwanted request body that are read and thrown
 /// away to keep the connection usable. Past that the connection is closed.
@@ -114,7 +114,7 @@ fn response(status: StatusCode) -> http::response::Builder {
         .header(header::DATE, date::now())
 }
 
-fn entity_tag(stat: &FileStat) -> String {
+fn entity_tag(stat: &Meta) -> String {
     let (seconds, nanoseconds) = stat.modified;
     format!("\"{seconds:x}{nanoseconds:08x}-{:x}\"", stat.size)
 }
@@ -163,7 +163,7 @@ impl Answer {
     }
 
     /// The object was stored.
-    fn stored(stat: &FileStat) -> Answer {
+    fn stored(stat: &Meta) -> Answer {
         let response = response(StatusCode::OK)
             .header(header::ETAG, entity_tag(stat))
             .header(header::CONTENT_LENGTH, 0);
@@ -172,7 +172,7 @@ impl Answer {
 
     /// The object, or the part of it that `range` asks for. Without
     /// `stored`, the headers alone.
-    fn object(stat: FileStat, range: Option<&HeaderValue>, stored: Option<Stored>) -> Answer {
+    fn object(stat: Meta, range: Option<&HeaderValue>, stored: Option<Stored>) -> Answer {
         let (status, range) = match Requested::parse(range, stat.size) {
             Requested::Whole => (StatusCode::OK, 0..stat.size),
             Requested::Part(range) => (StatusCode::PARTIAL_CONTENT, range),
@@ -439,7 +439,7 @@ async fn perform(
         } => store
             .open_object(&object)
             .await
-            .map(|stored| Answer::object(stored.stat, range.as_ref(), Some(stored))),
+            .map(|stored| Answer::object(stored.meta, range.as_ref(), Some(stored))),
         Action::PutObject(_) => unreachable!("handled above"),
     };
     Ok(Outcome::after(
@@ -530,10 +530,13 @@ async fn store_object(
     mut upload: Upload,
     incoming: Incoming,
 ) -> Result<Outcome, Fatal> {
-    let reply = match incoming {
-        Incoming::Empty(reply) => reply,
+    // Finishing an upload takes a buffer to write the header through. One
+    // that carried the body serves, since asking for another while holding
+    // those could wait forever.
+    let (reply, scratch) = match incoming {
+        Incoming::Empty(reply) => (reply, server.bodies.acquire().await),
         Incoming::Body(mut body) => match receive(server, conn, &mut body, &mut upload).await {
-            Ok(()) => body.proceed()?,
+            Ok(mut bufs) => (body.proceed()?, bufs.swap_remove(0)),
             Err(error) => {
                 server.store.abort(upload).await;
                 let answer = match error {
@@ -545,56 +548,72 @@ async fn store_object(
             }
         },
     };
-    let answer = match server.store.finish(upload).await {
-        Ok(stat) => Answer::stored(&stat),
+    let answer = match server.store.finish(upload, scratch).await {
+        Ok(meta) => Answer::stored(&meta),
         Err(error) => Answer::failed(StoreError::Io(error)),
     };
     Ok(Outcome::new(reply, answer))
 }
 
-/// Moves a request body into `upload`, one buffer at a time.
+/// Moves a request body into `upload`, a round at a time: from the socket
+/// into one buffer per drive, and from each buffer onto its drive. Hands
+/// back the buffers it used.
 async fn receive(
     server: &Inner,
     conn: &mut Conn,
     body: &mut Reply<RecvBody>,
     upload: &mut Upload,
-) -> Result<(), BodyError> {
-    let mut buf = server.bodies.acquire().await;
+) -> Result<Vec<FixedBuf>, BodyError> {
+    let geometry = server.store.geometry();
+    let round_len = geometry.round_len();
+    // An object of known size takes no more buffers than it has parts.
+    let parts = body
+        .remaining()
+        .map_or(geometry.drives(), |left| geometry.parts(left));
+    let mut bufs = server.bodies.acquire_many(parts).await;
+
+    let mut round = 0;
     loop {
-        while buf.len() < buf.capacity() && !body.is_ended() {
+        let mut filled = 0;
+        while filled < round_len && !body.is_ended() {
             match body.remaining() {
                 // A body of known length, with none of it in the input
                 // buffer: it goes from the socket to where it is written
                 // from, without a stop on the way.
                 Some(left) if conn.pending().is_empty() => {
-                    let limit = usize::try_from(left).unwrap_or(usize::MAX);
-                    let (received, returned) = conn.recv_into(buf, limit).await;
-                    buf = returned;
+                    let left = usize::try_from(left).unwrap_or(usize::MAX);
+                    let upto = round_len.min(filled.saturating_add(left));
+                    let segments = geometry.fill(filled..upto);
+                    let (received, returned) = conn.recv_vectored(bufs, &segments).await;
+                    bufs = returned;
                     let received = received?;
-                    if received == 0 {
+                    if received < upto - filled {
                         return Err(BodyError::Fatal(closed()));
                     }
                     body.consume_direct_read(received)
                         .map_err(|_| BodyError::Malformed)?;
+                    filled += received;
                 }
                 _ => {
-                    let produced = read_body(conn, body, buf.spare_capacity_mut()).await?;
-                    buf.grow(produced);
+                    let room = geometry.fill(filled..round_len);
+                    let next = room.first().expect("the round is not full");
+                    let output = &mut bufs[next.buf].spare_capacity_mut()[next.start..][..next.len];
+                    filled += read_body(conn, body, output).await?;
                 }
             }
         }
-        if buf.is_empty() {
-            return Ok(());
+        if filled == 0 {
+            return Ok(bufs);
         }
-        // A full buffer is a whole number of blocks. One that is not full
-        // is the last.
-        let (written, returned) = server.store.write(upload, buf).await;
-        buf = returned;
+
+        let (written, returned) = server.store.write_round(upload, round, bufs, filled).await;
+        bufs = returned;
         written.map_err(BodyError::Store)?;
         if body.is_ended() {
-            return Ok(());
+            return Ok(bufs);
         }
-        buf.clear();
+        bufs.iter_mut().for_each(FixedBuf::clear);
+        round += 1;
     }
 }
 
@@ -655,8 +674,9 @@ async fn respond(
     Ok(!cleanup.must_close_connection())
 }
 
-/// Sends the bytes `range` of an object, from the device to the socket
-/// through one buffer.
+/// Sends the bytes `range` of an object, a round at a time: from every
+/// drive into a buffer of its own, and from the buffers to the socket in the
+/// order the bytes have in the object.
 async fn send_object(
     server: &Inner,
     conn: &mut Conn,
@@ -664,32 +684,17 @@ async fn send_object(
     stored: &Stored,
     range: Range<u64>,
 ) -> Result<(), Fatal> {
-    let mut buf = server.bodies.acquire().await;
-    let mut position = range.start;
-    while position < range.end {
-        // Direct reads start on a block boundary, which may be short of
-        // where the range does.
-        let block_start = position - position % BLOCK as u64;
-        // No more than the range needs, in whole blocks. A read that runs
-        // far past the end of the file costs as much as one that does not.
-        let wanted = (range.end - block_start).next_multiple_of(BLOCK as u64);
-        let limit = usize::try_from(wanted).unwrap_or(usize::MAX);
-        buf.clear();
-        let (read, returned) = server.store.read(stored, buf, block_start, limit).await;
-        buf = returned;
-        let read_end = block_start + read? as u64;
-        if read_end <= position {
-            return Err(Fatal::Io(io::ErrorKind::UnexpectedEof.into()));
-        }
-
-        let skip = (position - block_start) as usize;
-        let take = (read_end.min(range.end) - position) as usize;
-        buf.truncate(skip + take);
-        let (sent, returned) = conn.send(buf, skip).await;
-        buf = returned;
+    let geometry = server.store.geometry();
+    let mut bufs = server.bodies.acquire_many(stored.parts()).await;
+    for round in geometry.rounds(&range) {
+        let plan = geometry.plan(round, &range);
+        let (read, returned) = server.store.read_round(stored, &plan, bufs).await;
+        bufs = returned;
+        read?;
+        let (sent, returned) = conn.send_vectored(bufs, &plan.segments).await;
+        bufs = returned;
         sent?;
-        body.consume_direct_write(take)?;
-        position += take as u64;
+        body.consume_direct_write(plan.len)?;
     }
     Ok(())
 }

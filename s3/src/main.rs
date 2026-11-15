@@ -7,9 +7,13 @@ use sidecar_s3::{Config, Server};
 use tokio_sidecar::{BufferPool, DiskConfig, Hyperthreads, Plan, Sidecar};
 
 const USAGE: &str = "\
-usage: sidecar-s3 --root DIR [options]
+usage: sidecar-s3 --root DIR [--root DIR ...] [options]
 
-  --root DIR            directory the buckets live in
+  --root DIR            directory the buckets live in. Given once per drive,
+                        objects are striped over the drives. The roots, their
+                        order and the stripe unit must stay as they are for
+                        the objects stored under them to remain readable.
+  --stripe-unit BYTES   size of the units objects are cut into  [131072]
   --listen ADDR         address to listen on                [127.0.0.1:9000]
   --connections N       connections served at a time        [1024]
   --buffers N           buffers for object data             [256]
@@ -20,7 +24,8 @@ usage: sidecar-s3 --root DIR [options]
                         with a kernel thread spinning on a CPU per domain";
 
 struct Options {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
+    stripe_unit: Option<usize>,
     listen: String,
     connections: usize,
     buffers: usize,
@@ -32,9 +37,9 @@ struct Options {
 
 impl Options {
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
-        let mut root = None;
         let mut options = Options {
-            root: PathBuf::new(),
+            roots: Vec::new(),
+            stripe_unit: None,
             listen: String::from("127.0.0.1:9000"),
             connections: 1024,
             buffers: 256,
@@ -52,7 +57,11 @@ impl Options {
         }
         while let Some(flag) = args.next() {
             match flag.as_str() {
-                "--root" => root = args.next().map(PathBuf::from),
+                "--root" => {
+                    let root = args.next().ok_or("--root needs a value")?;
+                    options.roots.push(PathBuf::from(root));
+                }
+                "--stripe-unit" => options.stripe_unit = Some(number(&flag, args.next())?),
                 "--listen" => {
                     options.listen = args.next().ok_or("--listen needs a value")?;
                 }
@@ -65,7 +74,9 @@ impl Options {
                 other => return Err(format!("unknown option `{other}`")),
             }
         }
-        options.root = root.ok_or("--root is required")?;
+        if options.roots.is_empty() {
+            return Err(String::from("--root is required"));
+        }
         Ok(options)
     }
 }
@@ -117,12 +128,15 @@ fn run(options: Options) -> std::io::Result<()> {
         })
         .await?;
 
-        let mut config = Config::new(&options.root);
+        let mut config = Config::new(&options.roots);
         config.connections = options.connections;
+        if let Some(unit) = options.stripe_unit {
+            config.stripe_unit = unit;
+        }
         Server::new(sidecar, config)?.listen(listener);
+        let roots: Vec<_> = options.roots.iter().map(|root| root.display()).collect();
         log::info!(
-            "serving {} on http://{address} with {workers} workers in {domains} domains, {}",
-            options.root.display(),
+            "serving {roots:?} on http://{address} with {workers} workers in {domains} domains, {}",
             if options.polled {
                 "polled disk I/O"
             } else {
