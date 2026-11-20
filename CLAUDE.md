@@ -264,9 +264,20 @@ Suggested order: directory sync and timeouts, then listing, then
   with 1, and PUT within noise. The small-object rows are not remeasured.
   Echo numbers, against ringline and tokio, are in `~/sidecar-echo-bench`.
 - Whether the timekeeper scheme costs anything under a timer-heavy load is
-  untried. The sidecar makes about three `io_uring_enter` calls per echo to
-  ringline's two: `before_steal` flushes right before the park flushes
-  again.
+  untried.
+- Three `io_uring_enter` calls per echo on one connection, to ringline's
+  two, and it stays that way (measured 2026-11-20). bpftrace on the echo
+  server split them: the hook submits the send, which completes on the
+  spot; the hook submits the next recv; the park sleeps. The park's own turn
+  almost never enters, so skipping it after the hook would save nothing.
+  Tried instead: the hook and the pre-sleep step only take completions in,
+  and the sleeping enter carries what is queued. That gave 2.0 enters per
+  echo and no gain: one connection, 512 and 2048 (steal) within noise over
+  9, 3 and 3 interleaved pairs; 64 connections 2 to 3% lower in 8 of 9
+  pairs, because every send then costs a trip through tokio's park instead
+  of waking its task from the hook. Data and scripts (`ab.sh`, `enters.bt`,
+  `ab1.tsv`) are in `~/sidecar-echo-bench`; stacks need a build with
+  `-C force-frame-pointers=yes` in `RUSTFLAGS`.
 - Work handed to a busy worker by another thread (a cancel, a socket
   dropped elsewhere) waits for that worker's next look at its ring.
 - Uploads got about 4% slower over loopback with write-behind. Writes that
