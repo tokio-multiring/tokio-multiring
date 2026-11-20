@@ -252,8 +252,11 @@ Suggested order: directory sync and timeouts, then listing, then
 - The arbiter in `landing.rs` has race tests and a ThreadSanitizer pass (with
   `race:tokio::runtime::io::` suppressed, those reports are tokio's), but no
   loom model.
-- Nothing has been measured on the `io-driver` branch yet beyond the echo
-  grid: the reference numbers above are from `main`.
+- The reference numbers above are from `main`. On `io-driver`, an
+  interleaved A/B over the 100G link (2026-11-20) put GET of 16 MiB objects
+  at the same 11.8 GiB/s and 1.3 cores with 2 workers, the same 8.7 GiB/s
+  with 1, and PUT within noise. The small-object rows are not remeasured.
+  Echo numbers, against ringline and tokio, are in `~/sidecar-echo-bench`.
 - `DEFER_TASKRUN`, and whether the timekeeper scheme costs anything under a
   timer-heavy load, are untried.
 - Work handed to a busy worker by another thread (a cancel, a socket
