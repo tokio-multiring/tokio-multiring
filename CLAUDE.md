@@ -55,6 +55,7 @@ src/ops.rs       the public operations on Sidecar
 src/buffers.rs   BufferPool, FixedBuf
 src/plan.rs      Plan: which CPU each runtime thread runs on
 examples/disk_bench.rs   raw block-device benchmark (destructive, see below)
+examples/echo_server.rs  TCP echo server for outside load generators
 
 s3/src/api.rs    one HTTP exchange: routing, upload and download paths
 s3/src/store.rs  objects on disk, commit protocol
