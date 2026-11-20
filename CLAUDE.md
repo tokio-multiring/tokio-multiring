@@ -97,8 +97,14 @@ s3/examples/load.rs      HTTP load generator
   55 ms 99th percentile at 2048 connections with stealing, against 4 ms.
 - Rings are `SINGLE_ISSUER | COOP_TASKRUN | TASKRUN_FLAG`, created disabled
   when the runtime is built and enabled by the worker's thread as it
-  starts. `DEFER_TASKRUN` is untried in this shape: it did not work when
-  workers slept in epoll, which they no longer do.
+  starts. `DEFER_TASKRUN` was measured against it (2026-11-20, echo on
+  loopback, 8 workers, 1 to 2048 connections, 256 B and 16 KiB): within
+  2% on throughput, tail and CPU in every cell, so it buys nothing here and
+  is not used. Gotcha for anyone retrying it: deferred completions only
+  become visible to an enter that carries `GETEVENTS`, which the io-uring
+  crate adds only when the ring's `TASKRUN_FLAG` is set; without that flag a
+  busy worker sees its completions only when it goes to sleep, and the 99th
+  percentile goes from 1 ms to 15 to 35 ms.
 - A ring belongs to the thread its worker started on, so the runtime must be
   multi-threaded and must not use `block_in_place`. Both fail with a panic
   that says so.
@@ -257,8 +263,10 @@ Suggested order: directory sync and timeouts, then listing, then
   at the same 11.8 GiB/s and 1.3 cores with 2 workers, the same 8.7 GiB/s
   with 1, and PUT within noise. The small-object rows are not remeasured.
   Echo numbers, against ringline and tokio, are in `~/sidecar-echo-bench`.
-- `DEFER_TASKRUN`, and whether the timekeeper scheme costs anything under a
-  timer-heavy load, are untried.
+- Whether the timekeeper scheme costs anything under a timer-heavy load is
+  untried. The sidecar makes about three `io_uring_enter` calls per echo to
+  ringline's two: `before_steal` flushes right before the park flushes
+  again.
 - Work handed to a busy worker by another thread (a cancel, a socket
   dropped elsewhere) waits for that worker's next look at its ring.
 - Uploads got about 4% slower over loopback with write-behind. Writes that
