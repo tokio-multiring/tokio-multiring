@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 io-uring = "0.7.15"
 libc = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
 # Worker-local tasks (`spawn_worker_local`, `run_on_each_worker`) and the
 # `on_before_steal` hook are not in upstream tokio; this is the
 # `local-worker-v3-full` branch of the fork.

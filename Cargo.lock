@@ -169,6 +169,7 @@ version = "0.1.0"
 dependencies = [
  "io-uring",
  "libc",
+ "socket2",
  "tokio",
 ]
 

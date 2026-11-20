@@ -29,7 +29,7 @@ RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --offline --workspace 
   sandbox. Fetching a new dependency needs one `cargo fetch` without it.
 - `--cfg tokio_unstable` comes from `.cargo/config.toml`. rustdoc needs it in
   `RUSTDOCFLAGS` as shown.
-- All of the above are clean at HEAD: 113 tests across ten test binaries.
+- All of the above are clean at HEAD: 118 tests across eleven test binaries.
 - Concurrency bugs here have shown up at rates near 1 in 100. Before calling
   such a change verified, loop the affected test binaries (they are in
   `target/{debug,release}/deps/`) at least 30 times in both profiles. A new
@@ -53,6 +53,7 @@ src/landing.rs   arbitration between a future and the reactor (read its module d
 src/op.rs        Operation enum (one variant per kind of I/O), Op future, Completion
 src/ops.rs       the public operations on Sidecar
 src/buffers.rs   BufferPool, FixedBuf
+src/net.rs       TcpListener, TcpStream: sockets in the mode the rings need
 src/plan.rs      Plan: which CPU each runtime thread runs on
 examples/disk_bench.rs   raw block-device benchmark (destructive, see below)
 examples/echo_server.rs  TCP echo server for outside load generators

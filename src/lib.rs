@@ -36,12 +36,14 @@
 
 mod buffers;
 mod landing;
+mod net;
 mod op;
 mod ops;
 mod plan;
 mod reactor;
 
 pub use buffers::{BufferPool, FixedBuf};
+pub use net::{TcpListener, TcpStream};
 pub use ops::{FileStat, Reclaim, Reclaimed, Segment};
 pub use plan::{Domain, Hyperthreads, Plan};
 pub use reactor::{Config, DiskConfig, Sidecar, before_steal};
