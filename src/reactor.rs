@@ -44,6 +44,19 @@ const CHUNK: usize = 64;
 /// a time.
 const BATCH: usize = 32;
 
+/// How many times in a row a worker that the runtime has look at its ring,
+/// while it still has tasks to run, only submits before it also takes
+/// completions in.
+///
+/// Completions wake tasks, and a busy worker that is handed more of them at
+/// every look never runs out. Tokio then leaves the tasks on its shared
+/// queue waiting, since a worker turns to that queue in earnest only when
+/// its own is empty. Measured with 2048 echo connections on 8 workers and
+/// stealing allowed, taking completions in at every look left one request
+/// in a hundred waiting 55 ms, and at every fourth, 4 ms. The bound is for
+/// a worker that never runs out by itself.
+const LOOKS_PER_REAP: u32 = 4;
+
 // Whether a worker is asleep in its ring.
 
 /// Running, or on its way to sleep.
@@ -493,8 +506,9 @@ impl Inner {
                     }
                 }
 
+                // In blocking mode, for the read on the ring to wait.
                 // SAFETY: returns a new descriptor or -1.
-                let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+                let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
                 if wake == -1 {
                     return Err(io::Error::last_os_error());
                 }
@@ -680,10 +694,9 @@ impl Reactor for Inner {
 /// the worker's tasks queued since the last flush goes to the kernel in one
 /// `io_uring_enter`, without a trip through the scheduler.
 ///
-/// A worker that never runs out of local work never reaches the hook. A
-/// full submission queue is flushed on the spot, and the runtime has every
-/// worker look at its ring every so many tasks, so what is left waiting is
-/// bounded either way.
+/// A worker that never runs out of local work never reaches the hook. The
+/// runtime has every worker look at its ring every so many tasks, which
+/// submits what is queued and, every few looks, takes completions in.
 ///
 /// Without the hook the sidecar still works: a worker then flushes when it
 /// is about to go to sleep, and at those regular looks.
@@ -762,6 +775,8 @@ struct Worker {
     /// Set when something is left that a turn soon has to pick up. The
     /// worker does not go to sleep on that.
     revisit: Cell<bool>,
+    /// Looks at the ring since completions were last taken in.
+    looks: Cell<u32>,
     /// Where the read that wakes the worker puts what it read. Leaked: the
     /// kernel may write to it after the ring is closed.
     woken: NonNull<[u8; 8]>,
@@ -789,6 +804,7 @@ impl Worker {
             released: RefCell::new(Vec::new()),
             reports: RefCell::new(Vec::new()),
             revisit: Cell::new(false),
+            looks: Cell::new(0),
             woken: NonNull::from(Box::leak(Box::new([0; 8]))),
             sidecar,
             index,
@@ -1259,12 +1275,30 @@ impl Worker {
         }
     }
 
+    /// Has a worker that still has tasks to run pass on what they queued,
+    /// and every so often take completions in. See [`LOOKS_PER_REAP`].
+    fn look(&self) {
+        let looks = self.looks.get() + 1;
+        if looks >= LOOKS_PER_REAP {
+            self.turn();
+            return;
+        }
+        self.looks.set(looks);
+        self.take_remote();
+        self.enter();
+        self.kick_disk();
+    }
+
     /// Puts the worker to sleep in its ring until a completion comes in,
-    /// another thread wakes it, or its time is up.
+    /// another thread wakes it, or its time is up. With no time at all, the
+    /// worker is busy and only looks at its ring.
     fn park(&self, timeouts: ParkTimeouts) {
+        if timeouts.driving == Some(Duration::ZERO) {
+            return self.look();
+        }
         // Tasks that this woke have to run before the worker may sleep.
         let delivered = self.turn();
-        if delivered || self.revisit.take() || timeouts.driving == Some(Duration::ZERO) {
+        if delivered || self.revisit.take() {
             return;
         }
 
@@ -1379,6 +1413,7 @@ impl Worker {
     /// Takes the completions off the rings and acts on them. Returns whether
     /// any of them was for a future or for a file the runtime watches.
     fn reap(&self) -> bool {
+        self.looks.set(0);
         let mut wakers = self.wakers.take();
         let mut released = self.released.take();
         let mut deferred = self.deferred.take();

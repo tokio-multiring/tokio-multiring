@@ -90,7 +90,11 @@ s3/examples/load.rs      HTTP load generator
   rotation.
 - Rings are flushed from `Builder::on_before_steal`, when a worker goes to
   sleep, and when the runtime has a busy worker look at its ring (a park
-  with a zero timeout, every 61 tasks by default).
+  with a zero timeout, every 61 tasks by default). A busy worker submits at
+  every look but takes completions in only at every fourth
+  (`LOOKS_PER_REAP`): handing it more tasks at every look keeps its queue
+  from ever emptying, and tokio then starves its shared queue. That cost a
+  55 ms 99th percentile at 2048 connections with stealing, against 4 ms.
 - Rings are `SINGLE_ISSUER | COOP_TASKRUN | TASKRUN_FLAG`, created disabled
   when the runtime is built and enabled by the worker's thread as it
   starts. `DEFER_TASKRUN` is untried in this shape: it did not work when

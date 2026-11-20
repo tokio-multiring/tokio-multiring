@@ -114,8 +114,8 @@ impl Future for Spin {
 }
 
 /// A worker that stays busy never gets to the hook and never goes to sleep.
-/// Its operations reach the kernel when the submission queue fills, and the
-/// last of them when the runtime has the worker look at its ring.
+/// Its operations reach the kernel, and their results come back, when the
+/// runtime has the worker look at its ring.
 #[test]
 fn busy_worker_still_flushes() {
     const SQ_ENTRIES: usize = 4;
