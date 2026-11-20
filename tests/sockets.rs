@@ -9,13 +9,12 @@ use std::time::Duration;
 
 use tokio_sidecar::{BufferPool, Config, Segment, Sidecar};
 
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .on_before_steal(tokio_sidecar::before_steal)
-        .build()
-        .unwrap()
+/// A runtime of four workers that a sidecar drives, and the sidecar.
+fn runtime(config: Config) -> (tokio::runtime::Runtime, Sidecar) {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(4).enable_time();
+    let sidecar = Sidecar::install(&mut builder, config);
+    (builder.build().unwrap(), sidecar)
 }
 
 /// A connected pair of TCP sockets, ours first.
@@ -46,8 +45,8 @@ fn tcp_echo() {
         reply
     });
 
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         tokio::spawn(async move {
             let stream = Arc::new(sidecar.accept(listener).await.unwrap());
 
@@ -90,8 +89,8 @@ fn send_delivers_the_whole_buffer() {
         }
     });
 
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let mut buf = pool.acquire().await;
         let pattern: Vec<u8> = (0..SIZE).map(|index| (index % 251) as u8).collect();
         buf.extend_from_slice(&pattern);
@@ -117,8 +116,8 @@ fn recv_reports_the_end_of_the_stream() {
     theirs.write_all(b"last words").unwrap();
     drop(theirs);
 
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let (received, buf) = sidecar
             .recv(ours.clone(), pool.acquire().await, usize::MAX)
             .await;
@@ -137,8 +136,8 @@ fn recv_limit_and_send_offset() {
     let pool = BufferPool::new(4096, 1).unwrap();
     theirs.write_all(b"headbody").unwrap();
 
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let (received, buf) = sidecar.recv(ours.clone(), pool.acquire().await, 4).await;
         assert_eq!(received.unwrap(), 4);
         assert_eq!(&buf[..], b"head");
@@ -167,8 +166,8 @@ fn send_vectored_interleaves_buffers() {
     let (ours, mut theirs) = socket_pair();
     let pool = BufferPool::new(4096, 2).unwrap();
 
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let mut bufs = pool.acquire_many(2).await;
         bufs[0].extend_from_slice(b"ACExx");
         bufs[1].extend_from_slice(b"..BD");
@@ -207,8 +206,8 @@ fn recv_vectored_fills_every_region() {
         theirs
     });
 
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let bufs = pool.acquire_many(2).await;
         let segments = [segment(0, 0, 3), segment(1, 100, 4), segment(0, 3, 3)];
         let (received, mut bufs) = sidecar.recv_vectored(ours.clone(), bufs, &segments).await;
@@ -243,8 +242,8 @@ fn vectored_transfers_larger_than_the_socket_buffer() {
         .map(|unit| segment(unit % 2, unit / 2 * UNIT, UNIT))
         .collect();
 
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let mut sending = pool.acquire_many(2).await;
         for (index, buf) in sending.iter_mut().enumerate() {
             let fill: Vec<u8> = (0..UNITS * UNIT)
@@ -276,13 +275,12 @@ fn pool_of(size: usize, huge_pages: bool) -> BufferPool {
     }
 }
 
-async fn sidecar_with(pool: &BufferPool) -> Sidecar {
-    Sidecar::start(Config {
+/// Settings for a sidecar with `pool` registered on its rings.
+fn config_with(pool: &BufferPool) -> Config {
+    Config {
         buffers: Some(pool.clone()),
         ..Config::default()
-    })
-    .await
-    .unwrap()
+    }
 }
 
 fn zero_copy_send(huge_pages: bool) {
@@ -304,8 +302,8 @@ fn zero_copy_send(huge_pages: bool) {
         received
     });
 
-    runtime().block_on(async {
-        let sidecar = sidecar_with(&pool).await;
+    let (runtime, sidecar) = runtime(config_with(&pool));
+    runtime.block_on(async {
         let mut bufs = pool.acquire_many(2).await;
         for (index, buf) in bufs.iter_mut().enumerate() {
             let fill: Vec<u8> = (0..UNITS * UNIT)
@@ -355,8 +353,8 @@ fn unclaimed_zero_copy_buffers_return_to_the_pool() {
     let (ours, mut theirs) = tcp_pair();
     let pool = pool_of(4096, false);
 
-    runtime().block_on(async {
-        let sidecar = sidecar_with(&pool).await;
+    let (runtime, sidecar) = runtime(config_with(&pool));
+    runtime.block_on(async {
         let mut bufs = pool.acquire_many(2).await;
         bufs[0].extend_from_slice(b"zero ");
         bufs[1].extend_from_slice(b"copy");
@@ -385,8 +383,8 @@ fn zero_copy_buffers_are_held_while_the_peer_does_not_read() {
     let (ours, mut theirs) = tcp_pair();
     let pool = pool_of(SIZE, false);
 
-    runtime().block_on(async {
-        let sidecar = sidecar_with(&pool).await;
+    let (runtime, sidecar) = runtime(config_with(&pool));
+    runtime.block_on(async {
         let mut bufs = pool.acquire_many(1).await;
         bufs[0].extend_from_slice(&vec![7; SIZE]);
         let whole = [segment(0, 0, SIZE)];
@@ -421,8 +419,8 @@ fn dropped_zero_copy_send_returns_its_buffers() {
     let (ours, theirs) = tcp_pair();
     let pool = pool_of(SIZE, false);
 
-    runtime().block_on(async {
-        let sidecar = sidecar_with(&pool).await;
+    let (runtime, sidecar) = runtime(config_with(&pool));
+    runtime.block_on(async {
         let mut bufs = pool.acquire_many(2).await;
         for buf in &mut bufs {
             buf.extend_from_slice(&vec![1; SIZE]);
@@ -468,8 +466,8 @@ fn failed_zero_copy_send_hands_its_buffers_back() {
     assert_eq!(set, 0);
     drop(theirs);
 
-    runtime().block_on(async {
-        let sidecar = sidecar_with(&pool).await;
+    let (runtime, sidecar) = runtime(config_with(&pool));
+    runtime.block_on(async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let mut bufs = pool.acquire_many(1).await;
         bufs[0].extend_from_slice(b"anyone?");
@@ -492,8 +490,8 @@ fn shutdown_of_one_direction() {
     let (ours, mut theirs) = socket_pair();
     let pool = BufferPool::new(4096, 1).unwrap();
 
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         sidecar
             .shutdown(ours.clone(), std::net::Shutdown::Write)
             .await
@@ -514,8 +512,8 @@ fn send_to_a_closed_peer_is_an_error() {
     let pool = BufferPool::new(4096, 1).unwrap();
     drop(theirs);
 
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let mut buf = pool.acquire().await;
         buf.extend_from_slice(b"anyone?");
         let (sent, buf) = sidecar.send(ours, buf, 0).await;
@@ -533,8 +531,8 @@ fn dropped_accept_closes_the_connection() {
     let address = listener.local_addr().unwrap();
     let listener = Arc::new(OwnedFd::from(listener));
 
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let (parked, accept) = tokio::sync::oneshot::channel();
         tokio::spawn({
             let sidecar = sidecar.clone();
@@ -572,8 +570,8 @@ fn dropped_recv_is_cancelled() {
     let (ours, _theirs) = socket_pair();
     let pool = BufferPool::new(4096, 1).unwrap();
 
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let recv = sidecar.recv(ours, pool.acquire().await, usize::MAX);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), recv)

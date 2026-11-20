@@ -5,13 +5,12 @@ use std::sync::Arc;
 
 use tokio_sidecar::{Config, Sidecar};
 
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .on_before_steal(tokio_sidecar::before_steal)
-        .build()
-        .unwrap()
+/// A runtime of two workers that a sidecar drives, and the sidecar.
+fn runtime(config: Config) -> (tokio::runtime::Runtime, Sidecar) {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(2).enable_time();
+    let sidecar = Sidecar::install(&mut builder, config);
+    (builder.build().unwrap(), sidecar)
 }
 
 /// A fresh directory, and a descriptor for it.
@@ -30,9 +29,8 @@ fn c(path: &str) -> CString {
 #[test]
 fn a_files_life() {
     let (path, dir) = scratch_dir("life");
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
-
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         sidecar
             .mkdir_at(dir.clone(), c("sub"), 0o755)
             .await
@@ -89,8 +87,8 @@ fn a_files_life() {
 #[test]
 fn opening_a_missing_file_fails() {
     let (path, dir) = scratch_dir("missing");
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let missing = sidecar.open_at(dir, c("nope"), libc::O_RDONLY, 0).await;
         assert_eq!(missing.unwrap_err().kind(), ErrorKind::NotFound);
     });

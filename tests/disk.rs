@@ -33,35 +33,36 @@ fn plan(domain_sizes: &[usize]) -> Plan {
     Plan::new(domains).unwrap()
 }
 
-fn runtime(plan: &Plan) -> tokio::runtime::Runtime {
+/// A runtime that `plan` builds and a sidecar with these settings drives.
+fn build(plan: &Plan, config: Config) -> std::io::Result<(tokio::runtime::Runtime, Sidecar)> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder
-        .enable_all()
-        .on_before_steal(tokio_sidecar::before_steal);
-    plan.build(&mut builder).unwrap()
+    builder.enable_time();
+    let sidecar = Sidecar::install(&mut builder, config);
+    Ok((plan.build(&mut builder)?, sidecar))
 }
 
-/// A runtime with one domain, and the configuration for its disk rings.
-fn setup() -> (tokio::runtime::Runtime, DiskConfig) {
-    let plan = plan(&[WORKERS]);
-    (runtime(&plan), disk_config(plan))
-}
-
-fn disk_config(plan: Plan) -> DiskConfig {
-    DiskConfig {
-        sq_entries: 64,
-        sq_thread_idle: Duration::from_millis(50),
-        plan,
+/// Settings for a sidecar with `pool` registered and with disk rings for a
+/// runtime that `plan` builds.
+fn config(pool: &BufferPool, plan: &Plan) -> Config {
+    Config {
+        buffers: Some(pool.clone()),
+        disk: Some(DiskConfig {
+            sq_entries: 64,
+            sq_thread_idle: Duration::from_millis(50),
+            plan: plan.clone(),
+        }),
+        ..Config::default()
     }
 }
 
-async fn start(pool: &BufferPool, disk: DiskConfig) -> std::io::Result<Sidecar> {
-    Sidecar::start(Config {
-        buffers: Some(pool.clone()),
-        disk: Some(disk),
-        ..Config::default()
-    })
-    .await
+/// A runtime with disk rings, its workers in the domains of `plan`.
+fn runtime(pool: &BufferPool, plan: Plan) -> (tokio::runtime::Runtime, Sidecar) {
+    build(&plan, config(pool, &plan)).unwrap()
+}
+
+/// A runtime with disk rings, its workers in one domain.
+fn setup(pool: &BufferPool) -> (tokio::runtime::Runtime, Sidecar) {
+    runtime(pool, plan(&[WORKERS]))
 }
 
 /// An `O_DIRECT` descriptor with room for `slot + 1` buffers. Tests use
@@ -106,9 +107,8 @@ async fn round_trip(
 fn round_trip_on_a_worker() {
     let (fd, offset) = scratch(0);
     let pool = BufferPool::new(BUF_SIZE, 4).unwrap();
-    let (runtime, disk) = setup();
+    let (runtime, sidecar) = setup(&pool);
     runtime.block_on(async {
-        let sidecar = start(&pool, disk).await.unwrap();
         tokio::spawn({
             let pool = pool.clone();
             async move { round_trip(&sidecar, &pool, &fd, offset, 0x11).await }
@@ -125,9 +125,8 @@ fn round_trip_on_a_worker() {
 fn round_trip_off_worker() {
     let (fd, offset) = scratch(1);
     let pool = BufferPool::new(BUF_SIZE, 4).unwrap();
-    let (runtime, disk) = setup();
+    let (runtime, sidecar) = setup(&pool);
     runtime.block_on(async {
-        let sidecar = start(&pool, disk).await.unwrap();
         round_trip(&sidecar, &pool, &fd, offset, 0x22).await;
     });
 }
@@ -139,9 +138,8 @@ fn round_trip_off_worker() {
 fn completions_wake_parked_workers() {
     let (fd, offset) = scratch(2);
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    let (runtime, disk) = setup();
+    let (runtime, sidecar) = setup(&pool);
     runtime.block_on(async {
-        let sidecar = start(&pool, disk).await.unwrap();
         tokio::spawn({
             let pool = pool.clone();
             async move {
@@ -171,10 +169,8 @@ fn many_operations_at_once() {
 
     let (fd, offset) = scratch(3);
     let pool = BufferPool::new(4096, 64).unwrap();
-    let plan = plan(&[2, 2]);
-    runtime(&plan).block_on(async {
-        let sidecar = start(&pool, disk_config(plan)).await.unwrap();
-
+    let (runtime, sidecar) = runtime(&pool, plan(&[2, 2]));
+    runtime.block_on(async {
         let mut buf = pool.acquire().await;
         buf.extend_from_slice(&[0x33; 4096]);
         let (written, buf) = sidecar.write_polled_at(fd.clone(), buf, offset).await;
@@ -209,9 +205,8 @@ fn many_operations_at_once() {
 fn dropped_operation_runs_to_its_end() {
     let (fd, offset) = scratch(4);
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    let (runtime, disk) = setup();
+    let (runtime, sidecar) = setup(&pool);
     runtime.block_on(async {
-        let sidecar = start(&pool, disk).await.unwrap();
         tokio::spawn({
             let pool = pool.clone();
             async move {
@@ -253,9 +248,8 @@ fn buffered_files_are_refused() {
     let fd = Arc::new(OwnedFd::from(file));
 
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    let (runtime, disk) = setup();
+    let (runtime, sidecar) = setup(&pool);
     runtime.block_on(async {
-        let sidecar = start(&pool, disk).await.unwrap();
         let (read, _buf) = sidecar
             .read_polled_at(fd, pool.acquire().await, 0, usize::MAX)
             .await;
@@ -267,14 +261,12 @@ fn buffered_files_are_refused() {
 fn polled_operations_need_disk_rings() {
     let (fd, offset) = scratch(5);
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    let (runtime, _) = setup();
+    let settings = Config {
+        disk: None,
+        ..config(&pool, &plan(&[WORKERS]))
+    };
+    let (runtime, sidecar) = build(&plan(&[WORKERS]), settings).unwrap();
     runtime.block_on(async {
-        let sidecar = Sidecar::start(Config {
-            buffers: Some(pool.clone()),
-            ..Config::default()
-        })
-        .await
-        .unwrap();
         let (read, _buf) = sidecar
             .read_polled_at(fd, pool.acquire().await, offset, usize::MAX)
             .await;
@@ -284,32 +276,24 @@ fn polled_operations_need_disk_rings() {
 
 #[test]
 fn disk_rings_need_a_pool() {
-    let (runtime, disk) = setup();
-    runtime.block_on(async {
-        let error = Sidecar::start(Config {
-            disk: Some(disk),
-            ..Config::default()
-        })
-        .await
-        .err()
-        .unwrap();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    });
+    let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
+    let plan = plan(&[WORKERS]);
+    let settings = Config {
+        buffers: None,
+        ..config(&pool, &plan)
+    };
+    let error = build(&plan, settings).err().unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
-/// The disk rings are grouped by the plan that placed the workers, so a
-/// plan that did not build the runtime cannot be used.
+/// The disk rings are grouped by the plan that places the workers, so a
+/// plan that does not build the runtime cannot be used.
 #[test]
 fn disk_rings_need_the_runtimes_plan() {
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    let (runtime, disk) = setup();
-    runtime.block_on(async {
-        let other = disk_config(plan(&[WORKERS]));
-        let error = start(&pool, other).await.err().unwrap();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-
-        // The refusal left nothing behind.
-        let sidecar = start(&pool, disk).await.unwrap();
-        sidecar.nop().await.unwrap();
-    });
+    let other = plan(&[WORKERS]);
+    let error = build(&plan(&[WORKERS]), config(&pool, &other))
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }

@@ -138,23 +138,19 @@ fn main() -> std::io::Result<()> {
         workers: cpus,
         sq_thread: None,
     }])?;
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder
-        .enable_all()
-        .on_before_steal(tokio_sidecar::before_steal);
-    let runtime = plan.build(&mut builder)?;
-
     let per_connection = if mode.zero_copy { 2 } else { 1 };
     let pool = BufferPool::without_huge_pages(buf_size, connections * per_connection)?;
 
-    runtime.block_on(async {
-        let sidecar = Sidecar::start(Config {
-            sq_entries: 1024,
-            buffers: Some(pool.clone()),
-            ..Config::default()
-        })
-        .await?;
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    let config = Config {
+        sq_entries: 1024,
+        buffers: Some(pool.clone()),
+        ..Config::default()
+    };
+    let sidecar = Sidecar::install(&mut builder, config);
+    let runtime = plan.build(&mut builder)?;
 
+    runtime.block_on(async {
         if per_worker {
             // Bound here once so that an address that cannot be had is an
             // error from `main`, and kept as the first worker's listener.

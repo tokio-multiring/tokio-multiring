@@ -9,13 +9,12 @@ use tokio_sidecar::{BufferPool, Config, Sidecar};
 
 const BUF_SIZE: usize = 64 * 1024;
 
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .on_before_steal(tokio_sidecar::before_steal)
-        .build()
-        .unwrap()
+/// A runtime of four workers that a sidecar drives, and the sidecar.
+fn runtime(config: Config) -> (tokio::runtime::Runtime, Sidecar) {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(4).enable_time();
+    let sidecar = Sidecar::install(&mut builder, config);
+    (builder.build().unwrap(), sidecar)
 }
 
 #[test]
@@ -68,7 +67,7 @@ fn dropped_buffers_come_back_empty() {
 
 #[test]
 fn acquire_waits_for_a_buffer() {
-    runtime().block_on(async {
+    runtime(Config::default()).0.block_on(async {
         let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
         let held = pool.acquire().await;
 
@@ -91,7 +90,7 @@ fn acquire_waits_for_a_buffer() {
 
 #[test]
 fn acquire_many_waits_for_all_of_them() {
-    runtime().block_on(async {
+    runtime(Config::default()).0.block_on(async {
         let pool = BufferPool::new(BUF_SIZE, 3).unwrap();
         assert_eq!(pool.count(), 3);
         let held = pool.acquire_many(2).await;
@@ -129,7 +128,7 @@ fn try_acquire_many_takes_all_or_none() {
 /// by one would leave them holding one apiece, waiting for the other.
 #[test]
 fn acquire_many_does_not_deadlock() {
-    runtime().block_on(async {
+    runtime(Config::default()).0.block_on(async {
         let pool = BufferPool::new(BUF_SIZE, 2).unwrap();
         let tasks: Vec<_> = (0..8)
             .map(|_| {
@@ -159,13 +158,11 @@ fn acquire_many_does_not_deadlock() {
 fn one_pool_registers_on_many_rings() {
     let pool = BufferPool::new(BUF_SIZE, 16).unwrap();
     for _ in 0..2 {
-        runtime().block_on(async {
-            let sidecar = Sidecar::start(Config {
-                buffers: Some(pool.clone()),
-                ..Config::default()
-            })
-            .await
-            .unwrap();
+        let (runtime, sidecar) = runtime(Config {
+            buffers: Some(pool.clone()),
+            ..Config::default()
+        });
+        runtime.block_on(async {
             assert_eq!(sidecar.buffers().unwrap().buf_size(), BUF_SIZE);
             tokio::spawn(async move { sidecar.nop().await })
                 .await
@@ -175,13 +172,12 @@ fn one_pool_registers_on_many_rings() {
     }
 }
 
-async fn sidecar_with(pool: &BufferPool) -> Sidecar {
-    Sidecar::start(Config {
+/// Settings for a sidecar with `pool` registered on its rings.
+fn config_with(pool: &BufferPool) -> Config {
+    Config {
         buffers: Some(pool.clone()),
         ..Config::default()
-    })
-    .await
-    .unwrap()
+    }
 }
 
 /// `O_DIRECT` is the case the pool's alignment exists for: the kernel
@@ -203,8 +199,8 @@ fn direct_io_round_trip() {
     let fd = Arc::new(OwnedFd::from(file));
 
     let pool = BufferPool::new(BUF_SIZE, 4).unwrap();
-    runtime().block_on(async {
-        let sidecar = sidecar_with(&pool).await;
+    let (runtime, sidecar) = runtime(config_with(&pool));
+    runtime.block_on(async {
         tokio::spawn({
             let pool = pool.clone();
             async move {
@@ -249,8 +245,8 @@ fn read_stops_at_its_limit() {
     writer.write_all(b"onetwo").unwrap();
 
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    runtime().block_on(async {
-        let sidecar = sidecar_with(&pool).await;
+    let (runtime, sidecar) = runtime(config_with(&pool));
+    runtime.block_on(async {
         let (read, buf) = sidecar
             .read_fixed_at(reader.clone(), pool.acquire().await, 0, 3)
             .await;
@@ -268,8 +264,8 @@ fn read_appends_to_the_contents() {
     writer.write_all(b"world").unwrap();
 
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    runtime().block_on(async {
-        let sidecar = sidecar_with(&pool).await;
+    let (runtime, sidecar) = runtime(config_with(&pool));
+    runtime.block_on(async {
         let mut buf = pool.acquire().await;
         buf.extend_from_slice(b"hello ");
         let (read, buf) = sidecar.read_fixed_at(reader, buf, 0, usize::MAX).await;
@@ -284,8 +280,8 @@ fn cancelled_read_returns_its_buffer() {
     let reader = Arc::new(OwnedFd::from(reader));
 
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    runtime().block_on(async {
-        let sidecar = sidecar_with(&pool).await;
+    let (runtime, sidecar) = runtime(config_with(&pool));
+    runtime.block_on(async {
         let read = sidecar.read_fixed_at(reader, pool.acquire().await, 0, usize::MAX);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), read)
@@ -306,8 +302,8 @@ fn buffers_from_elsewhere_are_refused() {
 
     let registered = BufferPool::new(BUF_SIZE, 1).unwrap();
     let other = BufferPool::new(BUF_SIZE, 1).unwrap();
-    runtime().block_on(async {
-        let sidecar = sidecar_with(&registered).await;
+    let (runtime, sidecar) = runtime(config_with(&registered));
+    runtime.block_on(async {
         let mut buf = other.acquire().await;
         buf.extend_from_slice(b"kept");
 
@@ -328,8 +324,8 @@ fn fixed_operations_need_a_pool() {
     let reader = Arc::new(OwnedFd::from(reader));
 
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let (result, _buf) = sidecar
             .read_fixed_at(reader, pool.acquire().await, 0, usize::MAX)
             .await;

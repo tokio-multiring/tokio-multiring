@@ -1,38 +1,60 @@
 use std::cell::{Cell, RefCell};
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::task::Waker;
 use std::time::Duration;
 
-use io_uring::{IoUring, cqueue, opcode, squeue};
-use tokio::io::Interest;
-use tokio::io::unix::AsyncFd;
-use tokio::runtime::Handle;
-use tokio::sync::{Notify, mpsc};
+use io_uring::{IoUring, cqueue, opcode, squeue, types};
+use tokio::io::{Interest, Ready};
+use tokio::runtime::Builder;
+use tokio::runtime::reactor::{ParkTimeouts, Reactor, Readiness, RegistrationToken};
 
 use crate::buffers::BufferPool;
 use crate::landing::{Arbiter, CellRef, Claim, TaskRef};
 use crate::op::{Completion, Operation};
 use crate::plan::Plan;
 
-/// `user_data` of submissions whose completion nobody waits for. Operation
-/// tokens carry a slot index in their low 32 bits, which never reaches
-/// `u32::MAX`, so the two cannot collide.
+// What a submission is for is in bits 30 and 31 of its `user_data`. The bits
+// below index the worker's table for that kind, and the upper half is the
+// generation of the entry there.
+
+/// The bits of a token that index a table.
+const INDEX: u64 = (1 << 30) - 1;
+/// The bits of a token that say what it is for.
+const KIND: u64 = 0b11 << 30;
+/// An operation, whose completion goes to a future.
+const OPERATION: u64 = 0;
+/// A poll that watches a file registered by the runtime.
+const WATCH: u64 = 0b01 << 30;
+/// The read that completes when another thread wakes the worker.
+const WAKE: u64 = 0b10 << 30;
+/// The poll that reports completions on the worker's disk ring.
+const DISK: u64 = WAKE | 1;
+/// Submissions whose completion nobody waits for.
 const DETACHED: u64 = u64::MAX;
 
 /// Arbiters are allocated this many at a time.
 const CHUNK: usize = 64;
 
-/// How many leases a reactor moves between its own free list and its pool
-/// at a time.
+/// How many leases a worker moves between its own free list and its pool at
+/// a time.
 const BATCH: usize = 32;
 
+// Whether a worker is asleep in its ring.
+
+/// Running, or on its way to sleep.
+const AWAKE: u8 = 0;
+/// Asleep, or about to be. Waking it takes a write to its descriptor.
+const ASLEEP: u8 = 1;
+/// Told to wake up since it last slept. It does not go to sleep on that.
+const NOTIFIED: u8 = 2;
+
 thread_local! {
-    static CURRENT: RefCell<Option<Rc<Reactor>>> = const { RefCell::new(None) };
+    static CURRENT: RefCell<Option<Rc<Worker>>> = const { RefCell::new(None) };
 }
 
 /// The right to start an operation in slot `index` of a reactor, with the
@@ -43,7 +65,7 @@ struct Lease {
     cell: CellRef,
 }
 
-/// Work handed to a reactor by a thread that does not own its ring.
+/// Work handed to a worker by a thread that does not own its ring.
 enum Remote {
     Submit {
         lease: Lease,
@@ -52,17 +74,33 @@ enum Remote {
         operation: Operation,
     },
     Cancel(u64),
+    Watch {
+        file: OwnedFd,
+        events: u32,
+        readiness: Readiness,
+        watch: Arc<WatchRef>,
+    },
+    Unwatch(Arc<WatchRef>),
 }
 
-/// What other threads share with a worker's reactor: the arbiters, and the
-/// way in for threads that have no ring of their own.
+/// Names a file that the runtime registered: the worker whose ring watches
+/// it and the token of the watch there. This is what the runtime holds for
+/// the registration.
+struct WatchRef {
+    worker: usize,
+    /// Zero until the worker has taken the watch on.
+    token: AtomicU64,
+}
+
+/// What other threads share with a worker: the arbiters, and the way in for
+/// threads that have no ring of their own.
 #[derive(Default)]
 struct Pool {
     chunks: Vec<NonNull<[Arbiter]>>,
     /// Leases not held by the reactor's own free list.
     free: Vec<Lease>,
     queue: Vec<Remote>,
-    /// Set when the reactor is gone. Nothing is accepted after that.
+    /// Set when the worker has stopped. Nothing is accepted after that.
     closed: bool,
 }
 
@@ -86,10 +124,15 @@ impl Pool {
         let base = self.chunks.len() * CHUNK;
         self.chunks.push(chunk);
         let first = chunk.cast::<Arbiter>();
-        self.free.extend((0..CHUNK).map(|offset| Lease {
-            index: u32::try_from(base + offset).expect("more than u32::MAX operations in flight"),
-            // SAFETY: `offset` is within the chunk.
-            cell: CellRef::new(unsafe { first.add(offset) }),
+        self.free.extend((0..CHUNK).map(|offset| {
+            Lease {
+                index: u32::try_from(base + offset)
+                    .ok()
+                    .filter(|&index| u64::from(index) <= INDEX)
+                    .expect("more operations in flight than a token can number"),
+                // SAFETY: `offset` is within the chunk.
+                cell: CellRef::new(unsafe { first.add(offset) }),
+            }
         }));
     }
 }
@@ -105,13 +148,18 @@ impl Drop for Pool {
     }
 }
 
-/// The part of a reactor that other threads can reach.
-#[derive(Default)]
+/// The part of a worker that other threads can reach.
 struct Shared {
     pool: Mutex<Pool>,
-    /// Wakes the driver task.
-    wake: Notify,
     in_flight: AtomicUsize,
+    /// One of `AWAKE`, `ASLEEP` and `NOTIFIED`.
+    sleep: AtomicU8,
+    /// An eventfd. The worker's ring reads from it, so a write brings the
+    /// worker out of its sleep there.
+    wake: OwnedFd,
+    /// The worker's rings, from when the runtime is built until the worker
+    /// starts and takes them.
+    rings: Mutex<Option<Rings>>,
 }
 
 impl Shared {
@@ -120,11 +168,31 @@ impl Shared {
     }
 }
 
-struct Inner {
+struct Rings {
+    ring: IoUring,
+    disk: Option<IoUring>,
+}
+
+/// What a sidecar has once its runtime is built.
+struct Started {
     workers: Box<[Shared]>,
-    next_remote: AtomicUsize,
+    /// Keeps the kernel submission threads of the disk rings alive.
+    _disk: Option<Disk>,
+}
+
+struct Inner {
+    me: Weak<Inner>,
+    sq_entries: u32,
     buffers: Option<BufferPool>,
-    disk: Option<Disk>,
+    disk: Option<DiskConfig>,
+    started: OnceLock<Started>,
+    next_remote: AtomicUsize,
+    /// One more than the index of the sleeping worker that wakes for the
+    /// runtime's timers. Zero when no worker does, which is never the case
+    /// while all of them sleep.
+    timekeeper: AtomicUsize,
+    /// Set when a timer was set that the timekeeper may be sleeping past.
+    timer_moved: AtomicBool,
 }
 
 /// Names an in-flight operation: the worker whose ring runs it, its token
@@ -220,15 +288,10 @@ impl Disk {
         })
     }
 
-    /// Creates the current worker's disk ring, served by the kernel thread
-    /// of the domain the plan placed it in.
-    fn ring(&self) -> io::Result<IoUring> {
-        let domain = self.plan.domain_of_current_thread().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the disk plan did not place this runtime's workers",
-            )
-        })?;
+    /// Creates the disk ring of the worker with index `worker`, served by
+    /// the kernel thread of the domain the plan places it in.
+    fn ring(&self, worker: usize) -> io::Result<IoUring> {
+        let domain = self.plan.domain_of_worker(worker);
         IoUring::builder()
             .setup_iopoll()
             .setup_sqpoll(self.idle_ms)
@@ -237,64 +300,47 @@ impl Disk {
     }
 }
 
-/// Handle to the reactors of one runtime. Cheap to clone.
+/// Handle to the reactor of one runtime. Cheap to clone.
 #[derive(Clone)]
 pub struct Sidecar {
     inner: Arc<Inner>,
 }
 
 impl Sidecar {
-    /// Creates one ring per worker of the current multi-threaded runtime and
-    /// starts a driver task on each.
+    /// Makes the runtime that `builder` builds one that a sidecar drives:
+    /// every worker gets a ring, sleeps in it when it has nothing to run,
+    /// and the runtime's own sockets and other I/O resources are watched by
+    /// those rings too. Returns the handle that operations are started on.
     ///
-    /// The reactors live until the runtime shuts down. A runtime can host
-    /// one sidecar: a second call fails with [`io::ErrorKind::AlreadyExists`]
-    /// and leaves the first untouched.
+    /// The rings are created when the runtime is built, and an error in
+    /// that is returned by the builder's `build`. Operations can be started
+    /// from then on. The runtime has to be a multi-threaded one, and must
+    /// not use [`block_in_place`](tokio::task::block_in_place): a ring
+    /// belongs to the thread its worker started on.
     ///
-    /// # Panics
-    ///
-    /// Panics if called from outside a multi-threaded runtime.
-    pub async fn start(config: Config) -> io::Result<Sidecar> {
-        let workers = Handle::current().metrics().num_workers();
-        let disk = match &config.disk {
-            Some(_) if config.buffers.is_none() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "disk rings need a buffer pool",
-                ));
-            }
-            Some(disk) => Some(Disk::new(disk)?),
-            None => None,
-        };
-        let inner = Arc::new(Inner {
-            workers: (0..workers).map(|_| Shared::default()).collect(),
+    /// This takes the builder's `io_reactor` and `on_before_steal` slots,
+    /// the latter for [`before_steal`]. A sidecar drives one runtime:
+    /// building a second one from the same builder fails with
+    /// [`io::ErrorKind::AlreadyExists`].
+    pub fn install(builder: &mut Builder, config: Config) -> Sidecar {
+        let inner = Arc::new_cyclic(|me| Inner {
+            me: me.clone(),
+            sq_entries: config.sq_entries,
+            buffers: config.buffers,
+            disk: config.disk,
+            started: OnceLock::new(),
             next_remote: AtomicUsize::new(0),
-            buffers: config.buffers.clone(),
-            disk,
+            timekeeper: AtomicUsize::new(0),
+            timer_moved: AtomicBool::new(false),
         });
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sidecar = inner.clone();
-        tokio::task::run_on_each_worker(move |index| {
-            let _ = tx.send(Reactor::install(sidecar.clone(), index, &config));
-        });
-
-        let mut result = Ok(());
-        for _ in 0..workers {
-            match rx.recv().await {
-                Some(installed) => result = result.and(installed),
-                None => {
-                    result = Err(io::Error::other("runtime shut down during sidecar start"));
-                    break;
-                }
-            }
-        }
-        if let Err(error) = result {
-            let sidecar = inner.clone();
-            tokio::task::run_on_each_worker(move |_| Reactor::uninstall(&sidecar));
-            return Err(error);
-        }
-        Ok(Sidecar { inner })
+        let reactor = inner.clone();
+        builder
+            .io_reactor(move |workers| {
+                reactor.start(workers)?;
+                Ok(reactor.clone() as Arc<dyn Reactor>)
+            })
+            .on_before_steal(before_steal);
+        Sidecar { inner }
     }
 
     /// The pool registered on the rings, if [`Config::buffers`] named one.
@@ -313,7 +359,7 @@ impl Sidecar {
     /// has let go of its buffers.
     pub fn in_flight(&self) -> usize {
         self.inner
-            .workers
+            .workers()
             .iter()
             .map(|shared| shared.in_flight.load(Ordering::Relaxed))
             .sum()
@@ -323,31 +369,27 @@ impl Sidecar {
     /// one, otherwise the next in rotation. The result is written to `task`,
     /// whose waker must already be set.
     pub(crate) fn submit(&self, operation: Operation, task: TaskRef) -> Ticket {
-        match self.local() {
-            Some(reactor) => {
-                let lease = reactor.lease();
+        match self.inner.local() {
+            Some(worker) => {
+                let lease = worker.lease();
                 // SAFETY: `self` keeps the pool alive.
                 let generation = unsafe { lease.cell.get() }.arm();
-                let token = reactor.start(lease, generation, task, operation);
-                if !reactor.hook_seen.get() {
-                    reactor.notify_driver();
-                }
+                let token = worker.start(lease, generation, task, operation);
                 Ticket {
-                    worker: reactor.index,
+                    worker: worker.index,
                     token,
                     cell: lease.cell,
                 }
             }
             None => {
-                let rotation = self.inner.next_remote.fetch_add(1, Ordering::Relaxed);
-                let worker = rotation % self.inner.workers.len();
-                let shared = &self.inner.workers[worker];
+                let worker = self.inner.next_worker();
+                let shared = &self.inner.workers()[worker];
 
                 let mut pool = shared.pool();
                 let lease = pool.lease();
                 // SAFETY: `self` keeps the pool alive.
                 let generation = unsafe { lease.cell.get() }.arm();
-                // With the reactor gone the operation is dropped, and its
+                // With the worker gone the operation is dropped, and its
                 // future stays pending.
                 let orphan = if pool.closed {
                     Some(operation)
@@ -362,7 +404,7 @@ impl Sidecar {
                 };
                 drop(pool);
                 drop(orphan);
-                shared.wake.notify_one();
+                self.inner.wake(worker);
 
                 Ticket {
                     worker,
@@ -382,60 +424,275 @@ impl Sidecar {
 
     /// Asks the kernel to cut short an operation whose future is gone.
     pub(crate) fn cancel(&self, ticket: Ticket) {
-        match self.local() {
-            Some(reactor) if reactor.index == ticket.worker => {
-                reactor.cancel(ticket.token);
-                reactor.notify_driver();
-            }
+        match self.inner.local() {
+            Some(worker) if worker.index == ticket.worker => worker.cancel(ticket.token),
             _ => {
-                let shared = &self.inner.workers[ticket.worker];
+                let shared = &self.inner.workers()[ticket.worker];
                 let mut pool = shared.pool();
                 if !pool.closed {
                     pool.queue.push(Remote::Cancel(ticket.token));
                     drop(pool);
-                    shared.wake.notify_one();
+                    self.inner.wake(ticket.worker);
                 }
             }
         }
     }
+}
 
-    /// This thread's reactor, if it has one and it belongs to this sidecar.
-    fn local(&self) -> Option<Rc<Reactor>> {
+impl Inner {
+    /// The workers of the runtime this sidecar drives.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the runtime has not been built.
+    fn workers(&self) -> &[Shared] {
+        let started = self.started.get();
+        &started.expect("the sidecar's runtime is not built").workers
+    }
+
+    /// Creates the rings of a runtime with this many workers.
+    fn start(&self, workers: usize) -> io::Result<()> {
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        if self.started.get().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "this sidecar already drives a runtime",
+            ));
+        }
+        let disk = match &self.disk {
+            Some(_) if self.buffers.is_none() => {
+                return Err(invalid("disk rings need a buffer pool"));
+            }
+            // The disk rings are grouped by the domains of the plan, which
+            // only means something if it also places the workers.
+            Some(disk) if !disk.plan.has_built() || disk.plan.worker_count() != workers => {
+                return Err(invalid("the disk plan is not the one building the runtime"));
+            }
+            Some(disk) => Some(Disk::new(disk)?),
+            None => None,
+        };
+
+        let shared = (0..workers)
+            .map(|worker| {
+                // COOP_TASKRUN, not DEFER_TASKRUN: `turn` relies on any
+                // enter bringing in the completions that are due.
+                // TASKRUN_FLAG lets it see without a syscall whether there
+                // are any. The ring is made disabled so that the worker's
+                // thread, which enables it, becomes its one issuer.
+                let ring = IoUring::builder()
+                    .setup_single_issuer()
+                    .setup_coop_taskrun()
+                    .setup_taskrun_flag()
+                    .setup_r_disabled()
+                    .build(self.sq_entries)?;
+                let disk = disk.as_ref().map(|disk| disk.ring(worker)).transpose()?;
+                if let Some(buffers) = &self.buffers {
+                    buffers.register_on(&ring)?;
+                    if let Some(disk) = &disk {
+                        buffers.register_on(disk)?;
+                    }
+                }
+
+                // SAFETY: returns a new descriptor or -1.
+                let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+                if wake == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(Shared {
+                    pool: Mutex::default(),
+                    in_flight: AtomicUsize::new(0),
+                    sleep: AtomicU8::new(AWAKE),
+                    // SAFETY: just created, and owned by nothing else.
+                    wake: unsafe { OwnedFd::from_raw_fd(wake) },
+                    rings: Mutex::new(Some(Rings { ring, disk })),
+                })
+            })
+            .collect::<io::Result<_>>()?;
+
+        let started = Started {
+            workers: shared,
+            _disk: disk,
+        };
+        // Tokio builds a runtime on one thread, so nothing races this.
+        self.started.set(started).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "this sidecar already drives a runtime",
+            )
+        })
+    }
+
+    /// This thread's worker, if it has one and it belongs to this sidecar.
+    fn local(&self) -> Option<Rc<Worker>> {
         // The thread-local is gone when a future is dropped during thread
         // teardown; such a thread is treated like any other non-worker.
         CURRENT
             .try_with(|current| current.borrow().clone())
             .ok()
             .flatten()
-            .filter(|reactor| Arc::ptr_eq(&reactor.sidecar, &self.inner))
+            .filter(|worker| std::ptr::eq(Arc::as_ptr(&worker.sidecar), self))
+    }
+
+    /// The worker that takes the next piece of work from a thread without
+    /// a ring.
+    fn next_worker(&self) -> usize {
+        self.next_remote.fetch_add(1, Ordering::Relaxed) % self.workers().len()
+    }
+
+    /// Brings `worker` out of its sleep if it is asleep, and keeps it from
+    /// going to sleep otherwise.
+    fn wake(&self, worker: usize) {
+        let shared = &self.workers()[worker];
+        if shared.sleep.swap(NOTIFIED, Ordering::SeqCst) == ASLEEP {
+            let one = 1u64.to_ne_bytes();
+            // SAFETY: writes eight bytes from a buffer of eight. It can only
+            // fail with a counter that is at its maximum, which wakes the
+            // worker just the same.
+            unsafe { libc::write(shared.wake.as_raw_fd(), one.as_ptr().cast(), one.len()) };
+        }
+    }
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sidecar")
+            .field("workers", &self.started.get().map(|s| s.workers.len()))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Reactor for Inner {
+    /// Has a ring watch the file: the current worker's if this thread has
+    /// one, so that a connection is watched where it is used, otherwise the
+    /// next in rotation.
+    fn register(
+        &self,
+        fd: BorrowedFd<'_>,
+        interest: Interest,
+    ) -> io::Result<(Readiness, RegistrationToken)> {
+        // The caller may close its descriptor at any time, and the number
+        // may then name another file.
+        let file = fd.try_clone_to_owned()?;
+        let events = poll_events(interest);
+        let readiness = Readiness::new();
+
+        let watch = match self.local() {
+            Some(worker) => Arc::new(WatchRef {
+                worker: worker.index,
+                token: AtomicU64::new(worker.watch(file, events, readiness.clone())),
+            }),
+            None => {
+                let worker = self.next_worker();
+                let watch = Arc::new(WatchRef {
+                    worker,
+                    token: AtomicU64::new(0),
+                });
+                let mut pool = self.workers()[worker].pool();
+                if pool.closed {
+                    return Err(io::Error::other("the runtime's I/O reactor has shut down"));
+                }
+                pool.queue.push(Remote::Watch {
+                    file,
+                    events,
+                    readiness: readiness.clone(),
+                    watch: watch.clone(),
+                });
+                drop(pool);
+                self.wake(worker);
+                watch
+            }
+        };
+        Ok((readiness, Box::new(watch)))
+    }
+
+    fn deregister(&self, _readiness: &Readiness, token: &RegistrationToken) -> io::Result<()> {
+        let watch = token
+            .downcast_ref::<Arc<WatchRef>>()
+            .expect("a registration token of another reactor");
+        let assigned = watch.token.load(Ordering::Acquire);
+        match self.local() {
+            Some(worker) if worker.index == watch.worker && assigned != 0 => {
+                worker.unwatch(assigned);
+            }
+            // Behind the request to watch it, if that is still queued.
+            _ => {
+                let mut pool = self.workers()[watch.worker].pool();
+                if !pool.closed {
+                    pool.queue.push(Remote::Unwatch(watch.clone()));
+                    drop(pool);
+                    self.wake(watch.worker);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn park(&self, worker: usize, timeouts: ParkTimeouts) -> bool {
+        match self.local() {
+            Some(local) if local.index == worker => local.park(timeouts),
+            _ => panic!(
+                "worker {worker} went to sleep on a thread that does not own its ring: \
+                 a sidecar needs a multi-threaded runtime"
+            ),
+        }
+        true
+    }
+
+    fn unpark(&self, worker: usize) {
+        self.wake(worker);
+    }
+
+    fn unpark_for_timer(&self) {
+        self.timer_moved.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.timekeeper.load(Ordering::SeqCst).checked_sub(1) {
+            self.wake(worker);
+        }
+    }
+
+    fn worker_start(&self, worker: usize) {
+        let rings = self.workers()[worker].rings.lock();
+        let rings = rings.unwrap_or_else(PoisonError::into_inner).take();
+        let Some(rings) = rings else {
+            panic!(
+                "worker {worker} started a second time: a runtime that a sidecar drives \
+                 cannot use `block_in_place`"
+            );
+        };
+        let sidecar = self.me.upgrade().expect("called through a reference");
+        Worker::install(sidecar, worker, rings);
+    }
+
+    fn worker_stop(&self, _worker: usize) {
+        let worker = CURRENT.with(|current| current.borrow_mut().take());
+        debug_assert!(
+            worker.is_some_and(|worker| std::ptr::eq(Arc::as_ptr(&worker.sidecar), self))
+        );
     }
 }
 
 /// Flushes the current worker's ring: submits what its tasks have queued and
-/// delivers the completions that are ready. Install it with
-/// [`Builder::on_before_steal`], or call it from your own before-steal
-/// callback if the runtime needs that slot for something else.
+/// delivers the completions that are ready. [`Sidecar::install`] has the
+/// runtime call it whenever a worker has run out of local work. A runtime
+/// that needs [`Builder::on_before_steal`] for something else has to call
+/// it from its own callback.
 ///
 /// The hook runs when a worker has emptied its local queue, so everything
 /// the worker's tasks queued since the last flush goes to the kernel in one
 /// `io_uring_enter`, without a trip through the scheduler.
 ///
 /// A worker that never runs out of local work never reaches the hook. A
-/// full submission queue is flushed on the spot, so at most
-/// [`Config::sq_entries`] operations are left waiting there, until the
-/// worker goes idle or a completion on its ring wakes the driver task.
+/// full submission queue is flushed on the spot, and the runtime has every
+/// worker look at its ring every so many tasks, so what is left waiting is
+/// bounded either way.
 ///
-/// Without the hook the sidecar still works: each worker's driver task does
-/// the flushing, at the cost of one extra task poll per batch.
+/// Without the hook the sidecar still works: a worker then flushes when it
+/// is about to go to sleep, and at those regular looks.
 ///
-/// Does nothing on a thread that has no reactor.
-///
-/// [`Builder::on_before_steal`]: tokio::runtime::Builder::on_before_steal
+/// Does nothing on a thread that has no ring.
 pub fn before_steal() {
-    let reactor = CURRENT.with(|current| current.borrow().clone());
-    if let Some(reactor) = reactor {
-        reactor.hook_seen.set(true);
-        reactor.turn();
+    let worker = CURRENT.with(|current| current.borrow().clone());
+    if let Some(worker) = worker {
+        worker.turn();
     }
 }
 
@@ -456,126 +713,121 @@ struct InFlight {
     let_go: Option<i32>,
 }
 
-/// One worker's ring. Only ever touched from that worker's thread.
-struct Reactor {
+/// A file that the runtime registered, watched by a multishot poll.
+struct Watch {
+    /// The worker's own descriptor for the file.
+    file: OwnedFd,
+    events: u32,
+    readiness: Readiness,
+    /// Set when the registration has ended. The entry stays until the
+    /// kernel has said that the poll is over.
+    ended: bool,
+}
+
+/// The watches of one worker, by the index in their token.
+#[derive(Default)]
+struct Watches {
+    /// Each with the generation of the watch that is or will be there.
+    entries: Vec<(u32, Option<Watch>)>,
+    vacant: Vec<u32>,
+}
+
+/// What a watch found out, to be passed on once no borrow is held.
+enum Report {
+    Ready(Ready),
+    /// The file can no longer be watched.
+    Failed,
+}
+
+/// One worker's rings and what is in flight on them. Only ever touched from
+/// that worker's thread.
+struct Worker {
     ring: RefCell<IoUring>,
     /// The polled ring, if the sidecar has them.
     disk: Option<RefCell<IoUring>>,
-    /// In-flight operations, indexed by the low half of their token.
+    /// In-flight operations, by the index in their token.
     slots: RefCell<Vec<Option<InFlight>>>,
     /// Leases for slots that are empty.
     free: RefCell<Vec<Lease>>,
+    watches: RefCell<Watches>,
     /// Completions whose future was busy with its waker when they came in:
     /// token, result and flags.
     deferred: RefCell<Vec<(u64, i32, u32)>>,
     /// Scratch space for `turn` and `reap`, kept to reuse the allocations.
     remote: RefCell<Vec<Remote>>,
+    completions: RefCell<Vec<(u64, i32, u32)>>,
     wakers: RefCell<Vec<Waker>>,
     released: RefCell<Vec<Operation>>,
-    /// Whether the driver task has been woken since its last turn.
-    driver_notified: Cell<bool>,
-    /// Whether [`before_steal`] runs on this thread. Until it has been seen,
-    /// local submissions wake the driver task to get flushed.
-    hook_seen: Cell<bool>,
-    stopped: Cell<bool>,
+    reports: RefCell<Vec<(Readiness, Report)>>,
+    /// Set when something is left that a turn soon has to pick up. The
+    /// worker does not go to sleep on that.
+    revisit: Cell<bool>,
+    /// Where the read that wakes the worker puts what it read. Leaked: the
+    /// kernel may write to it after the ring is closed.
+    woken: NonNull<[u8; 8]>,
     sidecar: Arc<Inner>,
     index: usize,
 }
 
-impl Reactor {
-    fn install(sidecar: Arc<Inner>, index: usize, config: &Config) -> io::Result<()> {
-        CURRENT.with(|current| {
-            let mut current = current.borrow_mut();
-            if current.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "this runtime already hosts a sidecar",
-                ));
-            }
-
-            // COOP_TASKRUN, not DEFER_TASKRUN: deferred completions do not
-            // raise readiness on the ring's descriptor, so a worker parked
-            // in tokio's driver would never learn about them. Cooperative
-            // task work wakes the parked thread, and TASKRUN_FLAG lets
-            // `turn` see pending work without a syscall.
-            let ring = IoUring::builder()
-                .setup_single_issuer()
-                .setup_coop_taskrun()
-                .setup_taskrun_flag()
-                .build(config.sq_entries)?;
-            if let Some(buffers) = &config.buffers {
-                buffers.register_on(&ring)?;
-            }
-            // SAFETY: the descriptor is the ring's, and the ring outlives
-            // `readiness`: the driver task owns both and drops `readiness`
-            // first.
-            let readiness = unsafe {
-                AsyncFd::register_with_interest(RingFd(ring.as_raw_fd()), Interest::READABLE)
-            }
-            .map_err(io::Error::from)?;
-
-            let mut disk_readiness = None;
-            let disk = match (&sidecar.disk, &config.buffers) {
-                (Some(disk), Some(buffers)) => {
-                    let ring = disk.ring()?;
-                    buffers.register_on(&ring)?;
-                    // SAFETY: as for `readiness`.
-                    disk_readiness = Some(
-                        unsafe {
-                            AsyncFd::register_with_interest(
-                                RingFd(ring.as_raw_fd()),
-                                Interest::READABLE,
-                            )
-                        }
-                        .map_err(io::Error::from)?,
-                    );
-                    Some(RefCell::new(ring))
-                }
-                _ => None,
-            };
-
-            let reactor = Rc::new(Reactor {
-                ring: RefCell::new(ring),
-                disk,
-                slots: RefCell::new(Vec::new()),
-                free: RefCell::new(Vec::new()),
-                deferred: RefCell::new(Vec::new()),
-                remote: RefCell::new(Vec::new()),
-                wakers: RefCell::new(Vec::new()),
-                released: RefCell::new(Vec::new()),
-                driver_notified: Cell::new(false),
-                hook_seen: Cell::new(false),
-                stopped: Cell::new(false),
-                sidecar,
-                index,
-            });
-            tokio::task::spawn_worker_local(drive(reactor.clone(), readiness, disk_readiness));
-            *current = Some(reactor);
-            Ok(())
-        })
-    }
-
-    /// Removes this thread's reactor if it belongs to `sidecar`.
-    fn uninstall(sidecar: &Arc<Inner>) {
-        CURRENT.with(|current| {
-            let mut current = current.borrow_mut();
-            if let Some(reactor) = current.as_ref()
-                && Arc::ptr_eq(&reactor.sidecar, sidecar)
-            {
-                reactor.stopped.set(true);
-                reactor.shared().wake.notify_one();
-                *current = None;
-            }
+impl Worker {
+    /// Makes the calling thread the one that runs the worker with index
+    /// `index`, and the only one to use its rings.
+    fn install(sidecar: Arc<Inner>, index: usize, rings: Rings) {
+        if let Err(error) = rings.ring.submitter().register_enable_rings() {
+            panic!("worker {index} could not take over its ring: {error}");
+        }
+        let worker = Rc::new(Worker {
+            ring: RefCell::new(rings.ring),
+            disk: rings.disk.map(RefCell::new),
+            slots: RefCell::new(Vec::new()),
+            free: RefCell::new(Vec::new()),
+            watches: RefCell::new(Watches::default()),
+            deferred: RefCell::new(Vec::new()),
+            remote: RefCell::new(Vec::new()),
+            completions: RefCell::new(Vec::new()),
+            wakers: RefCell::new(Vec::new()),
+            released: RefCell::new(Vec::new()),
+            reports: RefCell::new(Vec::new()),
+            revisit: Cell::new(false),
+            woken: NonNull::from(Box::leak(Box::new([0; 8]))),
+            sidecar,
+            index,
         });
+        worker.listen_for_wake();
+        worker.listen_for_disk();
+        let previous = CURRENT.with(|current| current.borrow_mut().replace(worker));
+        assert!(previous.is_none(), "this thread already runs a worker");
     }
 
     fn shared(&self) -> &Shared {
-        &self.sidecar.workers[self.index]
+        &self.sidecar.workers()[self.index]
     }
 
-    fn notify_driver(&self) {
-        if !self.driver_notified.replace(true) {
-            self.shared().wake.notify_one();
+    /// Queues the read that a write to the worker's eventfd completes.
+    fn listen_for_wake(&self) {
+        let wake = types::Fd(self.shared().wake.as_raw_fd());
+        let entry = opcode::Read::new(wake, self.woken.as_ptr().cast(), 8)
+            .build()
+            .user_data(WAKE);
+        if let Err(error) = self.push(&entry) {
+            // Nothing could wake the worker from its ring again.
+            panic!("io_uring_enter failed: {error}");
+        }
+    }
+
+    /// Queues the poll that says when the disk ring has completions, which
+    /// is what gets a worker asleep in its ring to reap them.
+    fn listen_for_disk(&self) {
+        let Some(disk) = &self.disk else {
+            return;
+        };
+        let disk = types::Fd(disk.borrow().as_raw_fd());
+        let entry = opcode::PollAdd::new(disk, libc::POLLIN as u32)
+            .multi(true)
+            .build()
+            .user_data(DISK);
+        if let Err(error) = self.push(&entry) {
+            panic!("io_uring_enter failed: {error}");
         }
     }
 
@@ -639,9 +891,11 @@ impl Reactor {
             let mut released = self.released.take();
             if !self.resolve(token, result, 0, &mut wakers, &mut released) {
                 self.deferred.borrow_mut().push((token, result, 0));
-                self.notify_driver();
+                self.revisit.set(true);
             }
-            self.deliver(wakers, released);
+            self.wakers.replace(wakers);
+            self.released.replace(released);
+            self.deliver();
         }
         token
     }
@@ -755,16 +1009,132 @@ impl Reactor {
         }
     }
 
-    /// Wakes the futures whose results are in and drops the operations
-    /// nobody is waiting for. Both run foreign code, so the caller must hold
-    /// no borrow.
-    fn deliver(&self, mut wakers: Vec<Waker>, mut released: Vec<Operation>) {
+    /// Has the ring watch `file` for `events`, reporting to `readiness`.
+    /// Returns the token of the watch.
+    fn watch(&self, file: OwnedFd, events: u32, readiness: Readiness) -> u64 {
+        let token = {
+            let mut watches = self.watches.borrow_mut();
+            let index = watches.vacant.pop().unwrap_or_else(|| {
+                let index = u32::try_from(watches.entries.len())
+                    .ok()
+                    .filter(|&index| u64::from(index) <= INDEX)
+                    .expect("more files registered than a token can number");
+                watches.entries.push((0, None));
+                index
+            });
+            let (generation, entry) = &mut watches.entries[index as usize];
+            *entry = Some(Watch {
+                file,
+                events,
+                readiness,
+                ended: false,
+            });
+            token_of(*generation, index) | WATCH
+        };
+        self.poll(token);
+        token
+    }
+
+    /// Queues the poll of the watch `token`. If that fails, the watch is
+    /// over, and whoever waits on the file is told.
+    fn poll(&self, token: u64) {
+        let entry = {
+            let watches = self.watches.borrow();
+            let (_, watch) = &watches.entries[key_of(token)];
+            let watch = watch.as_ref().expect("a watch that is in place");
+            opcode::PollAdd::new(types::Fd(watch.file.as_raw_fd()), watch.events)
+                .multi(true)
+                .build()
+                .user_data(token)
+        };
+        if self.push(&entry).is_err() {
+            let watch = self.unlist(token);
+            self.reports
+                .borrow_mut()
+                .push((watch.readiness, Report::Failed));
+            self.revisit.set(true);
+        }
+    }
+
+    /// Ends the watch `token`, if it is still there.
+    fn unwatch(&self, token: u64) {
+        let watching = {
+            let mut watches = self.watches.borrow_mut();
+            match watches.entries.get_mut(key_of(token)) {
+                Some((generation, Some(watch))) if *generation == generation_of(token) => {
+                    watch.ended = true;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if watching {
+            let entry = opcode::PollRemove::new(token).build().user_data(DETACHED);
+            // If this cannot be queued, the poll and the worker's descriptor
+            // for the file last until the file itself is done for.
+            let _ = self.push(&entry);
+        }
+    }
+
+    /// Takes the watch `token` out of the table, making room for another.
+    fn unlist(&self, token: u64) -> Watch {
+        let mut watches = self.watches.borrow_mut();
+        let (generation, entry) = &mut watches.entries[key_of(token)];
+        *generation = generation.wrapping_add(1);
+        let watch = entry.take().expect("a watch that is in place");
+        watches.vacant.push(key_of(token) as u32);
+        watch
+    }
+
+    /// Handles a completion of the poll of the watch `token`.
+    fn watched(&self, token: u64, result: i32, flags: u32) {
+        let (report, ended) = {
+            let watches = self.watches.borrow();
+            let (generation, watch) = &watches.entries[key_of(token)];
+            debug_assert_eq!(*generation, generation_of(token));
+            let watch = watch.as_ref().expect("a watch that is in place");
+            let report = match result {
+                _ if watch.ended => None,
+                0.. => Some(Report::Ready(ready(result as u32))),
+                _ => Some(Report::Failed),
+            };
+            let report = report.map(|report| (watch.readiness.clone(), report));
+            (report, watch.ended || result < 0)
+        };
+        self.reports.borrow_mut().extend(report);
+        if cqueue::more(flags) {
+            return;
+        }
+        // The kernel ends a multishot poll of its own accord now and then.
+        // A new one reports whatever happened in between as it starts.
+        match ended {
+            true => drop(self.unlist(token)),
+            false => self.poll(token),
+        }
+    }
+
+    /// Wakes the futures whose results are in, passes on what the watches
+    /// found, and drops the operations nobody is waiting for. All of these
+    /// run foreign code, so the caller must hold no borrow.
+    fn deliver(&self) {
+        let mut released = self.released.take();
         released.drain(..).for_each(Operation::release);
+        self.released.replace(released);
+
+        let mut reports = self.reports.take();
+        for (readiness, report) in reports.drain(..) {
+            match report {
+                Report::Ready(ready) => readiness.set_ready(ready),
+                Report::Failed => readiness.shutdown(),
+            }
+        }
+        self.reports.replace(reports);
+
+        let mut wakers = self.wakers.take();
         for waker in wakers.drain(..) {
             waker.wake();
         }
         self.wakers.replace(wakers);
-        self.released.replace(released);
     }
 
     /// Queues `entry`, flushing the submission queue to the kernel first if
@@ -826,7 +1196,7 @@ impl Reactor {
                         io::ErrorKind::ResourceBusy | io::ErrorKind::WouldBlock
                     ) =>
                 {
-                    self.notify_driver();
+                    self.revisit.set(true);
                     return;
                 }
                 // As in `enter`, there is no safe way to carry on.
@@ -835,9 +1205,8 @@ impl Reactor {
         }
     }
 
-    /// Takes in remote work, submits everything queued, and delivers the
-    /// completions that are ready.
-    fn turn(&self) {
+    /// Takes in what other threads have handed over.
+    fn take_remote(&self) {
         let mut remote = self.remote.take();
         std::mem::swap(&mut remote, &mut self.shared().pool().queue);
         for remote in remote.drain(..) {
@@ -848,7 +1217,7 @@ impl Reactor {
                     task,
                     operation,
                 } => {
-                    // SAFETY: the reactor keeps the pool alive.
+                    // SAFETY: the worker keeps the pool alive.
                     let cell = unsafe { lease.cell.get() };
                     if cell.is_abandoned(generation) {
                         // Dropped before it got here: not worth a trip to
@@ -860,18 +1229,101 @@ impl Reactor {
                     }
                 }
                 Remote::Cancel(token) => self.cancel(token),
+                Remote::Watch {
+                    file,
+                    events,
+                    readiness,
+                    watch,
+                } => {
+                    let token = self.watch(file, events, readiness);
+                    watch.token.store(token, Ordering::Release);
+                }
+                Remote::Unwatch(watch) => self.unwatch(watch.token.load(Ordering::Acquire)),
             }
         }
         self.remote.replace(remote);
-        self.driver_notified.set(false);
+    }
 
+    /// Takes in remote work, submits everything queued, and delivers the
+    /// completions that are ready. Returns whether any were.
+    fn turn(&self) -> bool {
+        self.take_remote();
+        let mut delivered = false;
         loop {
             self.enter();
             self.kick_disk();
-            self.reap();
+            delivered |= self.reap();
             if !self.kernel_holds_completions() {
-                break;
+                break delivered;
             }
+        }
+    }
+
+    /// Puts the worker to sleep in its ring until a completion comes in,
+    /// another thread wakes it, or its time is up.
+    fn park(&self, timeouts: ParkTimeouts) {
+        // Tasks that this woke have to run before the worker may sleep.
+        let delivered = self.turn();
+        if delivered || self.revisit.take() || timeouts.driving == Some(Duration::ZERO) {
+            return;
+        }
+
+        let shared = self.shared();
+        let asleep =
+            shared
+                .sleep
+                .compare_exchange(AWAKE, ASLEEP, Ordering::SeqCst, Ordering::SeqCst);
+        if asleep.is_ok() {
+            // One sleeping worker wakes for the timers, the first to get
+            // there. The others sleep until something is there for them.
+            let sidecar = &*self.sidecar;
+            let keeper = sidecar
+                .timekeeper
+                .compare_exchange(0, self.index + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+            match keeper {
+                // A timer was set since the runtime worked out how long
+                // this worker may sleep.
+                true if sidecar.timer_moved.swap(false, Ordering::SeqCst) => {}
+                true => self.wait(timeouts.driving),
+                false => self.wait(timeouts.waiting),
+            }
+            if keeper {
+                // In this order: a timer set in between finds either the
+                // flag down, to raise it, or this worker to wake.
+                sidecar.timer_moved.store(false, Ordering::SeqCst);
+                sidecar.timekeeper.store(0, Ordering::SeqCst);
+            }
+            shared.sleep.store(AWAKE, Ordering::SeqCst);
+            self.turn();
+        } else {
+            // Told to wake up before it slept.
+            shared.sleep.store(AWAKE, Ordering::SeqCst);
+        }
+    }
+
+    /// Submits what is queued and sleeps until the ring has a completion,
+    /// for at most `limit`.
+    fn wait(&self, limit: Option<Duration>) {
+        self.kick_disk();
+        let ring = self.ring.borrow();
+        let result = match limit {
+            None => ring.submit_and_wait(1),
+            Some(limit) => {
+                let limit = types::Timespec::new()
+                    .sec(limit.as_secs())
+                    .nsec(limit.subsec_nanos());
+                let args = types::SubmitArgs::new().timespec(&limit);
+                ring.submitter().submit_with_args(1, &args)
+            }
+        };
+        match result.map_err(|error| (error.raw_os_error(), error)) {
+            Ok(_) => {}
+            // Out of time, interrupted, or out of completion-queue space,
+            // which the reaping that follows makes.
+            Err((Some(libc::ETIME | libc::EINTR | libc::EBUSY | libc::EAGAIN), _)) => {}
+            // As in `enter`, there is no safe way to carry on.
+            Err((_, error)) => panic!("io_uring_enter failed: {error}"),
         }
     }
 
@@ -913,7 +1365,7 @@ impl Reactor {
                         io::ErrorKind::ResourceBusy | io::ErrorKind::WouldBlock
                     ) =>
                 {
-                    self.notify_driver();
+                    self.revisit.set(true);
                     return;
                 }
                 // Anything else means the ring itself is unusable. In-flight
@@ -924,41 +1376,77 @@ impl Reactor {
         }
     }
 
-    fn reap(&self) {
+    /// Takes the completions off the rings and acts on them. Returns whether
+    /// any of them was for a future or for a file the runtime watches.
+    fn reap(&self) -> bool {
         let mut wakers = self.wakers.take();
         let mut released = self.released.take();
         let mut deferred = self.deferred.take();
+        let mut completions = self.completions.take();
 
+        let before = deferred.len();
         deferred.retain(|&(token, result, flags)| {
             !self.resolve(token, result, flags, &mut wakers, &mut released)
         });
+        let mut delivered = deferred.len() < before;
+
         for ring in std::iter::once(&self.ring).chain(&self.disk) {
-            for cqe in ring.borrow_mut().completion() {
-                let (token, result, flags) = (cqe.user_data(), cqe.result(), cqe.flags());
-                if token != DETACHED
-                    && !self.resolve(token, result, flags, &mut wakers, &mut released)
-                {
-                    deferred.push((token, result, flags));
+            let mut ring = ring.borrow_mut();
+            completions.extend(
+                ring.completion()
+                    .map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags())),
+            );
+        }
+        for (token, result, flags) in completions.drain(..) {
+            match token {
+                DETACHED => {}
+                WAKE => self.listen_for_wake(),
+                DISK if cqueue::more(flags) => {}
+                DISK => self.listen_for_disk(),
+                _ if token & KIND == WATCH => {
+                    self.watched(token, result, flags);
+                    delivered = true;
+                }
+                _ => {
+                    debug_assert_eq!(token & KIND, OPERATION);
+                    if !self.resolve(token, result, flags, &mut wakers, &mut released) {
+                        deferred.push((token, result, flags));
+                    }
+                    delivered = true;
                 }
             }
         }
         // A future only keeps its waker locked for a moment: come back soon.
         if !deferred.is_empty() {
-            self.notify_driver();
+            self.revisit.set(true);
         }
         self.deferred.replace(deferred);
-        self.deliver(wakers, released);
+        self.completions.replace(completions);
+        self.wakers.replace(wakers);
+        self.released.replace(released);
+        self.deliver();
+        delivered
     }
 }
 
-impl Drop for Reactor {
+impl Drop for Worker {
     fn drop(&mut self) {
         let unsent = {
             let mut pool = self.shared().pool();
             pool.closed = true;
             std::mem::take(&mut pool.queue)
         };
+        // Nothing reports on the files any more. Whoever waits on one gets
+        // an error instead of waiting forever.
+        for remote in &unsent {
+            if let Remote::Watch { readiness, .. } = remote {
+                readiness.shutdown();
+            }
+        }
         drop(unsent);
+        for (_, watch) in &self.watches.get_mut().entries {
+            watch.iter().for_each(|watch| watch.readiness.shutdown());
+        }
         // Closing the ring does not wait for in-flight operations to stop,
         // so the kernel may write into their buffers after this point. They
         // are leaked rather than freed.
@@ -971,50 +1459,51 @@ fn token_of(generation: u32, index: u32) -> u64 {
 }
 
 fn key_of(token: u64) -> usize {
-    (token & u64::from(u32::MAX)) as usize
+    (token & INDEX) as usize
 }
 
 fn generation_of(token: u64) -> u32 {
     (token >> 32) as u32
 }
 
-/// The ring's descriptor, borrowed for readiness notifications. The ring
-/// itself is owned by the [`Reactor`].
-struct RingFd(RawFd);
-
-impl AsRawFd for RingFd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
+/// The poll events that tell about `interest`. Errors and hang-ups are
+/// reported whatever is asked for.
+fn poll_events(interest: Interest) -> u32 {
+    let mut events = 0;
+    if interest.is_readable() {
+        events |= libc::POLLIN | libc::POLLRDHUP;
     }
+    if interest.is_writable() {
+        events |= libc::POLLOUT;
+    }
+    if interest.is_priority() {
+        events |= libc::POLLPRI;
+    }
+    events as u32
 }
 
-/// Arguments drop in reverse order, so the rings are deregistered from
-/// tokio's driver while they are still open.
-async fn drive(
-    reactor: Rc<Reactor>,
-    readiness: AsyncFd<RingFd>,
-    disk_readiness: Option<AsyncFd<RingFd>>,
-) {
-    while !reactor.stopped.get() {
-        reactor.turn();
-        tokio::select! {
-            biased;
-            () = reactor.shared().wake.notified() => {}
-            () = completions(Some(&readiness)) => {}
-            () = completions(disk_readiness.as_ref()) => {}
-        }
+/// What a poll that reported `events` says its file is ready for. The same
+/// reading as that of tokio's own driver.
+fn ready(events: u32) -> Ready {
+    let has = |event: libc::c_short| events & event as u32 != 0;
+    let mut ready = Ready::EMPTY;
+    if has(libc::POLLIN) {
+        ready |= Ready::READABLE;
     }
-}
-
-/// Waits until `ring` has completions to reap. Never returns for `None`.
-async fn completions(ring: Option<&AsyncFd<RingFd>>) {
-    let Some(ring) = ring else {
-        return std::future::pending().await;
-    };
-    match ring.readable().await {
-        // Cleared before the next turn reaps, so a completion that lands in
-        // between raises readiness again.
-        Ok(mut guard) => guard.clear_ready(),
-        Err(error) => panic!("ring readiness failed: {error}"),
+    if has(libc::POLLOUT) {
+        ready |= Ready::WRITABLE;
     }
+    if has(libc::POLLHUP) || has(libc::POLLIN) && has(libc::POLLRDHUP) {
+        ready |= Ready::READ_CLOSED;
+    }
+    if has(libc::POLLHUP) || has(libc::POLLERR) && (has(libc::POLLOUT) || !has(libc::POLLIN)) {
+        ready |= Ready::WRITE_CLOSED;
+    }
+    if has(libc::POLLERR) {
+        ready |= Ready::ERROR;
+    }
+    if has(libc::POLLPRI) {
+        ready |= Ready::PRIORITY;
+    }
+    ready
 }

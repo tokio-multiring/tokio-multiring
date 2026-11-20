@@ -86,31 +86,26 @@ fn serve(roots: Vec<PathBuf>, setup: Setup) -> Fixture {
     }])
     .unwrap();
 
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder
-        .enable_all()
-        .on_before_steal(tokio_sidecar::before_steal);
-    let runtime = plan.build(&mut builder).unwrap();
-
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let pool = match setup.huge_pages {
         true => BufferPool::new(BUFFER, setup.buffers).unwrap(),
         false => BufferPool::without_huge_pages(BUFFER, setup.buffers).unwrap(),
     };
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_time();
+    let rings = tokio_sidecar::Config {
+        buffers: Some(pool.clone()),
+        disk: setup.polled.then(|| DiskConfig {
+            sq_entries: 32,
+            sq_thread_idle: Duration::from_millis(50),
+            plan: plan.clone(),
+        }),
+        ..tokio_sidecar::Config::default()
+    };
+    let sidecar = Sidecar::install(&mut builder, rings);
+    let runtime = plan.build(&mut builder).unwrap();
     runtime.block_on(async {
-        let sidecar = Sidecar::start(tokio_sidecar::Config {
-            buffers: Some(pool.clone()),
-            disk: setup.polled.then(|| DiskConfig {
-                sq_entries: 32,
-                sq_thread_idle: Duration::from_millis(50),
-                plan,
-            }),
-            ..tokio_sidecar::Config::default()
-        })
-        .await
-        .unwrap();
-
         let mut config = Config::new(&roots);
         config.connections = 4;
         config.head_buffer = 4096;

@@ -1,6 +1,5 @@
 //! Where a runtime's threads run.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
@@ -9,16 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::runtime::{Builder, Runtime, RuntimeFlavor};
-
-thread_local! {
-    static PLACEMENT: RefCell<Option<Placement>> = const { RefCell::new(None) };
-}
-
-/// Where a worker thread was placed.
-struct Placement {
-    plan: Arc<Inner>,
-    domain: usize,
-}
 
 /// CPUs that are meant to work together, typically the ones sharing a
 /// last-level cache.
@@ -202,24 +191,18 @@ impl Plan {
     /// Pins the calling thread, which runs the worker with index `worker`,
     /// to that worker's CPU.
     fn place_current_worker(&self, worker: usize) -> io::Result<()> {
-        let (domain, cpu) = self.inner.seats[worker];
-        pin(&[cpu])?;
-        PLACEMENT.set(Some(Placement {
-            plan: self.inner.clone(),
-            domain,
-        }));
-        Ok(())
+        let (_, cpu) = self.inner.seats[worker];
+        pin(&[cpu])
     }
 
-    /// Index of the domain the current thread was placed in, if it is one
-    /// of this plan's workers.
-    pub(crate) fn domain_of_current_thread(&self) -> Option<usize> {
-        PLACEMENT.with_borrow(|placement| {
-            placement
-                .as_ref()
-                .filter(|placement| Arc::ptr_eq(&placement.plan, &self.inner))
-                .map(|placement| placement.domain)
-        })
+    /// Whether this plan has built a runtime, or is building one.
+    pub(crate) fn has_built(&self) -> bool {
+        self.inner.built.load(Ordering::Relaxed)
+    }
+
+    /// Index of the domain that the worker with index `worker` is in.
+    pub(crate) fn domain_of_worker(&self, worker: usize) -> usize {
+        self.inner.seats[worker].0
     }
 }
 

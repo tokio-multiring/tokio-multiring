@@ -2,9 +2,11 @@
 
 Two crates in one workspace:
 
-- **`tokio-sidecar`** (repo root): one io_uring ring per tokio worker, running
-  beside tokio's own epoll driver. Operation futures are `Send`; buffers and
-  descriptors move into an operation and come back with its result.
+- **`tokio-sidecar`** (repo root): an io_uring reactor that drives a tokio
+  runtime in place of tokio's own I/O driver, one ring per worker. Workers
+  sleep in their rings, tokio's sockets are watched by them, and the crate's
+  own operations go straight onto them. Operation futures are `Send`; buffers
+  and descriptors move into an operation and come back with its result.
 - **`sidecar-s3`** (`s3/`): an S3-style object server built on it, speaking
   HTTP through the server half of ureq-proto. This is the point of the
   project: show what ureq-proto's buffer-ownership API allows when the I/O
@@ -12,7 +14,8 @@ Two crates in one workspace:
   disks.
 
 The repository is local only: no remote, nothing published. Work in small,
-focused commits on `main`.
+focused commits. The branch `io-driver` holds the move from a sidecar beside
+tokio's driver to being the driver; `main` is the state before it.
 
 ## Build and test
 
@@ -29,7 +32,7 @@ RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --offline --workspace 
   sandbox. Fetching a new dependency needs one `cargo fetch` without it.
 - `--cfg tokio_unstable` comes from `.cargo/config.toml`. rustdoc needs it in
   `RUSTDOCFLAGS` as shown.
-- All of the above are clean at HEAD: 118 tests across eleven test binaries.
+- All of the above are clean at HEAD: 129 tests across twelve test binaries.
 - Concurrency bugs here have shown up at rates near 1 in 100. Before calling
   such a change verified, loop the affected test binaries (they are in
   `target/{debug,release}/deps/`) at least 30 times in both profiles. A new
@@ -42,13 +45,14 @@ RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --offline --workspace 
 
 | Crate | Source | Why |
 |---|---|---|
-| tokio | `github.com/lthiery/tokio`, branch `local-worker-v3-full`, rev `0faaf109` | worker-local tasks (`spawn_worker_local`, `run_on_each_worker`) and `Builder::on_before_steal` |
+| tokio | path `../tokio-uring-wl/tokio`, branch `byo-io-driver` (local, not pushed) | the reactor seam (`runtime::reactor::Reactor`, `Builder::io_reactor`), worker-local tasks (`spawn_worker_local`, `run_on_each_worker`) and `Builder::on_before_steal` |
+| mio | path `../mio-shared-registration`, branch `shared-registration-v3`, as a `[patch]` | `Registry::register_shared`, which that tokio branch registers sockets through |
 | ureq-proto | `github.com/lthiery/ureq-proto`, branch `combined-0.7.1`, rev `29bb652` | server state machine with HTTP/1.0 framing and strict transfer-encoding (both open upstream as PRs) |
 
 ## Layout
 
 ```
-src/reactor.rs   Sidecar, per-worker Reactor, the turn loop, disk rings
+src/reactor.rs   Sidecar and its `Reactor` impl for tokio, per-worker `Worker`, the turn loop, sleeping, watches, disk rings
 src/landing.rs   arbitration between a future and the reactor (read its module docs first)
 src/op.rs        Operation enum (one variant per kind of I/O), Op future, Completion
 src/ops.rs       the public operations on Sidecar
@@ -72,14 +76,28 @@ s3/examples/load.rs      HTTP load generator
 
 **Sidecar**
 
-- It is a sidecar, not a replacement for tokio's I/O driver. Tokio watches
-  each ring's descriptor through `AsyncFd`.
-- Rings are flushed from `Builder::on_before_steal`. A worker-local driver
-  task remains as the wake target for a parked worker and for work handed in
-  from other threads. `on_thread_park` was measured and is slower.
-- Rings are `SINGLE_ISSUER | COOP_TASKRUN | TASKRUN_FLAG`. `DEFER_TASKRUN`
-  does not raise readiness on the ring descriptor, so a parked worker never
-  wakes (checked on 7.0.0-38 and -43).
+- The sidecar is the runtime's I/O reactor (Louis, 2026-11-20): it
+  implements `tokio::runtime::reactor::Reactor`, and `Sidecar::install` puts
+  it on a runtime builder. Tokio's own driver is not polled, so there is no
+  epoll and `tokio::signal` and `tokio::process` panic on such a runtime.
+- One ring per worker, and each worker sleeps in its own
+  (`io_uring_enter` with a wait). Another thread wakes it by writing to the
+  worker's eventfd, which a read on the ring is waiting on. One sleeping
+  worker at a time, the "timekeeper", sleeps only until the next timer.
+- Tokio's sockets are watched by a multishot poll on the ring of the worker
+  that registers them, which with first-use registration is the worker that
+  first uses them. A thread without a ring hands the request to a worker in
+  rotation.
+- Rings are flushed from `Builder::on_before_steal`, when a worker goes to
+  sleep, and when the runtime has a busy worker look at its ring (a park
+  with a zero timeout, every 61 tasks by default).
+- Rings are `SINGLE_ISSUER | COOP_TASKRUN | TASKRUN_FLAG`, created disabled
+  when the runtime is built and enabled by the worker's thread as it
+  starts. `DEFER_TASKRUN` is untried in this shape: it did not work when
+  workers slept in epoll, which they no longer do.
+- A ring belongs to the thread its worker started on, so the runtime must be
+  multi-threaded and must not use `block_in_place`. Both fail with a panic
+  that says so.
 - The reactor alone owns the in-flight slots and writes each result straight
   into the pinned future. Drop versus delivery is decided by one atomic word
   per slot (`landing.rs`). A mutex-shared slab and tokio's oneshot were both
@@ -120,10 +138,15 @@ s3/examples/load.rs      HTTP load generator
 - **Never take a pool buffer while holding one.** Take all you need at once
   with `acquire_many`, or use `try_acquire_many`. Take a scratch buffer
   before a commit lock, not under it. Two deadlocks came from this.
-- **Wakers and buffer drops run foreign code.** Call them with no `RefCell`
-  borrow or lock held (see `Reactor::deliver`).
-- **Sockets must be in blocking mode.** io_uring returns `EAGAIN` at once on
-  `O_NONBLOCK` descriptors. Sockets from `std` are fine, tokio's are not.
+- **Wakers, buffer drops and readiness reports run foreign code.** Call them
+  with no `RefCell` borrow or lock held (see `Worker::deliver`).
+- **A worker must not sleep on work it has just made.** A turn that
+  delivered a completion has woken a task. `Worker::park` returns then, and
+  when `revisit` is set.
+- **Sockets for the crate's own operations must be in blocking mode.**
+  io_uring returns `EAGAIN` at once on `O_NONBLOCK` descriptors. Sockets from
+  `std` are fine, tokio's are not: those are for tokio's own methods, which
+  work on this runtime too.
 - **A direct read must not ask for much more than the file holds.** The
   kernel zeroes the rest of the request first. Pass a `limit`.
 - **Zero-copy with registered buffers only on ordinary pages.** On huge pages
@@ -225,9 +248,12 @@ Suggested order: directory sync and timeouts, then listing, then
 - The arbiter in `landing.rs` has race tests and a ThreadSanitizer pass (with
   `race:tokio::runtime::io::` suppressed, those reports are tokio's), but no
   loom model.
-- A worker that never empties its run queue never reaches the before-steal
-  hook. A full submission queue and any completion still flush, so the
-  exposed case is narrow, but it is not closed.
+- Nothing has been measured on the `io-driver` branch yet beyond the echo
+  grid: the reference numbers above are from `main`.
+- `DEFER_TASKRUN`, and whether the timekeeper scheme costs anything under a
+  timer-heavy load, are untried.
+- Work handed to a busy worker by another thread (a cancel, a socket
+  dropped elsewhere) waits for that worker's next look at its ring.
 - Uploads got about 4% slower over loopback with write-behind. Writes that
   extend a file are punted to kernel worker threads; preallocating parts when
   the length is known is untried.

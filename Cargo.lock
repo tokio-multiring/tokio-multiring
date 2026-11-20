@@ -73,9 +73,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "mio"
-version = "1.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20521a903f02b0a573cd6840e9d0a5a0cc043d361fe924092cd70f8556cc9c4a"
+version = "1.2.4"
 dependencies = [
  "libc",
  "wasi",
@@ -142,8 +140,8 @@ dependencies = [
 [[package]]
 name = "tokio"
 version = "1.54.1"
-source = "git+https://github.com/lthiery/tokio?rev=0faaf1094b2ca4f27fc0a7a82de184f16ab707a6#0faaf1094b2ca4f27fc0a7a82de184f16ab707a6"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",

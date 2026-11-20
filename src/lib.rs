@@ -1,12 +1,11 @@
-//! Per-worker io_uring reactors that run beside tokio's own I/O driver.
+//! An io_uring reactor that drives a tokio runtime, with one ring per
+//! worker thread.
 //!
-//! Tokio keeps its epoll driver. Each worker thread of a multi-threaded
-//! runtime additionally owns an io_uring instance, driven by a worker-local
-//! task that tokio wakes through the ring's file descriptor, and flushed by
-//! [`before_steal`] whenever the worker runs out of local work. Nothing in
-//! tokio's I/O path is replaced: sockets, timers and everything else built on
-//! the stock driver keep working unchanged, and io_uring is used only for the
-//! operations submitted through a [`Sidecar`].
+//! The runtime's own I/O driver is not used. A worker with nothing to run
+//! sleeps in its ring, the sockets and other I/O resources of tokio are
+//! watched by the rings, and the operations of a [`Sidecar`] go straight
+//! onto the ring of the worker that starts them. [`before_steal`] flushes a
+//! worker's ring whenever it runs out of local work. Timers stay with tokio.
 //!
 //! A [`Plan`] pins every thread of the runtime to a CPU as it starts. With
 //! [`Config::disk`], each worker also gets a polled ring for `O_DIRECT` file
@@ -21,18 +20,14 @@
 //!
 //! ```
 //! # fn main() -> std::io::Result<()> {
-//! let runtime = tokio::runtime::Builder::new_multi_thread()
-//!     .enable_all()
-//!     .on_before_steal(tokio_sidecar::before_steal)
-//!     .build()?;
-//! runtime.block_on(async {
-//!     let sidecar = tokio_sidecar::Sidecar::start(Default::default()).await?;
-//!     tokio::spawn(async move { sidecar.nop().await }).await?
-//! })
+//! let mut builder = tokio::runtime::Builder::new_multi_thread();
+//! let sidecar = tokio_sidecar::Sidecar::install(&mut builder, Default::default());
+//! let runtime = builder.build()?;
+//! runtime.block_on(async { tokio::spawn(async move { sidecar.nop().await }).await? })
 //! # }
 //! ```
 //!
-//! Requires the `local-worker-v3-full` tokio fork and `--cfg tokio_unstable`.
+//! Requires the `byo-io-driver` tokio fork and `--cfg tokio_unstable`.
 
 mod buffers;
 mod landing;

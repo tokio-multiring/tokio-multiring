@@ -128,12 +128,6 @@ fn run(options: Options) -> std::io::Result<()> {
     let count = options.domains.unwrap_or(domains.len()).min(domains.len());
     let plan = Plan::new(domains[..count].to_vec())?;
 
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder
-        .enable_all()
-        .on_before_steal(tokio_sidecar::before_steal);
-    let runtime = plan.build(&mut builder)?;
-
     let listener = TcpListener::bind(&options.listen)?;
     let address = listener.local_addr()?;
     let buffers = match options.small_pages {
@@ -143,18 +137,21 @@ fn run(options: Options) -> std::io::Result<()> {
     let workers = plan.worker_count();
     let domains = plan.domains().len();
 
-    runtime.block_on(async {
-        let sidecar = Sidecar::start(tokio_sidecar::Config {
-            buffers: Some(buffers),
-            disk: options.polled.then(|| DiskConfig {
-                sq_entries: 256,
-                sq_thread_idle: Duration::from_millis(100),
-                plan,
-            }),
-            ..tokio_sidecar::Config::default()
-        })
-        .await?;
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_time();
+    let rings = tokio_sidecar::Config {
+        buffers: Some(buffers),
+        disk: options.polled.then(|| DiskConfig {
+            sq_entries: 256,
+            sq_thread_idle: Duration::from_millis(100),
+            plan: plan.clone(),
+        }),
+        ..tokio_sidecar::Config::default()
+    };
+    let sidecar = Sidecar::install(&mut builder, rings);
+    let runtime = plan.build(&mut builder)?;
 
+    runtime.block_on(async {
         let mut config = Config::new(&options.roots);
         config.connections = options.connections;
         if let Some(unit) = options.stripe_unit {

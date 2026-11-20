@@ -78,12 +78,6 @@ fn main() {
     let plan = Plan::new(available[..domains].to_vec()).unwrap();
     let workers = plan.worker_count();
 
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder
-        .enable_all()
-        .on_before_steal(tokio_sidecar::before_steal);
-    let runtime = plan.build(&mut builder).unwrap();
-
     let file = std::fs::File::options()
         .read(true)
         .write(mode == "fill")
@@ -92,31 +86,36 @@ fn main() {
         .unwrap();
     let fd = Arc::new(OwnedFd::from(file));
 
-    if mode == "fill" {
-        runtime.block_on(fill(plan, fd, span));
-        return;
-    }
     let polled = match mode.as_str() {
-        "polled" => true,
+        "polled" | "fill" => true,
         "interrupt" => false,
         other => panic!("MODE is `polled`, `interrupt` or `fill`, not `{other}`"),
     };
-
     let tasks = workers * depth;
-    let pool = BufferPool::new(block, tasks).unwrap();
-    let (latencies, cpu) = runtime.block_on(async {
-        let sidecar = Sidecar::start(Config {
-            buffers: Some(pool.clone()),
-            disk: polled.then(|| DiskConfig {
-                sq_entries: 256,
-                sq_thread_idle: Duration::from_millis(100),
-                plan,
-            }),
-            ..Config::default()
-        })
-        .await
-        .unwrap();
+    let pool = match mode.as_str() {
+        "fill" => BufferPool::new(FILL_PIECE, FILL_WRITERS).unwrap(),
+        _ => BufferPool::new(block, tasks).unwrap(),
+    };
 
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_time();
+    let config = Config {
+        buffers: Some(pool.clone()),
+        disk: polled.then(|| DiskConfig {
+            sq_entries: 256,
+            sq_thread_idle: Duration::from_millis(100),
+            plan: plan.clone(),
+        }),
+        ..Config::default()
+    };
+    let sidecar = Sidecar::install(&mut builder, config);
+    let runtime = plan.build(&mut builder).unwrap();
+
+    if mode == "fill" {
+        runtime.block_on(fill(sidecar, pool, fd, span));
+        return;
+    }
+    let (latencies, cpu) = runtime.block_on(async {
         let begin = Instant::now() + Duration::from_secs(1);
         let end = begin + Duration::from_secs(seconds);
         let blocks = span / block as u64;
@@ -188,23 +187,15 @@ fn main() {
     );
 }
 
-/// Writes the whole span, in 1 MiB pieces.
-async fn fill(plan: Plan, fd: Arc<OwnedFd>, span: u64) {
-    const PIECE: usize = 1 << 20;
-    const WRITERS: u64 = 16;
+/// What `fill` writes at a time.
+const FILL_PIECE: usize = 1 << 20;
+/// How many tasks `fill` writes with, each holding one buffer of `pool`.
+const FILL_WRITERS: usize = 16;
 
-    let pool = BufferPool::new(PIECE, WRITERS as usize).unwrap();
-    let sidecar = Sidecar::start(Config {
-        buffers: Some(pool.clone()),
-        disk: Some(DiskConfig {
-            sq_entries: 64,
-            sq_thread_idle: Duration::from_millis(100),
-            plan,
-        }),
-        ..Config::default()
-    })
-    .await
-    .unwrap();
+/// Writes the whole span, in 1 MiB pieces.
+async fn fill(sidecar: Sidecar, pool: BufferPool, fd: Arc<OwnedFd>, span: u64) {
+    const PIECE: usize = FILL_PIECE;
+    const WRITERS: u64 = FILL_WRITERS as u64;
 
     let started = Instant::now();
     let pieces = span / PIECE as u64;

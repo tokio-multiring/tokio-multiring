@@ -21,14 +21,11 @@ fn dropped_open_closes_the_file() {
     let dir = Arc::new(OwnedFd::from(std::fs::File::open(&path).unwrap()));
     let file = CString::new("file").unwrap();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .on_before_steal(tokio_sidecar::before_steal)
-        .build()
-        .unwrap();
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(2).enable_time();
+    let sidecar = Sidecar::install(&mut builder, Config::default());
+    let runtime = builder.build().unwrap();
     runtime.block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
         // On a worker, so that the open is with the kernel as soon as it has
         // been polled.
         tokio::spawn(async move {

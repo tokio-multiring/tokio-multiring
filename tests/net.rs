@@ -5,13 +5,12 @@ use std::os::fd::{AsFd, AsRawFd};
 
 use tokio_sidecar::{BufferPool, Config, Segment, Sidecar, TcpListener, TcpStream};
 
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .on_before_steal(tokio_sidecar::before_steal)
-        .build()
-        .unwrap()
+/// A runtime of four workers that a sidecar drives, and the sidecar.
+fn runtime(config: Config) -> (tokio::runtime::Runtime, Sidecar) {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(4).enable_time();
+    let sidecar = Sidecar::install(&mut builder, config);
+    (builder.build().unwrap(), sidecar)
 }
 
 fn loopback() -> SocketAddr {
@@ -27,8 +26,8 @@ fn is_nonblocking(socket: &impl AsFd) -> bool {
 
 #[test]
 fn a_stream_echoes_what_its_listener_accepted() {
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let pool = BufferPool::new(4096, 1).unwrap();
         let listener = TcpListener::bind(&sidecar, loopback()).unwrap();
         let address = listener.local_addr().unwrap();
@@ -64,8 +63,8 @@ fn a_stream_echoes_what_its_listener_accepted() {
 
 #[test]
 fn clones_of_a_stream_send_and_receive_at_once() {
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let pool = BufferPool::new(4096, 2).unwrap();
         let listener = TcpListener::bind(&sidecar, loopback()).unwrap();
         let mut theirs = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -103,8 +102,8 @@ fn listeners_sharing_a_port_all_take_connections() {
     const LISTENERS: usize = 4;
     const CONNECTIONS: usize = 64;
 
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let first = TcpListener::bind_reuse_port(&sidecar, loopback()).unwrap();
         let address = first.local_addr().unwrap();
         let mut listeners = vec![first];
@@ -146,8 +145,8 @@ fn listeners_sharing_a_port_all_take_connections() {
 
 #[test]
 fn a_port_in_use_is_refused_without_reuse_port() {
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let first = TcpListener::bind(&sidecar, loopback()).unwrap();
         let address = first.local_addr().unwrap();
 
@@ -160,8 +159,8 @@ fn a_port_in_use_is_refused_without_reuse_port() {
 
 #[test]
 fn sockets_from_elsewhere_are_put_in_blocking_mode() {
-    runtime().block_on(async {
-        let sidecar = Sidecar::start(Config::default()).await.unwrap();
+    let (runtime, sidecar) = runtime(Config::default());
+    runtime.block_on(async {
         let pool = BufferPool::new(4096, 1).unwrap();
 
         let listener = std::net::TcpListener::bind(loopback()).unwrap();

@@ -48,24 +48,20 @@ fn a_domain_shares_one_pinned_kernel_thread() {
     let plan = Plan::new(domains).unwrap();
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder
-        .enable_all()
-        .on_before_steal(tokio_sidecar::before_steal);
-    let runtime = plan.build(&mut builder).unwrap();
+    let config = Config {
+        buffers: Some(BufferPool::new(4096, 1).unwrap()),
+        disk: Some(DiskConfig {
+            sq_entries: 8,
+            sq_thread_idle: Duration::from_millis(10),
+            plan: plan.clone(),
+        }),
+        ..Config::default()
+    };
+    let sidecar = Sidecar::install(&mut builder, config);
     assert!(sq_thread_cpus().is_empty());
 
+    let runtime = plan.build(&mut builder).unwrap();
     runtime.block_on(async {
-        let sidecar = Sidecar::start(Config {
-            buffers: Some(BufferPool::new(4096, 1).unwrap()),
-            disk: Some(DiskConfig {
-                sq_entries: 8,
-                sq_thread_idle: Duration::from_millis(10),
-                plan,
-            }),
-            ..Config::default()
-        })
-        .await
-        .unwrap();
         assert_eq!(sq_thread_cpus(), expected);
         sidecar.nop().await.unwrap();
     });
