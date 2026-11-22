@@ -65,11 +65,21 @@ impl Harness {
     }
 }
 
+fn read_some(stream: &mut TcpStream, buf: &mut [u8]) -> usize {
+    loop {
+        match stream.read(buf) {
+            Ok(n) => return n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+}
+
 fn read_response(stream: &mut TcpStream) -> (u16, String, Vec<u8>) {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 4096];
     let head_end = loop {
-        let n = stream.read(&mut chunk).unwrap();
+        let n = read_some(stream, &mut chunk);
         assert!(n > 0, "unexpected EOF waiting for response headers");
         raw.extend_from_slice(&chunk[..n]);
         if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -87,7 +97,7 @@ fn read_response(stream: &mut TcpStream) -> (u16, String, Vec<u8>) {
     {
         let len: usize = line["content-length:".len()..].trim().parse().unwrap();
         while body.len() < len {
-            let n = stream.read(&mut chunk).unwrap();
+            let n = read_some(stream, &mut chunk);
             assert!(n > 0, "unexpected EOF reading content-length body");
             body.extend_from_slice(&chunk[..n]);
         }
@@ -98,7 +108,7 @@ fn read_response(stream: &mut TcpStream) -> (u16, String, Vec<u8>) {
         let mut pos = 0;
         loop {
             while !body[pos..].windows(2).any(|w| w == b"\r\n") {
-                let n = stream.read(&mut chunk).unwrap();
+                let n = read_some(stream, &mut chunk);
                 assert!(n > 0, "unexpected EOF reading chunk size");
                 body.extend_from_slice(&chunk[..n]);
             }
@@ -108,14 +118,14 @@ fn read_response(stream: &mut TcpStream) -> (u16, String, Vec<u8>) {
             pos += crlf + 2;
             if size == 0 {
                 while body.len() < pos + 2 {
-                    let n = stream.read(&mut chunk).unwrap();
+                    let n = read_some(stream, &mut chunk);
                     assert!(n > 0);
                     body.extend_from_slice(&chunk[..n]);
                 }
                 break;
             }
             while body.len() < pos + size + 2 {
-                let n = stream.read(&mut chunk).unwrap();
+                let n = read_some(stream, &mut chunk);
                 assert!(n > 0, "unexpected EOF reading chunk data");
                 body.extend_from_slice(&chunk[..n]);
             }
@@ -127,7 +137,7 @@ fn read_response(stream: &mut TcpStream) -> (u16, String, Vec<u8>) {
         // Read until EOF if HTTP/1.0 close-delimited and status allows a body
         if head.starts_with("HTTP/1.0") && status != 204 && status != 304 {
             loop {
-                let n = stream.read(&mut chunk).unwrap();
+                let n = read_some(stream, &mut chunk);
                 if n == 0 {
                     break;
                 }
@@ -167,7 +177,7 @@ fn routing_extractors_keep_alive_and_head() {
     s.write_all(b"HEAD /hello/louis HTTP/1.1\r\nhost: test\r\n\r\n")
         .unwrap();
     let mut head_only = [0u8; 1024];
-    let n = s.read(&mut head_only).unwrap();
+    let n = read_some(&mut s, &mut head_only);
     let head_str = std::str::from_utf8(&head_only[..n]).unwrap();
     assert!(head_str.starts_with("HTTP/1.1 200 OK"));
     assert!(head_str.to_ascii_lowercase().contains("content-length: 8"));
@@ -254,7 +264,7 @@ fn expect_100_continue_accept_and_reject() {
     )
     .unwrap();
     let mut interim = [0u8; 64];
-    let n = s.read(&mut interim).unwrap();
+    let n = read_some(&mut s, &mut interim);
     assert_eq!(&interim[..n], b"HTTP/1.1 100 Continue\r\n\r\n");
     s.write_all(b"abcde").unwrap();
     let (status, _, body) = read_response(&mut s);
@@ -400,7 +410,7 @@ fn direct_body_and_direct_response_with_middleware() {
     );
     s.write_all(head_req.as_bytes()).unwrap();
     let mut interim = [0u8; 64];
-    let n = s.read(&mut interim).unwrap();
+    let n = read_some(&mut s, &mut interim);
     assert_eq!(&interim[..n], b"HTTP/1.1 100 Continue\r\n\r\n");
     s.write_all(&up).unwrap();
     let (status, head, body) = read_response(&mut s);
@@ -523,7 +533,7 @@ fn idle_timeout_closes_quiet_connection() {
 
     // Sit idle past the timeout -> server closes cleanly (EOF)
     let mut buf = [0u8; 16];
-    let n = s.read(&mut buf).unwrap();
+    let n = read_some(&mut s, &mut buf);
     assert_eq!(n, 0, "idle connection should be closed by server");
 }
 
