@@ -58,8 +58,7 @@ RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --offline --workspace 
 
 | Crate | Source | Why |
 |---|---|---|
-| tokio | path `../tokio-uring-wl/tokio`, branch `byo-io-driver` (rebased onto `local-worker-v3` `c90d985b`; `[patch.crates-io]` unifies axum/hyper-util onto it) | the reactor seam (`runtime::reactor::Reactor`, `Builder::io_reactor`), upgraded worker-local tasks (`spawn_worker_local`, `run_on_each_worker`, `run_on_any_worker`, `worker_local_queue_interval`), and `Builder::on_before_steal` |
-| mio | path `../mio-shared-registration`, branch `shared-registration-v3`, as a `[patch]` | `Registry::register_shared`, which that tokio branch registers sockets through |
+| tokio | path `../tokio-io-reactor-wl/tokio`, branch `io-reactor-wl` (`io-reactor` merged with `local-worker-v3` `ff2d7368`; `[patch.crates-io]` unifies axum/hyper-util onto it) | the reactor seam (`runtime::reactor::Reactor`, `Builder::io_reactor`) and upgraded worker-local tasks (`spawn_worker_local`, `run_on_each_worker`, `run_on_any_worker`, `worker_local_queue_interval`); uses stock crates.io `mio` |
 | ureq-proto | `../ureq-proto-combined`, branch `axum-proto` (for `sidecar-axum`); `s3/` keeps `combined-0.7.1` rev `29bb652` | server state machine with HTTP/1.0 framing, strict transfer-encoding, any-final-status `Send100::reject`, and chunked finish capacity check |
 
 ## Layout
@@ -103,19 +102,20 @@ s3-axum/src/main.rs              CLI launching --runtime sidecar|tokio|tokio-uri
 
 - The sidecar is the runtime's I/O reactor (Louis, 2026-11-20): it
   implements `tokio::runtime::reactor::Reactor`, and `Sidecar::install` puts
-  it on a runtime builder. Tokio's own driver is not polled, so there is no
-  epoll and `tokio::signal` and `tokio::process` panic on such a runtime.
+  it on a runtime builder. Tokio's own mio/epoll driver is not constructed, so
+  there is no epoll and `tokio::signal` and `tokio::process` panic on such a
+  runtime.
 - One ring per worker, and each worker sleeps in its own
   (`io_uring_enter` with a wait). Another thread wakes it by writing to the
   worker's eventfd, which a read on the ring is waiting on. One sleeping
   worker at a time, the "timekeeper", sleeps only until the next timer.
 - Tokio's sockets are watched by a multishot poll on the ring of the worker
-  that registers them, which with first-use registration is the worker that
-  first uses them. A thread without a ring hands the request to a worker in
-  rotation.
-- Rings are flushed from `Builder::on_before_steal`, when a worker goes to
-  sleep, and when the runtime has a busy worker look at its ring (a park
-  with a zero timeout, every 61 tasks by default). A busy worker submits at
+  that registers them. A thread without a ring hands the request to a worker
+  in rotation.
+- Rings are flushed from `Reactor::before_steal` (leaving
+  `Builder::on_before_steal` free for callers), when a worker goes to sleep,
+  and when the runtime has a busy worker look at its ring (`ParkMode::Poll`,
+  every 61 tasks by default). A busy worker submits at
   every look but takes completions in only at every fourth
   (`LOOKS_PER_REAP`): handing it more tasks at every look keeps its queue
   from ever emptying, and tokio then starves its shared queue. That cost a
@@ -131,8 +131,9 @@ s3-axum/src/main.rs              CLI launching --runtime sidecar|tokio|tokio-uri
   busy worker sees its completions only when it goes to sleep, and the 99th
   percentile goes from 1 ms to 15 to 35 ms.
 - A ring belongs to the thread its worker started on, so the runtime must be
-  multi-threaded and must not use `block_in_place`. Both fail with a panic
-  that says so.
+  multi-threaded and must not use `block_in_place` (enforced via
+  `Reactor::allow_block_in_place() -> false`). Both fail with a panic that
+  says so.
 - The reactor alone owns the in-flight slots and writes each result straight
   into the pinned future. Drop versus delivery is decided by one atomic word
   per slot (`landing.rs`). A mutex-shared slab and tokio's oneshot were both
