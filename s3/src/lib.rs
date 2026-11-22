@@ -171,8 +171,12 @@ impl Server {
     pub fn listen(&self, listener: TcpListener) {
         let listener = Arc::new(OwnedFd::from(listener));
         let inner = self.inner.clone();
-        tokio::task::run_on_each_worker(move |_| {
-            tokio::spawn(accept(inner, listener));
+        tokio::task::run_on_each_worker(|_| {
+            let inner = inner.clone();
+            let listener = listener.clone();
+            move || {
+                tokio::spawn(accept(inner, listener));
+            }
         });
     }
 }

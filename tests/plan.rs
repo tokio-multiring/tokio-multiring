@@ -70,7 +70,11 @@ fn every_worker_gets_a_cpu_of_its_own() {
         .collect();
     runtime.block_on(async {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::task::run_on_each_worker(move |_| tx.send(affinity()).unwrap());
+        tokio::task::run_on_each_worker(|_| {
+            let tx = tx.clone();
+            move || tx.send(affinity()).unwrap()
+        });
+        drop(tx);
 
         let mut pinned = BTreeSet::new();
         while let Some(worker) = rx.recv().await {

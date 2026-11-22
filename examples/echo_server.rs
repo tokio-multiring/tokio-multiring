@@ -154,21 +154,28 @@ fn main() -> std::io::Result<()> {
         if per_worker {
             // Bound here once so that an address that cannot be had is an
             // error from `main`, and kept as the first worker's listener.
-            let first = Arc::new(TcpListener::bind_reuse_port(&sidecar, address)?);
-            tokio::task::run_on_each_worker(move |worker| {
+            let mut first = Some(Arc::new(TcpListener::bind_reuse_port(&sidecar, address)?));
+            tokio::task::run_on_each_worker(|worker| {
                 let listener = match worker {
-                    0 => first.clone(),
+                    0 => first.take().expect("worker 0 runs once"),
                     _ => Arc::new(
                         TcpListener::bind_reuse_port(&sidecar, address)
                             .expect("the address was bound a moment ago"),
                     ),
                 };
-                tokio::task::spawn_worker_local(accept(listener, pool.clone(), mode));
+                let pool = pool.clone();
+                move || {
+                    tokio::task::spawn_worker_local(accept(listener, pool, mode));
+                }
             });
         } else {
             let listener = Arc::new(TcpListener::bind(&sidecar, address)?);
-            tokio::task::run_on_each_worker(move |_| {
-                tokio::spawn(accept(listener.clone(), pool.clone(), mode));
+            tokio::task::run_on_each_worker(|_| {
+                let listener = listener.clone();
+                let pool = pool.clone();
+                move || {
+                    tokio::spawn(accept(listener, pool, mode));
+                }
             });
         }
         std::future::pending().await

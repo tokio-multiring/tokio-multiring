@@ -172,13 +172,14 @@ impl Plan {
         // way, and whichever thread gets to a worker's task first runs it.
         // So each worker is given its CPU by a task that runs on it.
         let (placed, results) = std::sync::mpsc::channel();
-        {
-            let _context = runtime.enter();
+        runtime.run_on_each_worker(|worker| {
             let plan = self.clone();
-            tokio::task::run_on_each_worker(move |worker| {
+            let placed = placed.clone();
+            move || {
                 let _ = placed.send(plan.place_current_worker(worker));
-            });
-        }
+            }
+        });
+        drop(placed);
         for _ in 0..self.worker_count() {
             let result = results
                 .recv()
