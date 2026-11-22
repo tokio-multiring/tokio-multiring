@@ -1074,12 +1074,23 @@ impl SidecarStore {
             Some(len) => (geometry.parts(len), len.div_ceil(round_len as u64).max(1)),
             None => (geometry.drives(), u64::MAX),
         };
-        let mut free = self.acquire_window(parts, rounds).await;
+        // Acquire the first round + one wire-encoded FixedBuf atomically so
+        // concurrent uploads can never deadlock on pool exhaustion.
+        let mut initial = self.buffers.acquire_many(parts + 1).await;
+        let mut encoded = initial.pop().expect("requested parts + 1");
+        let mut free = vec![initial];
+        let wanted = rounds.min(self.window as u64) as usize;
+        let reserve = self.buffers.count() / 2;
+        while free.len() < wanted && self.buffers.available() >= reserve + parts {
+            match self.buffers.try_acquire_many(parts) {
+                Some(bufs) => free.push(bufs),
+                None => break,
+            }
+        }
+
         let mut writing = VecDeque::new();
         let mut decoder = AwsChunkedDecoder::new(spec);
-        let mut encoded = vec![0u8; 64 * 1024];
         let mut enc_start = 0usize;
-        let mut enc_end = 0usize;
 
         loop {
             let mut bufs = match free.pop() {
@@ -1095,20 +1106,45 @@ impl SidecarStore {
             let mut filled = 0usize;
 
             while filled < round_len && !decoder.is_done() {
-                if enc_start == enc_end {
+                if enc_start == encoded.len() {
+                    encoded.clear();
                     enc_start = 0;
-                    enc_end = direct.read_into(&mut encoded).await.map_err(|e| match e {
-                        BodyError::Io(err) => StoreError::Io(err),
-                        BodyError::Malformed(_) => StoreError::Api(ApiError::BAD_REQUEST),
-                    })?;
-                    if enc_end == 0 {
+                    let n = match direct.remaining() {
+                        Some(0) => 0,
+                        Some(left) if !direct.has_pending() => {
+                            let want = usize::try_from(left)
+                                .unwrap_or(usize::MAX)
+                                .min(encoded.capacity());
+                            let seg = [tokio_sidecar::Segment {
+                                buf: 0,
+                                start: 0,
+                                len: want,
+                            }];
+                            let (received, mut ret) =
+                                direct.recv_vectored(vec![encoded], &seg).await;
+                            encoded = ret.pop().expect("passed 1 buffer");
+                            received.map_err(|e| match e {
+                                BodyError::Io(err) => StoreError::Io(err),
+                                BodyError::Malformed(_) => StoreError::Api(ApiError::BAD_REQUEST),
+                            })?
+                        }
+                        _ => direct
+                            .read_into(encoded.spare_capacity_mut())
+                            .await
+                            .map_err(|e| match e {
+                                BodyError::Io(err) => StoreError::Io(err),
+                                BodyError::Malformed(_) => StoreError::Api(ApiError::BAD_REQUEST),
+                            })?,
+                    };
+                    if n == 0 {
                         break;
                     }
+                    encoded.grow(n);
                 }
                 let room = geometry.fill(filled..round_len);
                 let next = room.first().expect("round is not full");
                 let output = &mut bufs[next.buf].spare_capacity_mut()[next.start..][..next.len];
-                let (used, produced) = decoder.decode(&encoded[enc_start..enc_end], output)?;
+                let (used, produced) = decoder.decode(&encoded[enc_start..], output)?;
                 enc_start += used;
                 filled += produced;
             }

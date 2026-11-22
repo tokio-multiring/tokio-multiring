@@ -45,7 +45,7 @@ pub(crate) struct ChunkSigning {
     signing_key: [u8; 32],
     amz_date: String,
     scope: String,
-    prev_signature: String,
+    prev_signature: [u8; 64],
 }
 
 /// Verifies an incoming HTTP request against `auth` using AWS4-HMAC-SHA256 and
@@ -127,13 +127,17 @@ pub(crate) fn verify_request(
             }))
         }
         "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => {
+            let prev_signature: [u8; 64] = expected_sig
+                .as_bytes()
+                .try_into()
+                .expect("SHA-256 hex digest is 64 ASCII bytes");
             Ok(PayloadMode::AwsChunked(AwsChunkedSpec {
                 decoded_len,
                 signing: Some(ChunkSigning {
                     signing_key,
                     amz_date: amz_date.to_owned(),
                     scope,
-                    prev_signature: expected_sig,
+                    prev_signature,
                 }),
             }))
         }
@@ -384,7 +388,7 @@ pub(crate) struct AwsChunkedDecoder {
     signing: Option<ChunkSigning>,
     line_buf: Vec<u8>,
     chunk_hasher: Sha256,
-    expected_chunk_sig: Option<String>,
+    expected_chunk_sig: Option<[u8; 64]>,
     decoded_total: u64,
     expected_decoded_len: Option<u64>,
 }
@@ -428,22 +432,32 @@ impl AwsChunkedDecoder {
         while in_pos < input.len() {
             match self.state {
                 DecodeState::HeaderLine => {
-                    let b = input[in_pos];
-                    in_pos += 1;
-                    self.line_buf.push(b);
-                    if self.line_buf.len() > 256 {
+                    let rest = &input[in_pos..];
+                    let take = match rest.iter().position(|&b| b == b'\n') {
+                        Some(pos) => pos + 1,
+                        None => rest.len(),
+                    };
+                    if self.line_buf.len() + take > 256 {
                         return Err(ApiError::BAD_REQUEST);
                     }
+                    self.line_buf.extend_from_slice(&rest[..take]);
+                    in_pos += take;
                     if self.line_buf.ends_with(b"\r\n") {
                         let line = std::str::from_utf8(&self.line_buf[..self.line_buf.len() - 2])
                             .map_err(|_| ApiError::BAD_REQUEST)?;
                         let (size_hex, ext) = line.split_once(';').unwrap_or((line, ""));
                         let size = usize::from_str_radix(size_hex.trim(), 16)
                             .map_err(|_| ApiError::BAD_REQUEST)?;
-                        let sig = ext
+                        let sig = match ext
                             .split(';')
                             .find_map(|p| p.trim().strip_prefix("chunk-signature="))
-                            .map(str::to_owned);
+                        {
+                            Some(s) => Some(
+                                <[u8; 64]>::try_from(s.as_bytes())
+                                    .map_err(|_| ApiError::SIGNATURE_MISMATCH)?,
+                            ),
+                            None => None,
+                        };
                         if self.signing.is_some() && sig.is_none() {
                             return Err(ApiError::SIGNATURE_MISMATCH);
                         }
@@ -538,13 +552,30 @@ impl AwsChunkedDecoder {
             .expected_chunk_sig
             .take()
             .ok_or(ApiError::SIGNATURE_MISMATCH)?;
-        let chunk_hash = hex::encode(std::mem::take(&mut self.chunk_hasher).finalize());
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
-            signing.amz_date, signing.scope, signing.prev_signature, EMPTY_SHA256, chunk_hash
-        );
-        let expected = hmac_sha256_hex(&signing.signing_key, string_to_sign.as_bytes());
-        if expected.as_bytes().ct_eq(provided.as_bytes()).unwrap_u8() != 1 {
+        let mut chunk_hash = [0u8; 64];
+        hex::encode_to_slice(
+            std::mem::take(&mut self.chunk_hasher).finalize(),
+            &mut chunk_hash,
+        )
+        .expect("SHA-256 digest is 32 bytes");
+
+        let mut mac =
+            HmacSha256::new_from_slice(&signing.signing_key).expect("HMAC accepts any key size");
+        mac.update(b"AWS4-HMAC-SHA256-PAYLOAD\n");
+        mac.update(signing.amz_date.as_bytes());
+        mac.update(b"\n");
+        mac.update(signing.scope.as_bytes());
+        mac.update(b"\n");
+        mac.update(&signing.prev_signature);
+        mac.update(b"\n");
+        mac.update(EMPTY_SHA256.as_bytes());
+        mac.update(b"\n");
+        mac.update(&chunk_hash);
+
+        let mut expected = [0u8; 64];
+        hex::encode_to_slice(mac.finalize().into_bytes(), &mut expected)
+            .expect("HMAC-SHA256 output is 32 bytes");
+        if expected.ct_eq(&provided).unwrap_u8() != 1 {
             return Err(ApiError::SIGNATURE_MISMATCH);
         }
         signing.prev_signature = expected;
