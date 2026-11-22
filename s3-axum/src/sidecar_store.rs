@@ -20,8 +20,10 @@ use tokio_sidecar::{BufferPool, FixedBuf, Reclaim, Sidecar};
 
 use crate::error::{ApiError, StoreError};
 use crate::join::{Started, join_all};
-use crate::name::{Bucket, Object, PART_PREFIX, UPLOAD_PREFIX};
-use crate::stripe::{BLOCK, Geometry, HEADER, Header, Meta, Plan};
+use crate::name::{Bucket, Object, PART_PREFIX, UPLOAD_PREFIX, decode_key};
+use crate::stripe::{
+    BLOCK, Geometry, HEADER, Header, ListPage, ListedBucket, ListedObject, Meta, Plan,
+};
 
 static ZEROS: [u8; BLOCK] = [0; BLOCK];
 const OPEN_ATTEMPTS: usize = 8;
@@ -31,6 +33,7 @@ const ZERO_COPY_MIN: usize = 64 * 1024;
 pub struct SidecarStore {
     sidecar: Sidecar,
     buffers: BufferPool,
+    roots: Vec<PathBuf>,
     drives: Vec<Arc<OwnedFd>>,
     geometry: Geometry,
     window: usize,
@@ -137,6 +140,7 @@ impl SidecarStore {
         Ok(Arc::new(Self {
             sidecar,
             buffers,
+            roots: roots.to_vec(),
             drives,
             geometry,
             window,
@@ -212,6 +216,126 @@ impl SidecarStore {
             }
             other => Ok(other.map(drop)?),
         }
+    }
+
+    pub(crate) async fn list_buckets(&self) -> Result<Vec<ListedBucket>, StoreError> {
+        let root = self.roots[0].clone();
+        let buckets = tokio::task::spawn_blocking(move || -> io::Result<Vec<ListedBucket>> {
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(&root)? {
+                let entry = entry?;
+                let meta = entry.metadata()?;
+                if !meta.is_dir() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if name.starts_with('.') {
+                    continue;
+                }
+                let modified_secs = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs() as i64);
+                out.push(ListedBucket {
+                    name,
+                    modified_secs,
+                });
+            }
+            out.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(out)
+        })
+        .await
+        .map_err(io::Error::other)??;
+        Ok(buckets)
+    }
+
+    pub(crate) async fn list_objects(
+        &self,
+        bucket: &Bucket,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<ListPage, StoreError> {
+        self.head_bucket(bucket).await?;
+        let roots = self.roots.clone();
+        let bucket_name = bucket.as_str().to_owned();
+        let prefix = prefix.to_owned();
+        let start_after = start_after.map(str::to_owned);
+
+        let mut entries =
+            tokio::task::spawn_blocking(move || -> io::Result<Vec<(String, usize, String)>> {
+                let mut found = Vec::new();
+                for (drive_idx, root) in roots.iter().enumerate() {
+                    let dir = root.join(&bucket_name);
+                    let rd = match std::fs::read_dir(&dir) {
+                        Ok(rd) => rd,
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e),
+                    };
+                    for entry in rd {
+                        let entry = entry?;
+                        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+                            continue;
+                        };
+                        let Some(key) = decode_key(&file_name) else {
+                            continue;
+                        };
+                        if !key.starts_with(&prefix) {
+                            continue;
+                        }
+                        if let Some(ref after) = start_after
+                            && key.as_str() <= after.as_str()
+                        {
+                            continue;
+                        }
+                        found.push((key, drive_idx, file_name));
+                    }
+                }
+                found.sort_by(|a, b| a.0.cmp(&b.0));
+                Ok(found)
+            })
+            .await
+            .map_err(io::Error::other)??;
+
+        let is_truncated = entries.len() > max_keys;
+        entries.truncate(max_keys);
+        let next_continuation_token = is_truncated.then(|| entries.last().unwrap().0.clone());
+
+        let mut contents = Vec::with_capacity(entries.len());
+        let mut scratch = self.buffers.acquire().await;
+        for (key, drive_idx, file_name) in entries {
+            let rel = bucket.file(&file_name);
+            let flags = libc::O_RDONLY | libc::O_DIRECT;
+            let file = match self
+                .sidecar
+                .open_at(self.drives[drive_idx].clone(), rel, flags, 0)
+                .await
+            {
+                Ok(f) => Arc::new(f),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let (header, returned) = self.read_header(&file, scratch).await;
+            scratch = returned;
+            if let Ok(header) = header {
+                contents.push(ListedObject {
+                    key,
+                    meta: Meta {
+                        size: header.size,
+                        modified: header.modified,
+                    },
+                });
+            }
+        }
+
+        Ok(ListPage {
+            contents,
+            is_truncated,
+            next_continuation_token,
+        })
     }
 
     async fn missing(&self, object: &Object) -> StoreError {

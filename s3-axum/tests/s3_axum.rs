@@ -58,6 +58,7 @@ impl RunningServer {
                     head_buffer: 4096,
                     zero_copy,
                     worker_local_connections: true,
+                    idle_timeout: None,
                 },
             )
             .unwrap();
@@ -220,13 +221,51 @@ fn run_suite(server: &RunningServer) {
         b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
     );
     assert_eq!(st, 200);
-    let (st, _, body) = send_request(
+    let (st, head, body) = send_request(
         &mut s,
         "GET /photos/chunked HTTP/1.1\r\nhost: test\r\n\r\n",
         b"",
     );
     assert_eq!(st, 200);
+    assert!(head.to_ascii_lowercase().contains("x-amz-request-id:"));
+    assert!(head.to_ascii_lowercase().contains("x-s3-runtime:"));
     assert_eq!(body, b"hello world");
+
+    // ListBuckets (GET /)
+    let (st, _, body) = send_request(&mut s, "GET / HTTP/1.1\r\nhost: test\r\n\r\n", b"");
+    assert_eq!(st, 200);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(xml.contains("<Name>photos</Name>"), "unexpected xml: {xml}");
+
+    // ListObjectsV2 with prefix and pagination
+    let (st, _, body) = send_request(
+        &mut s,
+        "GET /photos?list-type=2&prefix=obj-&max-keys=3 HTTP/1.1\r\nhost: test\r\n\r\n",
+        b"",
+    );
+    assert_eq!(st, 200);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(xml.contains("<KeyCount>3</KeyCount>"), "{xml}");
+    assert!(xml.contains("<IsTruncated>true</IsTruncated>"), "{xml}");
+    assert!(xml.contains("<Key>obj-0</Key>"), "{xml}");
+    assert!(xml.contains("<Key>obj-2</Key>"), "{xml}");
+    assert!(
+        xml.contains("<NextContinuationToken>obj-2</NextContinuationToken>"),
+        "{xml}"
+    );
+    assert!(!xml.contains(".part-"), "internal parts leaked: {xml}");
+
+    let (st, _, body) = send_request(
+        &mut s,
+        "GET /photos?list-type=2&prefix=obj-&max-keys=10&continuation-token=obj-2 HTTP/1.1\r\nhost: test\r\n\r\n",
+        b"",
+    );
+    assert_eq!(st, 200);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(xml.contains("<KeyCount>3</KeyCount>"), "{xml}");
+    assert!(xml.contains("<IsTruncated>false</IsTruncated>"), "{xml}");
+    assert!(xml.contains("<Key>obj-3</Key>"), "{xml}");
+    assert!(xml.contains("<Key>obj-5</Key>"), "{xml}");
 
     // Delete objects and bucket
     for name in [

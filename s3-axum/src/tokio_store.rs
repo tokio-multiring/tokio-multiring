@@ -28,8 +28,8 @@ use tokio::task::{JoinHandle, spawn_blocking};
 
 use crate::error::{ApiError, StoreError};
 use crate::join::join_all;
-use crate::name::{Bucket, Object, PART_PREFIX, UPLOAD_PREFIX};
-use crate::stripe::{BLOCK, Geometry, HEADER, Header, Meta};
+use crate::name::{Bucket, Object, PART_PREFIX, UPLOAD_PREFIX, decode_key};
+use crate::stripe::{BLOCK, Geometry, HEADER, Header, ListPage, ListedBucket, ListedObject, Meta};
 
 const OPEN_ATTEMPTS: usize = 8;
 const COMMIT_LOCKS: usize = 256;
@@ -254,6 +254,123 @@ impl TokioStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Err(ApiError::NO_SUCH_BUCKET.into()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    pub(crate) async fn list_buckets(&self) -> Result<Vec<ListedBucket>, StoreError> {
+        let root = self.roots[0].clone();
+        let buckets = spawn_blocking(move || -> io::Result<Vec<ListedBucket>> {
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(&root)? {
+                let entry = entry?;
+                let meta = entry.metadata()?;
+                if !meta.is_dir() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if name.starts_with('.') {
+                    continue;
+                }
+                let modified_secs = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs() as i64);
+                out.push(ListedBucket {
+                    name,
+                    modified_secs,
+                });
+            }
+            out.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(out)
+        })
+        .await
+        .map_err(io::Error::other)??;
+        Ok(buckets)
+    }
+
+    pub(crate) async fn list_objects(
+        &self,
+        bucket: &Bucket,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<ListPage, StoreError> {
+        self.head_bucket(bucket).await?;
+        let roots = self.roots.clone();
+        let bucket_name = bucket.as_str().to_owned();
+        let prefix = prefix.to_owned();
+        let start_after = start_after.map(str::to_owned);
+        let geometry = self.geometry;
+        let flags = self.open_read_flags();
+
+        let page = spawn_blocking(move || -> io::Result<ListPage> {
+            let mut entries = Vec::new();
+            for root in &roots {
+                let dir = root.join(&bucket_name);
+                let rd = match std::fs::read_dir(&dir) {
+                    Ok(rd) => rd,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+                for entry in rd {
+                    let entry = entry?;
+                    let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    let Some(key) = decode_key(&file_name) else {
+                        continue;
+                    };
+                    if !key.starts_with(&prefix) {
+                        continue;
+                    }
+                    if let Some(ref after) = start_after
+                        && key.as_str() <= after.as_str()
+                    {
+                        continue;
+                    }
+                    entries.push((key, entry.path()));
+                }
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let is_truncated = entries.len() > max_keys;
+            entries.truncate(max_keys);
+            let next_continuation_token = is_truncated.then(|| entries.last().unwrap().0.clone());
+
+            let mut contents = Vec::with_capacity(entries.len());
+            for (key, path) in entries {
+                let file = match OpenOptions::new()
+                    .read(true)
+                    .custom_flags(flags)
+                    .open(&path)
+                {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+                if let Ok(header) = Self::read_header_sync(&file, &geometry) {
+                    contents.push(ListedObject {
+                        key,
+                        meta: Meta {
+                            size: header.size,
+                            modified: header.modified,
+                        },
+                    });
+                }
+            }
+
+            Ok(ListPage {
+                contents,
+                is_truncated,
+                next_continuation_token,
+            })
+        })
+        .await
+        .map_err(io::Error::other)??;
+
+        Ok(page)
     }
 
     fn read_header_sync(file: &File, geometry: &Geometry) -> io::Result<Header> {

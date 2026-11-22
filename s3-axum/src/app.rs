@@ -1,17 +1,21 @@
-//! Unified Axum S3 router and handlers that run identically on BOTH:
+//! Unified Axum S3 router, handlers, and middleware running identically on BOTH:
 //! - `tokio-sidecar` + `sidecar-axum` (`io_uring` + `ureq-proto`, zero-copy &
 //!   registered buffers via `DirectBody` / `DirectResponse`), and
 //! - standard Tokio + `axum::serve` (Hyper HTTP/1.1 + `spawn_blocking` I/O).
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, Request, State};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, put};
-use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
+use axum::routing::{get, put};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
+use serde::Deserialize;
 use sidecar_axum::{DirectBody, DirectResponse};
 
 use crate::date;
@@ -21,6 +25,10 @@ use crate::sidecar_store::{SidecarStore, SidecarStored};
 use crate::stripe::Meta;
 use crate::tokio_store::{TokioStore, TokioStored};
 
+static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static X_AMZ_REQUEST_ID: HeaderName = HeaderName::from_static("x-amz-request-id");
+static X_S3_RUNTIME: HeaderName = HeaderName::from_static("x-s3-runtime");
+
 /// Storage backend powering the unified Axum S3 app.
 #[derive(Clone)]
 pub enum Backend {
@@ -28,16 +36,38 @@ pub enum Backend {
     Tokio(Arc<TokioStore>),
 }
 
-/// Builds the unified Axum S3 [`Router`] for either runtime.
+impl Backend {
+    fn runtime_header(&self) -> HeaderValue {
+        match self {
+            Backend::Sidecar(_) => HeaderValue::from_static("sidecar"),
+            Backend::Tokio(_) => HeaderValue::from_static("tokio"),
+        }
+    }
+}
+
+/// Optional router-level middleware settings.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AppOptions {
+    /// Log method, path, status, and latency for every request via Axum middleware.
+    pub trace: bool,
+}
+
+/// Builds the unified Axum S3 [`Router`] for either runtime with default options.
 pub fn router(backend: Backend) -> Router {
-    Router::new()
-        .route("/", any(service_root))
+    router_with_options(backend, AppOptions::default())
+}
+
+/// Builds the unified Axum S3 [`Router`] with explicit [`AppOptions`].
+pub fn router_with_options(backend: Backend, options: AppOptions) -> Router {
+    let runtime_header = backend.runtime_header();
+    let app = Router::new()
+        .route("/", get(list_buckets).fallback(method_not_allowed))
         .route(
             "/{bucket}",
             put(create_bucket)
                 .head(head_bucket)
                 .delete(delete_bucket)
-                .get(not_implemented)
+                .get(list_objects)
                 .fallback(method_not_allowed),
         )
         .route(
@@ -45,7 +75,7 @@ pub fn router(backend: Backend) -> Router {
             put(create_bucket)
                 .head(head_bucket)
                 .delete(delete_bucket)
-                .get(not_implemented)
+                .get(list_objects)
                 .fallback(method_not_allowed),
         )
         .route(
@@ -57,7 +87,48 @@ pub fn router(backend: Backend) -> Router {
                 .fallback(method_not_allowed),
         )
         .fallback(fallback_handler)
-        .with_state(backend)
+        .with_state(backend);
+
+    // Real Axum middleware layer that runs on every request on BOTH runtimes
+    // while leaving `DirectBody` and `DirectResponse` intact on sidecar-axum.
+    app.layer(middleware::from_fn(move |req: Request, next: Next| {
+        let runtime_header = runtime_header.clone();
+        let trace = options.trace;
+        async move {
+            let started = trace.then(Instant::now);
+            let method = trace.then(|| req.method().clone());
+            let path = trace.then(|| req.uri().path().to_owned());
+
+            let mut resp = next.run(req).await;
+
+            let id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+            let hex = format_hex_u64(id);
+            let req_id =
+                HeaderValue::from_bytes(&hex).expect("hex ASCII bytes are a valid header value");
+            resp.headers_mut().insert(X_AMZ_REQUEST_ID.clone(), req_id);
+            resp.headers_mut()
+                .insert(X_S3_RUNTIME.clone(), runtime_header);
+
+            if let (Some(started), Some(method), Some(path)) = (started, method, path) {
+                log::info!(
+                    "{method} {path} -> {} ({:.2?})",
+                    resp.status().as_u16(),
+                    started.elapsed()
+                );
+            }
+            resp
+        }
+    }))
+}
+
+fn format_hex_u64(mut value: u64) -> [u8; 16] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [b'0'; 16];
+    for slot in out.iter_mut().rev() {
+        *slot = HEX[(value & 0xf) as usize];
+        value >>= 4;
+    }
+    out
 }
 
 fn check_no_query(uri: &Uri) -> Result<(), ApiError> {
@@ -67,12 +138,16 @@ fn check_no_query(uri: &Uri) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn parse_bucket(uri: &Uri) -> Result<Bucket, ApiError> {
-    check_no_query(uri)?;
+fn parse_bucket_path(uri: &Uri) -> Result<Bucket, ApiError> {
     match Target::parse(uri.path())? {
         Target::Bucket(b) => Ok(b),
         Target::Service | Target::Object(_) => Err(ApiError::INVALID_BUCKET_NAME),
     }
+}
+
+fn parse_bucket(uri: &Uri) -> Result<Bucket, ApiError> {
+    check_no_query(uri)?;
+    parse_bucket_path(uri)
 }
 
 fn parse_object(uri: &Uri) -> Result<Object, ApiError> {
@@ -88,6 +163,32 @@ fn entity_tag(stat: &Meta) -> String {
     format!("\"{seconds:x}{nanoseconds:08x}-{:x}\"", stat.size)
 }
 
+fn xml_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn xml_response(xml: String) -> Response {
+    let bytes = xml.into_bytes();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::DATE, date::now())
+        .header(header::CONTENT_TYPE, "application/xml")
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .body(Body::from(bytes))
+        .expect("valid XML response")
+}
+
 fn empty_response(status: StatusCode) -> Response {
     let mut builder = Response::builder()
         .status(status)
@@ -96,21 +197,6 @@ fn empty_response(status: StatusCode) -> Response {
         builder = builder.header(header::CONTENT_LENGTH, 0);
     }
     builder.body(Body::empty()).expect("valid empty response")
-}
-
-async fn service_root(method: Method, uri: Uri) -> ApiError {
-    if check_no_query(&uri).is_err() {
-        return ApiError::NOT_IMPLEMENTED;
-    }
-    if method == Method::GET {
-        ApiError::NOT_IMPLEMENTED
-    } else {
-        ApiError::METHOD_NOT_ALLOWED
-    }
-}
-
-async fn not_implemented() -> ApiError {
-    ApiError::NOT_IMPLEMENTED
 }
 
 async fn method_not_allowed() -> ApiError {
@@ -122,6 +208,96 @@ async fn fallback_handler(uri: Uri) -> ApiError {
         Err(err) => err,
         Ok(_) => ApiError::METHOD_NOT_ALLOWED,
     }
+}
+
+/// `GET /` — S3 `ListBuckets`.
+async fn list_buckets(State(backend): State<Backend>, uri: Uri) -> Result<Response, StoreError> {
+    check_no_query(&uri)?;
+    let buckets = match &backend {
+        Backend::Sidecar(s) => s.list_buckets().await?,
+        Backend::Tokio(s) => s.list_buckets().await?,
+    };
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Buckets>",
+    );
+    for bucket in buckets {
+        xml.push_str("<Bucket><Name>");
+        xml.push_str(&xml_escape(&bucket.name));
+        xml.push_str("</Name><CreationDate>");
+        xml.push_str(&date::iso8601(bucket.modified_secs));
+        xml.push_str("</CreationDate></Bucket>");
+    }
+    xml.push_str("</Buckets></ListAllMyBucketsResult>");
+    Ok(xml_response(xml))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ListObjectsQuery {
+    #[serde(rename = "list-type")]
+    list_type: Option<String>,
+    prefix: Option<String>,
+    #[serde(rename = "max-keys")]
+    max_keys: Option<usize>,
+    #[serde(rename = "start-after")]
+    start_after: Option<String>,
+    #[serde(rename = "continuation-token")]
+    continuation_token: Option<String>,
+}
+
+/// `GET /{bucket}` — S3 `ListObjectsV2` (and v1 fallback when `list-type` is omitted).
+async fn list_objects(
+    State(backend): State<Backend>,
+    uri: Uri,
+    Query(query): Query<ListObjectsQuery>,
+) -> Result<Response, StoreError> {
+    let bucket = parse_bucket_path(&uri)?;
+    if let Some(ref lt) = query.list_type
+        && lt != "2"
+    {
+        return Err(ApiError::NOT_IMPLEMENTED.into());
+    }
+    let prefix = query.prefix.as_deref().unwrap_or("");
+    let max_keys = query.max_keys.unwrap_or(1000).min(1000);
+    let after = query
+        .continuation_token
+        .as_deref()
+        .or(query.start_after.as_deref());
+
+    let page = match &backend {
+        Backend::Sidecar(s) => s.list_objects(&bucket, prefix, after, max_keys).await?,
+        Backend::Tokio(s) => s.list_objects(&bucket, prefix, after, max_keys).await?,
+    };
+
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>{}</Name><Prefix>{}</Prefix><KeyCount>{}</KeyCount><MaxKeys>{}</MaxKeys>\
+         <IsTruncated>{}</IsTruncated>",
+        xml_escape(bucket.as_str()),
+        xml_escape(prefix),
+        page.contents.len(),
+        max_keys,
+        page.is_truncated,
+    );
+    if let Some(ref token) = page.next_continuation_token {
+        xml.push_str("<NextContinuationToken>");
+        xml.push_str(&xml_escape(token));
+        xml.push_str("</NextContinuationToken>");
+    }
+    for obj in &page.contents {
+        xml.push_str("<Contents><Key>");
+        xml.push_str(&xml_escape(&obj.key));
+        xml.push_str("</Key><LastModified>");
+        xml.push_str(&date::iso8601(obj.meta.modified.0));
+        xml.push_str("</LastModified><ETag>");
+        xml.push_str(&xml_escape(&entity_tag(&obj.meta)));
+        xml.push_str("</ETag><Size>");
+        xml.push_str(&obj.meta.size.to_string());
+        xml.push_str("</Size></Contents>");
+    }
+    xml.push_str("</ListBucketResult>");
+    Ok(xml_response(xml))
 }
 
 async fn create_bucket(State(backend): State<Backend>, uri: Uri) -> Result<Response, StoreError> {

@@ -46,6 +46,7 @@ impl Harness {
                     head_buffer: 4096,
                     zero_copy,
                     worker_local_connections: true,
+                    idle_timeout: None,
                 },
             )
             .unwrap();
@@ -485,4 +486,43 @@ fn unread_body_discard_abandon_and_error_responses() {
     let _ = s3.write_all(big_head.as_bytes());
     let (status, _, _) = read_response(&mut s3);
     assert_eq!(status, 431);
+}
+
+#[test]
+fn idle_timeout_closes_quiet_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut builder = Builder::new_multi_thread();
+    builder.worker_threads(2).enable_time();
+    let sidecar = Sidecar::install(&mut builder, tokio_sidecar::Config::default());
+    let rt = builder.build().unwrap();
+    rt.block_on(async {
+        let router = Router::new().route("/ping", get(|| async { "pong" }));
+        let server = Server::new(
+            sidecar,
+            Config {
+                connections: 8,
+                head_buffer: 4096,
+                zero_copy: ZeroCopy::Never,
+                worker_local_connections: true,
+                idle_timeout: Some(Duration::from_millis(120)),
+            },
+        )
+        .unwrap();
+        server.listen(listener, router);
+    });
+
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    // First request succeeds
+    s.write_all(b"GET /ping HTTP/1.1\r\nhost: test\r\n\r\n")
+        .unwrap();
+    let (status, _, body) = read_response(&mut s);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"pong");
+
+    // Sit idle past the timeout -> server closes cleanly (EOF)
+    let mut buf = [0u8; 16];
+    let n = s.read(&mut buf).unwrap();
+    assert_eq!(n, 0, "idle connection should be closed by server");
 }

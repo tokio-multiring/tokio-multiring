@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use axum::serve::ListenerExt;
-use s3_axum::{Backend, SidecarStore, TokioStore, router};
+use s3_axum::{AppOptions, Backend, SidecarStore, TokioStore, router_with_options};
 use sidecar_axum::{Config as HttpConfig, Server, ZeroCopy};
 use tokio_sidecar::{BufferPool, DiskConfig, Domain, Hyperthreads, Plan, Sidecar};
 
@@ -26,6 +26,8 @@ usage: s3-axum --runtime sidecar|tokio --root DIR [--root DIR ...] [options]
   --workers N           limit total worker threads            [domain size]
   --hyperthreads        use both SMT threads per core
   --steal-connections   spawn connection tasks with tokio::spawn instead of worker-local
+  --idle-timeout SECS   close idle keep-alive connections after SECS (sidecar)
+  --trace               log method, path, status, and latency via Axum middleware
   --polled              opt into IOPOLL+SQPOLL disk rings (off by default)
   --direct              use O_DIRECT in spawn_blocking (tokio runtime only)";
 
@@ -50,6 +52,8 @@ struct Options {
     workers: Option<usize>,
     hyperthreads: Hyperthreads,
     worker_local_connections: bool,
+    idle_timeout: Option<Duration>,
+    trace: bool,
     polled: bool,
     direct: bool,
 }
@@ -71,6 +75,8 @@ impl Options {
             workers: None,
             hyperthreads: Hyperthreads::Skip,
             worker_local_connections: true,
+            idle_timeout: None,
+            trace: false,
             polled: false,
             direct: false,
         };
@@ -114,6 +120,11 @@ impl Options {
                 "--small-pages" => opts.small_pages = true,
                 "--hyperthreads" => opts.hyperthreads = Hyperthreads::Use,
                 "--steal-connections" => opts.worker_local_connections = false,
+                "--idle-timeout" => {
+                    let secs = number(&flag, args.next())?;
+                    opts.idle_timeout = Some(Duration::from_secs(secs as u64));
+                }
+                "--trace" => opts.trace = true,
                 "--polled" => opts.polled = true,
                 "--direct" => opts.direct = true,
                 other => return Err(format!("unknown option `{other}`")),
@@ -204,11 +215,13 @@ fn run(opts: Options) -> std::io::Result<()> {
                     opts.stripe_unit,
                     opts.window,
                 )?;
-                let app = router(Backend::Sidecar(store));
+                let app =
+                    router_with_options(Backend::Sidecar(store), AppOptions { trace: opts.trace });
                 let http_cfg = HttpConfig {
                     connections: opts.connections,
                     zero_copy: opts.zero_copy,
                     worker_local_connections: opts.worker_local_connections,
+                    idle_timeout: opts.idle_timeout,
                     ..HttpConfig::default()
                 };
                 Server::new(sidecar, http_cfg)?.listen(listener, app);
@@ -238,7 +251,8 @@ fn run(opts: Options) -> std::io::Result<()> {
             runtime.block_on(async {
                 let store =
                     TokioStore::open(&opts.roots, opts.stripe_unit, opts.buffer_size, opts.direct)?;
-                let app = router(Backend::Tokio(store));
+                let app =
+                    router_with_options(Backend::Tokio(store), AppOptions { trace: opts.trace });
                 let listener = tokio::net::TcpListener::from_std(listener)?.tap_io(|stream| {
                     let _ = stream.set_nodelay(true);
                 });

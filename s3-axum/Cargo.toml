@@ -8,7 +8,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio"] }
 bytes = "1"
 futures-core = "0.3"
 http = "1"
@@ -16,6 +16,7 @@ http-body = "1"
 http-body-util = "0.1"
 libc = "0.2"
 log = "0.4"
+serde = { version = "1", features = ["derive"] }
 sidecar-axum = { path = "../sidecar-axum" }
 tokio = { path = "../../tokio-uring-wl/tokio", features = ["macros", "net", "rt-multi-thread", "sync", "time", "worker-local"] }
 tokio-sidecar = { path = ".." }

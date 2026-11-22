@@ -58,6 +58,9 @@ pub struct Config {
     /// Whether accepted connection tasks are spawned worker-local (pinned to
     /// the accepting worker's io_uring ring) or regular work-stealing tasks.
     pub worker_local_connections: bool,
+    /// Optional timeout while waiting for the next request head on a keep-alive
+    /// or newly accepted connection.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Default for Config {
@@ -67,6 +70,7 @@ impl Default for Config {
             head_buffer: 16 * 1024,
             zero_copy: ZeroCopy::Remote,
             worker_local_connections: true,
+            idle_timeout: None,
         }
     }
 }
@@ -77,6 +81,7 @@ struct Shared {
     slots: Arc<Semaphore>,
     zero_copy: ZeroCopy,
     worker_local_connections: bool,
+    idle_timeout: Option<Duration>,
 }
 
 /// Serves an Axum `Router` (or any compatible `tower_service::Service`) over a
@@ -101,6 +106,7 @@ impl Server {
                 slots: Arc::new(Semaphore::new(config.connections)),
                 zero_copy: config.zero_copy,
                 worker_local_connections: config.worker_local_connections,
+                idle_timeout: config.idle_timeout,
             }),
         })
     }
@@ -185,8 +191,9 @@ where
             zero_copy,
         );
         let svc = service.clone();
+        let idle_timeout = shared.idle_timeout;
         let fut = async move {
-            serve_connection(conn, svc).await;
+            serve_connection(conn, svc, idle_timeout).await;
             drop(slot);
         };
         if shared.worker_local_connections {
@@ -216,12 +223,12 @@ impl From<ureq_proto::Error> for Fatal {
     }
 }
 
-async fn serve_connection<S>(mut conn: Conn, mut service: S)
+async fn serve_connection<S>(mut conn: Conn, mut service: S, idle_timeout: Option<Duration>)
 where
     S: Service<Request<Body>, Response = Response<Body>, Error = Infallible>,
 {
     loop {
-        match exchange(conn, &mut service).await {
+        match exchange(conn, &mut service, idle_timeout).await {
             Ok(Some(next_conn)) => conn = next_conn,
             Ok(None) => return,
             Err(Fatal::Io(error)) => return log::debug!("connection lost: {error}"),
@@ -272,7 +279,11 @@ async fn discard(conn: &mut Conn, mut body: Reply<RecvBody>) -> Result<Discarded
 
 /// Runs one HTTP/1.1 exchange. Returns `Ok(Some(conn))` when the connection
 /// can be reused for another request, or `Ok(None)` once closed cleanly.
-async fn exchange<S>(mut conn: Conn, service: &mut S) -> Result<Option<Conn>, Fatal>
+async fn exchange<S>(
+    mut conn: Conn,
+    service: &mut S,
+    idle_timeout: Option<Duration>,
+) -> Result<Option<Conn>, Fatal>
 where
     S: Service<Request<Body>, Response = Response<Body>, Error = Infallible>,
 {
@@ -283,18 +294,30 @@ where
                 conn.consume(used);
                 break request;
             }
-            Ok((_, None)) => match conn.fill().await? {
-                Filled::Data => {}
-                Filled::Closed => {
-                    conn.close().await;
-                    return Ok(None);
+            Ok((_, None)) => {
+                let filled = match idle_timeout {
+                    Some(limit) => match tokio::time::timeout(limit, conn.fill()).await {
+                        Ok(res) => res?,
+                        Err(_) => {
+                            conn.close().await;
+                            return Ok(None);
+                        }
+                    },
+                    None => conn.fill().await?,
+                };
+                match filled {
+                    Filled::Data => {}
+                    Filled::Closed => {
+                        conn.close().await;
+                        return Ok(None);
+                    }
+                    Filled::Full => {
+                        refuse(&mut conn, HEAD_TOO_LARGE).await?;
+                        conn.close().await;
+                        return Ok(None);
+                    }
                 }
-                Filled::Full => {
-                    refuse(&mut conn, HEAD_TOO_LARGE).await?;
-                    conn.close().await;
-                    return Ok(None);
-                }
-            },
+            }
             Err(_) => {
                 refuse(&mut conn, BAD_REQUEST).await?;
                 conn.close().await;

@@ -215,3 +215,22 @@ pub(crate) struct Meta {
     pub(crate) size: u64,
     pub(crate) modified: (i64, u32),
 }
+
+#[derive(Debug)]
+pub(crate) struct ListedBucket {
+    pub(crate) name: String,
+    pub(crate) modified_secs: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct ListedObject {
+    pub(crate) key: String,
+    pub(crate) meta: Meta,
+}
+
+#[derive(Debug)]
+pub(crate) struct ListPage {
+    pub(crate) contents: Vec<ListedObject>,
+    pub(crate) is_truncated: bool,
+    pub(crate) next_continuation_token: Option<String>,
+}

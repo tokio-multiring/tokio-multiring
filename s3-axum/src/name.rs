@@ -143,3 +143,13 @@ fn encode_key(key: &[u8]) -> String {
     }
     file
 }
+
+/// Decodes an on-disk object file name back into a UTF-8 S3 key, skipping
+/// internal files starting with `.`.
+pub(crate) fn decode_key(file: &str) -> Option<String> {
+    if file.starts_with('.') {
+        return None;
+    }
+    let decoded = percent_decode(file).ok()?;
+    String::from_utf8(decoded).ok()
+}

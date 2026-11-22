@@ -10,6 +10,6 @@ mod sidecar_store;
 mod stripe;
 mod tokio_store;
 
-pub use app::{Backend, router};
+pub use app::{AppOptions, Backend, router, router_with_options};
 pub use sidecar_store::SidecarStore;
 pub use tokio_store::TokioStore;
