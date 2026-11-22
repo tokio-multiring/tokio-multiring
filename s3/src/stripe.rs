@@ -17,7 +17,7 @@
 
 use std::ops::Range;
 
-use tokio_sidecar::Segment;
+use tokio_multiring::Segment;
 
 /// Offsets and lengths of direct I/O are multiples of this. It is a multiple
 /// of every logical block size in use.
@@ -26,6 +26,7 @@ pub(crate) const BLOCK: usize = 4096;
 /// Space at the start of part 0 that the header takes.
 pub(crate) const HEADER: usize = BLOCK;
 
+/// Preserved from the crate's original name for on-disk compatibility.
 const MAGIC: &[u8; 8] = b"sidecar1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

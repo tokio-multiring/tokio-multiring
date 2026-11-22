@@ -4,32 +4,33 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use axum::serve::ListenerExt;
+use multiring_axum::{Config as HttpConfig, Server, ZeroCopy};
 use s3_axum::{
-    AppOptions, AuthConfig, Backend, SidecarStore, TokioStore, TokioUringStore, router_with_options,
+    AppOptions, AuthConfig, Backend, MultiRingStore, TokioStore, TokioUringStore,
+    router_with_options,
 };
-use sidecar_axum::{Config as HttpConfig, Server, ZeroCopy};
-use tokio_sidecar::{BufferPool, DiskConfig, Domain, Hyperthreads, Plan, Sidecar};
+use tokio_multiring::{BufferPool, DiskConfig, Domain, Hyperthreads, MultiRing, Plan};
 
 const USAGE: &str = "\
-usage: s3-axum --runtime sidecar|tokio|tokio-uring --root DIR [--root DIR ...] [options]
+usage: s3-axum --runtime multiring|tokio|tokio-uring --root DIR [--root DIR ...] [options]
 
-  --runtime MODE        sidecar     (tokio-sidecar io_uring + sidecar-axum/ureq-proto)
+  --runtime MODE        multiring   (tokio-multiring io_uring + multiring-axum/ureq-proto)
                         tokio       (standard Tokio mio/epoll + axum::serve + spawn_blocking)
-                        tokio-uring (mainline Tokio io-uring fs + axum::serve/Hyper) [sidecar]
+                        tokio-uring (mainline Tokio io-uring fs + axum::serve/Hyper) [multiring]
   --root DIR            directory the buckets live in (repeatable for striping)
-  --stripe-unit BYTES   stripe unit size, multiple of 4096    [131072]
-  --window N            read-ahead / write-behind rounds      [4]
-  --listen ADDR         address to listen on                  [127.0.0.1:9000]
-  --connections N       concurrent connections (sidecar)      [1024]
-  --buffers N           registered buffers (sidecar)          [256]
-  --buffer-size BYTES   buffer/chunk size, multiple of unit   [1048576]
-  --zero-copy WHO       never, remote, or always (sidecar)    [remote]
-  --small-pages         ordinary pages for registered buffers (sidecar)
-  --domains N           use only the first N cache domains    [all]
-  --workers N           limit total worker threads            [domain size]
+  --stripe-unit BYTES   stripe unit size, multiple of 4096      [131072]
+  --window N            read-ahead / write-behind rounds        [4]
+  --listen ADDR         address to listen on                    [127.0.0.1:9000]
+  --connections N       concurrent connections (multiring)      [1024]
+  --buffers N           registered buffers (multiring)          [256]
+  --buffer-size BYTES   buffer/chunk size, multiple of unit     [1048576]
+  --zero-copy WHO       never, remote, or always (multiring)    [remote]
+  --small-pages         ordinary pages for registered buffers (multiring)
+  --domains N           use only the first N cache domains      [all]
+  --workers N           limit total worker threads              [domain size]
   --hyperthreads        use both SMT threads per core
   --steal-connections   spawn connection tasks with tokio::spawn instead of worker-local
-  --idle-timeout SECS   close idle keep-alive connections after SECS (sidecar)
+  --idle-timeout SECS   close idle keep-alive connections after SECS (multiring)
   --trace               log method, path, status, and latency via Axum middleware
   --access-key KEY      enable AWS SigV4 auth (must pair with --secret-key)
   --secret-key SECRET   AWS SigV4 secret key (must pair with --access-key)
@@ -38,7 +39,7 @@ usage: s3-axum --runtime sidecar|tokio|tokio-uring --root DIR [--root DIR ...] [
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RuntimeKind {
-    Sidecar,
+    MultiRing,
     Tokio,
     TokioUring,
 }
@@ -69,7 +70,7 @@ struct Options {
 impl Options {
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut opts = Options {
-            runtime: RuntimeKind::Sidecar,
+            runtime: RuntimeKind::MultiRing,
             roots: Vec::new(),
             stripe_unit: 128 * 1024,
             window: 4,
@@ -102,12 +103,12 @@ impl Options {
             match flag.as_str() {
                 "--runtime" => {
                     opts.runtime = match args.next().as_deref() {
-                        Some("sidecar") => RuntimeKind::Sidecar,
+                        Some("multiring") => RuntimeKind::MultiRing,
                         Some("tokio") => RuntimeKind::Tokio,
                         Some("tokio-uring") => RuntimeKind::TokioUring,
                         _ => {
                             return Err(
-                                "--runtime must be `sidecar`, `tokio`, or `tokio-uring`".into()
+                                "--runtime must be `multiring`, `tokio`, or `tokio-uring`".into()
                             );
                         }
                     };
@@ -225,33 +226,33 @@ fn run(opts: Options) -> std::io::Result<()> {
     };
 
     match opts.runtime {
-        RuntimeKind::Sidecar => {
+        RuntimeKind::MultiRing => {
             let buffers = match opts.small_pages {
                 true => BufferPool::without_huge_pages(opts.buffer_size, opts.buffers)?,
                 false => BufferPool::new(opts.buffer_size, opts.buffers)?,
             };
             let mut builder = tokio::runtime::Builder::new_multi_thread();
             builder.enable_time();
-            let rings = tokio_sidecar::Config {
+            let rings = tokio_multiring::Config {
                 buffers: Some(buffers),
                 disk: opts.polled.then(|| DiskConfig {
                     sq_entries: 256,
                     sq_thread_idle: Duration::from_millis(100),
                     plan: plan.clone(),
                 }),
-                ..tokio_sidecar::Config::default()
+                ..tokio_multiring::Config::default()
             };
-            let sidecar = Sidecar::install(&mut builder, rings);
+            let multiring = MultiRing::install(&mut builder, rings);
             let runtime = plan.build(&mut builder)?;
 
             runtime.block_on(async {
-                let store = SidecarStore::open(
-                    sidecar.clone(),
+                let store = MultiRingStore::open(
+                    multiring.clone(),
                     &opts.roots,
                     opts.stripe_unit,
                     opts.window,
                 )?;
-                let app = router_with_options(Backend::Sidecar(store), app_opts);
+                let app = router_with_options(Backend::MultiRing(store), app_opts);
                 let http_cfg = HttpConfig {
                     connections: opts.connections,
                     zero_copy: opts.zero_copy,
@@ -259,9 +260,9 @@ fn run(opts: Options) -> std::io::Result<()> {
                     idle_timeout: opts.idle_timeout,
                     ..HttpConfig::default()
                 };
-                Server::new(sidecar, http_cfg)?.listen(listener, app);
+                Server::new(multiring, http_cfg)?.listen(listener, app);
                 log::info!(
-                    "s3-axum [sidecar] serving {roots_display:?} on http://{address} \
+                    "s3-axum [multiring] serving {roots_display:?} on http://{address} \
                      ({workers} workers in {domains} domains, {}, {})",
                     if opts.polled {
                         "polled disk I/O"

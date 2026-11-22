@@ -1,12 +1,12 @@
 //! Ablation benchmark isolating:
 //!   1. `hyper`          — standard Tokio (mio) + `axum::serve` (Hyper)
 //!   2. `tokio-ureq`     — standard Tokio (mio) + `ureq-proto` over `tokio::net::TcpStream` (just drop Hyper!)
-//!   3. `sidecar-body`   — `tokio-sidecar` (`io_uring`) + `sidecar-axum` (`ureq-proto`), standard `axum::body::Body`
-//!   4. `sidecar-direct` — `tokio-sidecar` (`io_uring`) + `sidecar-axum` (`ureq-proto`), `DirectWrite` + `send_zc`
+//!   3. `multiring-body`   — `tokio-multiring` (`io_uring`) + `multiring-axum` (`ureq-proto`), standard `axum::body::Body`
+//!   4. `multiring-direct` — `tokio-multiring` (`io_uring`) + `multiring-axum` (`ureq-proto`), `DirectWrite` + `send_zc`
 //!
 //! Supports both pure in-memory HTTP (`--mode mem`, serving static 4K/16M
 //! responses compatible with `s3/examples/load`) and real S3 (`--mode s3`,
-//! using `TokioStore` across modes 1-3 and `SidecarStore` for mode 4).
+//! using `TokioStore` across modes 1-3 and `MultiRingStore` for mode 4).
 
 use std::convert::Infallible;
 use std::future::{Future, poll_fn};
@@ -25,11 +25,13 @@ use bytes::{Bytes, BytesMut};
 use http::{HeaderValue, Request, StatusCode, header};
 use http_body::Body as HttpBody;
 use http_body_util::BodyExt;
-use s3_axum::{Backend, SidecarStore, TokioStore, router as s3_router};
-use sidecar_axum::{BodySink, Config as HttpConfig, DirectResponse, DirectWrite, Server, ZeroCopy};
+use multiring_axum::{
+    BodySink, Config as HttpConfig, DirectResponse, DirectWrite, Server, ZeroCopy,
+};
+use s3_axum::{Backend, MultiRingStore, TokioStore, router as s3_router};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_sidecar::{BufferPool, Domain, FixedBuf, Hyperthreads, Plan, Segment, Sidecar};
+use tokio_multiring::{BufferPool, Domain, FixedBuf, Hyperthreads, MultiRing, Plan, Segment};
 use tower_service::Service;
 use ureq_proto::server::{RecvRequestResult, Reply, SendResponseResult};
 
@@ -294,7 +296,7 @@ impl DirectWrite for MemDirectWriter {
                 let mut buf = match free.pop() {
                     Some(b) => b,
                     None => {
-                        let r: tokio_sidecar::Reclaim = unack.pop_front().unwrap();
+                        let r: tokio_multiring::Reclaim = unack.pop_front().unwrap();
                         r.await.bufs.into_iter().next().unwrap()
                     }
                 };
@@ -417,13 +419,13 @@ fn main() -> io::Result<()> {
                 }
             })
         }
-        "sidecar-body" | "sidecar-direct" => {
+        "multiring-body" | "multiring-direct" => {
             let pool = BufferPool::new(1 << 20, 256)?;
             let mut builder = tokio::runtime::Builder::new_multi_thread();
             builder.enable_time();
-            let sidecar = Sidecar::install(
+            let multiring = MultiRing::install(
                 &mut builder,
-                tokio_sidecar::Config {
+                tokio_multiring::Config {
                     buffers: Some(pool.clone()),
                     ..Default::default()
                 },
@@ -435,18 +437,18 @@ fn main() -> io::Result<()> {
                         payload: Bytes::from(vec![0x42u8; mem_size]),
                         pool: Some(pool),
                         size: mem_size,
-                        use_direct: stack == "sidecar-direct",
+                        use_direct: stack == "multiring-direct",
                     })
-                } else if stack == "sidecar-body" {
-                    // `sidecar-axum` (ureq-proto + io_uring sockets) driving `TokioStore`!
+                } else if stack == "multiring-body" {
+                    // `multiring-axum` (ureq-proto + io_uring sockets) driving `TokioStore`!
                     let store = TokioStore::open(&roots, 128 * 1024, 1 << 20, direct_disk)?;
                     s3_router(Backend::Tokio(store))
                 } else {
-                    let store = SidecarStore::open(sidecar.clone(), &roots, 128 * 1024, 4)?;
-                    s3_router(Backend::Sidecar(store))
+                    let store = MultiRingStore::open(multiring.clone(), &roots, 128 * 1024, 4)?;
+                    s3_router(Backend::MultiRing(store))
                 };
                 Server::new(
-                    sidecar,
+                    multiring,
                     HttpConfig {
                         connections: 1024,
                         zero_copy: ZeroCopy::Remote,

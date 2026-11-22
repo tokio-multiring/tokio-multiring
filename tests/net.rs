@@ -3,14 +3,14 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd};
 
-use tokio_sidecar::{BufferPool, Config, Segment, Sidecar, TcpListener, TcpStream};
+use tokio_multiring::{BufferPool, Config, MultiRing, Segment, TcpListener, TcpStream};
 
-/// A runtime of four workers that a sidecar drives, and the sidecar.
-fn runtime(config: Config) -> (tokio::runtime::Runtime, Sidecar) {
+/// A runtime of four workers that a multiring drives, and the multiring.
+fn runtime(config: Config) -> (tokio::runtime::Runtime, MultiRing) {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(4).enable_time();
-    let sidecar = Sidecar::install(&mut builder, config);
-    (builder.build().unwrap(), sidecar)
+    let multiring = MultiRing::install(&mut builder, config);
+    (builder.build().unwrap(), multiring)
 }
 
 fn loopback() -> SocketAddr {
@@ -26,10 +26,10 @@ fn is_nonblocking(socket: &impl AsFd) -> bool {
 
 #[test]
 fn a_stream_echoes_what_its_listener_accepted() {
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         let pool = BufferPool::new(4096, 1).unwrap();
-        let listener = TcpListener::bind(&sidecar, loopback()).unwrap();
+        let listener = TcpListener::bind(&multiring, loopback()).unwrap();
         let address = listener.local_addr().unwrap();
 
         let client = std::thread::spawn(move || {
@@ -63,10 +63,10 @@ fn a_stream_echoes_what_its_listener_accepted() {
 
 #[test]
 fn clones_of_a_stream_send_and_receive_at_once() {
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         let pool = BufferPool::new(4096, 2).unwrap();
-        let listener = TcpListener::bind(&sidecar, loopback()).unwrap();
+        let listener = TcpListener::bind(&multiring, loopback()).unwrap();
         let mut theirs = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let ours = listener.accept().await.unwrap();
 
@@ -102,13 +102,13 @@ fn listeners_sharing_a_port_all_take_connections() {
     const LISTENERS: usize = 4;
     const CONNECTIONS: usize = 64;
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
-        let first = TcpListener::bind_reuse_port(&sidecar, loopback()).unwrap();
+        let first = TcpListener::bind_reuse_port(&multiring, loopback()).unwrap();
         let address = first.local_addr().unwrap();
         let mut listeners = vec![first];
         for _ in 1..LISTENERS {
-            listeners.push(TcpListener::bind_reuse_port(&sidecar, address).unwrap());
+            listeners.push(TcpListener::bind_reuse_port(&multiring, address).unwrap());
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -145,32 +145,32 @@ fn listeners_sharing_a_port_all_take_connections() {
 
 #[test]
 fn a_port_in_use_is_refused_without_reuse_port() {
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
-        let first = TcpListener::bind(&sidecar, loopback()).unwrap();
+        let first = TcpListener::bind(&multiring, loopback()).unwrap();
         let address = first.local_addr().unwrap();
 
-        let second = TcpListener::bind(&sidecar, address).map(drop);
+        let second = TcpListener::bind(&multiring, address).map(drop);
         assert_eq!(second.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
-        let shared = TcpListener::bind_reuse_port(&sidecar, address).map(drop);
+        let shared = TcpListener::bind_reuse_port(&multiring, address).map(drop);
         assert_eq!(shared.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
     });
 }
 
 #[test]
 fn sockets_from_elsewhere_are_put_in_blocking_mode() {
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         let pool = BufferPool::new(4096, 1).unwrap();
 
         let listener = std::net::TcpListener::bind(loopback()).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let listener = TcpListener::from_std(&sidecar, listener).unwrap();
+        let listener = TcpListener::from_std(&multiring, listener).unwrap();
         assert!(!is_nonblocking(&listener));
 
         let connecting = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         connecting.set_nonblocking(true).unwrap();
-        let ours = TcpStream::from_std(&sidecar, connecting).unwrap();
+        let ours = TcpStream::from_std(&multiring, connecting).unwrap();
         assert!(!is_nonblocking(&ours));
 
         // On a non-blocking socket this receive would fail with `WouldBlock`

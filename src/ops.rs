@@ -11,9 +11,9 @@ use tokio::sync::oneshot;
 
 use crate::buffers::FixedBuf;
 use crate::op::{Message, Op, Operation};
-use crate::reactor::Sidecar;
+use crate::reactor::MultiRing;
 
-impl Sidecar {
+impl MultiRing {
     /// Completes after one round trip through a ring, doing no I/O.
     pub fn nop(&self) -> impl Future<Output = io::Result<()>> + Send + use<> {
         let op = Op::new(self, Operation::Nop);
@@ -226,10 +226,10 @@ impl Sidecar {
     fn check_fixed(&self, buf: &FixedBuf, polled: bool) -> io::Result<()> {
         let invalid = |message| Err(io::Error::new(io::ErrorKind::InvalidInput, message));
         if !self.buffers().is_some_and(|pool| pool.owns(buf)) {
-            return invalid("buffer is not from the pool registered on this sidecar");
+            return invalid("buffer is not from the pool registered on this multiring");
         }
         if polled && !self.has_disk_rings() {
-            return invalid("this sidecar has no disk rings");
+            return invalid("this multiring has no disk rings");
         }
         Ok(())
     }
@@ -237,7 +237,7 @@ impl Sidecar {
     /// Waits for a connection on `listener` and returns it, in blocking
     /// mode and with close-on-exec set.
     ///
-    /// Sockets used with a sidecar must be in blocking mode: on a
+    /// Sockets used with a multiring must be in blocking mode: on a
     /// non-blocking one the kernel reports `WouldBlock` where it would
     /// otherwise wait. Listeners and streams from `std` are fine as they
     /// come; ones from tokio are not.
@@ -401,7 +401,7 @@ impl Sidecar {
     /// up. Whether the copy is in fact avoided is up to the route the data
     /// takes. Loopback, for one, copies. See [`Reclaimed::copied`].
     ///
-    /// Buffers from this sidecar's pool are sent as registered buffers if
+    /// Buffers from this multiring's pool are sent as registered buffers if
     /// the pool is on ordinary pages. For a pool on huge pages, and for
     /// other buffers, the kernel pins the pages of each send as it goes.
     /// The reason is a mistake in Linux, in every release up to 7.0 at
@@ -676,7 +676,7 @@ pub struct Reclaimed {
 }
 
 /// Notification that the kernel has finished with the memory of a
-/// [`Sidecar::send_bytes_zc`] operation and its [`Bytes`] handle has been
+/// [`MultiRing::send_bytes_zc`] operation and its [`Bytes`] handle has been
 /// dropped.
 ///
 /// Resolves to `true` if the kernel reported falling back to copying, or
@@ -711,7 +711,7 @@ pub struct Segment {
     pub len: usize,
 }
 
-/// What [`Sidecar::stat`] reports about a file.
+/// What [`MultiRing::stat`] reports about a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileStat {
     /// Size in bytes.

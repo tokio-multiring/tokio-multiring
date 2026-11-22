@@ -1,9 +1,9 @@
 [package]
-name = "tokio-sidecar"
+name = "tokio-multiring"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Per-worker io_uring reactors running beside tokio's own I/O driver"
+description = "Per-worker io_uring reactor driving a multi-threaded tokio runtime"
 license = "MIT"
 publish = false
 
@@ -22,7 +22,7 @@ libc = "0.2"
 tokio = { path = "../tokio-io-reactor-wl/tokio", features = ["macros", "net", "io-util", "time"] }
 
 [workspace]
-members = ["s3", "sidecar-axum", "s3-axum"]
+members = ["s3", "multiring-axum", "s3-axum"]
 
 [patch.crates-io]
 tokio = { path = "../tokio-io-reactor-wl/tokio" }

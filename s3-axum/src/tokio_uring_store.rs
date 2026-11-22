@@ -1,5 +1,5 @@
 //! Mainline Tokio `io-uring` (`tokio::fs` with `feature = "io-uring"`) storage
-//! backend using the exact same on-disk striped format as [`crate::sidecar_store`]
+//! backend using the exact same on-disk striped format as [`crate::multiring_store`]
 //! and [`crate::tokio_store`].
 //!
 //! Exercises every `io_uring`-backed `tokio::fs` operation available in mainline
@@ -21,8 +21,8 @@ use axum::body::Body;
 use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
 use http_body_util::BodyExt;
+use multiring_axum::DirectBody;
 use sha2::{Digest, Sha256};
-use sidecar_axum::DirectBody;
 use subtle::ConstantTimeEq;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -37,7 +37,7 @@ use crate::stripe::{Geometry, HEADER, Header, ListPage, ListedBucket, ListedObje
 
 const OPEN_ATTEMPTS: usize = 8;
 const COMMIT_LOCKS: usize = 256;
-/// Same 16 KiB upfront inline read as `SidecarStore` so small GETs get an
+/// Same 16 KiB upfront inline read as `MultiRingStore` so small GETs get an
 /// apples-to-apples single-read path on mainline Tokio's `io-uring` too.
 const INLINE_READ: usize = 16 * 1024;
 
@@ -738,7 +738,7 @@ impl TokioUringStore {
             }
             Err(e) => return Err(e.into()),
         }
-        // Durability parity with SidecarStore / TokioStore.
+        // Durability parity with MultiRingStore / TokioStore.
         let f = OpenOptions::new().write(true).open(&staged_path).await?;
         if let Err(e) = f.sync_data().await {
             let _ = fs::remove_file(&staged_path).await;

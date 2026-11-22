@@ -2,7 +2,7 @@
 //!
 //! These run against a file in the build directory by default. That checks
 //! the plumbing, but on most file systems the device then completes by
-//! interrupt. To exercise real polling, point `SIDECAR_SCRATCH_DEVICE` at a
+//! interrupt. To exercise real polling, point `MULTIRING_SCRATCH_DEVICE` at a
 //! block device that has poll queues and whose contents may be overwritten.
 
 use std::os::fd::OwnedFd;
@@ -10,7 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio_sidecar::{BufferPool, Config, DiskConfig, Domain, Hyperthreads, Plan, Sidecar};
+use tokio_multiring::{BufferPool, Config, DiskConfig, Domain, Hyperthreads, MultiRing, Plan};
 
 const WORKERS: usize = 4;
 const BUF_SIZE: usize = 64 * 1024;
@@ -33,15 +33,15 @@ fn plan(domain_sizes: &[usize]) -> Plan {
     Plan::new(domains).unwrap()
 }
 
-/// A runtime that `plan` builds and a sidecar with these settings drives.
-fn build(plan: &Plan, config: Config) -> std::io::Result<(tokio::runtime::Runtime, Sidecar)> {
+/// A runtime that `plan` builds and a multiring with these settings drives.
+fn build(plan: &Plan, config: Config) -> std::io::Result<(tokio::runtime::Runtime, MultiRing)> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_time();
-    let sidecar = Sidecar::install(&mut builder, config);
-    Ok((plan.build(&mut builder)?, sidecar))
+    let multiring = MultiRing::install(&mut builder, config);
+    Ok((plan.build(&mut builder)?, multiring))
 }
 
-/// Settings for a sidecar with `pool` registered and with disk rings for a
+/// Settings for a multiring with `pool` registered and with disk rings for a
 /// runtime that `plan` builds.
 fn config(pool: &BufferPool, plan: &Plan) -> Config {
     Config {
@@ -56,12 +56,12 @@ fn config(pool: &BufferPool, plan: &Plan) -> Config {
 }
 
 /// A runtime with disk rings, its workers in the domains of `plan`.
-fn runtime(pool: &BufferPool, plan: Plan) -> (tokio::runtime::Runtime, Sidecar) {
+fn runtime(pool: &BufferPool, plan: Plan) -> (tokio::runtime::Runtime, MultiRing) {
     build(&plan, config(pool, &plan)).unwrap()
 }
 
 /// A runtime with disk rings, its workers in one domain.
-fn setup(pool: &BufferPool) -> (tokio::runtime::Runtime, Sidecar) {
+fn setup(pool: &BufferPool) -> (tokio::runtime::Runtime, MultiRing) {
     runtime(pool, plan(&[WORKERS]))
 }
 
@@ -70,7 +70,7 @@ fn setup(pool: &BufferPool) -> (tokio::runtime::Runtime, Sidecar) {
 fn scratch(slot: u64) -> (Arc<OwnedFd>, u64) {
     let mut options = std::fs::File::options();
     options.read(true).write(true).custom_flags(libc::O_DIRECT);
-    let file = match std::env::var_os("SIDECAR_SCRATCH_DEVICE") {
+    let file = match std::env::var_os("MULTIRING_SCRATCH_DEVICE") {
         Some(device) => options.open(device).unwrap(),
         None => {
             let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -84,7 +84,7 @@ fn scratch(slot: u64) -> (Arc<OwnedFd>, u64) {
 }
 
 async fn round_trip(
-    sidecar: &Sidecar,
+    multiring: &MultiRing,
     pool: &BufferPool,
     fd: &Arc<OwnedFd>,
     offset: u64,
@@ -92,11 +92,11 @@ async fn round_trip(
 ) {
     let mut buf = pool.acquire().await;
     buf.extend_from_slice(&[fill; BUF_SIZE]);
-    let (written, mut buf) = sidecar.write_polled_at(fd.clone(), buf, offset).await;
+    let (written, mut buf) = multiring.write_polled_at(fd.clone(), buf, offset).await;
     assert_eq!(written.unwrap(), BUF_SIZE);
 
     buf.clear();
-    let (read, buf) = sidecar
+    let (read, buf) = multiring
         .read_polled_at(fd.clone(), buf, offset, usize::MAX)
         .await;
     assert_eq!(read.unwrap(), BUF_SIZE);
@@ -107,11 +107,11 @@ async fn round_trip(
 fn round_trip_on_a_worker() {
     let (fd, offset) = scratch(0);
     let pool = BufferPool::new(BUF_SIZE, 4).unwrap();
-    let (runtime, sidecar) = setup(&pool);
+    let (runtime, multiring) = setup(&pool);
     runtime.block_on(async {
         tokio::spawn({
             let pool = pool.clone();
-            async move { round_trip(&sidecar, &pool, &fd, offset, 0x11).await }
+            async move { round_trip(&multiring, &pool, &fd, offset, 0x11).await }
         })
         .await
         .unwrap();
@@ -125,9 +125,9 @@ fn round_trip_on_a_worker() {
 fn round_trip_off_worker() {
     let (fd, offset) = scratch(1);
     let pool = BufferPool::new(BUF_SIZE, 4).unwrap();
-    let (runtime, sidecar) = setup(&pool);
+    let (runtime, multiring) = setup(&pool);
     runtime.block_on(async {
-        round_trip(&sidecar, &pool, &fd, offset, 0x22).await;
+        round_trip(&multiring, &pool, &fd, offset, 0x22).await;
     });
 }
 
@@ -138,7 +138,7 @@ fn round_trip_off_worker() {
 fn completions_wake_parked_workers() {
     let (fd, offset) = scratch(2);
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    let (runtime, sidecar) = setup(&pool);
+    let (runtime, multiring) = setup(&pool);
     runtime.block_on(async {
         tokio::spawn({
             let pool = pool.clone();
@@ -146,7 +146,7 @@ fn completions_wake_parked_workers() {
                 for round in 0..300u32 {
                     tokio::time::timeout(
                         Duration::from_secs(5),
-                        round_trip(&sidecar, &pool, &fd, offset, round as u8),
+                        round_trip(&multiring, &pool, &fd, offset, round as u8),
                     )
                     .await
                     .expect("worker was never woken");
@@ -169,21 +169,21 @@ fn many_operations_at_once() {
 
     let (fd, offset) = scratch(3);
     let pool = BufferPool::new(4096, 64).unwrap();
-    let (runtime, sidecar) = runtime(&pool, plan(&[2, 2]));
+    let (runtime, multiring) = runtime(&pool, plan(&[2, 2]));
     runtime.block_on(async {
         let mut buf = pool.acquire().await;
         buf.extend_from_slice(&[0x33; 4096]);
-        let (written, buf) = sidecar.write_polled_at(fd.clone(), buf, offset).await;
+        let (written, buf) = multiring.write_polled_at(fd.clone(), buf, offset).await;
         assert_eq!(written.unwrap(), 4096);
         drop(buf);
 
         let reads: Vec<_> = (0..OPS)
             .map(|_| {
-                let sidecar = sidecar.clone();
+                let multiring = multiring.clone();
                 let pool = pool.clone();
                 let fd = fd.clone();
                 tokio::spawn(async move {
-                    let (read, buf) = sidecar
+                    let (read, buf) = multiring
                         .read_polled_at(fd, pool.acquire().await, offset, usize::MAX)
                         .await;
                     assert_eq!(read.unwrap(), 4096);
@@ -194,7 +194,7 @@ fn many_operations_at_once() {
         for read in reads {
             read.await.unwrap();
         }
-        assert_eq!(sidecar.in_flight(), 0);
+        assert_eq!(multiring.in_flight(), 0);
     });
     assert_eq!(pool.available(), 64);
 }
@@ -205,7 +205,7 @@ fn many_operations_at_once() {
 fn dropped_operation_runs_to_its_end() {
     let (fd, offset) = scratch(4);
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    let (runtime, sidecar) = setup(&pool);
+    let (runtime, multiring) = setup(&pool);
     runtime.block_on(async {
         tokio::spawn({
             let pool = pool.clone();
@@ -213,7 +213,7 @@ fn dropped_operation_runs_to_its_end() {
                 let mut buf = pool.acquire().await;
                 buf.extend_from_slice(&[0x44; BUF_SIZE]);
 
-                let mut write = Box::pin(sidecar.write_polled_at(fd.clone(), buf, offset));
+                let mut write = Box::pin(multiring.write_polled_at(fd.clone(), buf, offset));
                 std::future::poll_fn(|cx| {
                     let _ = write.as_mut().poll(cx);
                     std::task::Poll::Ready(())
@@ -224,7 +224,7 @@ fn dropped_operation_runs_to_its_end() {
                 let buf = tokio::time::timeout(Duration::from_secs(5), pool.acquire())
                     .await
                     .expect("buffer never came back");
-                let (read, buf) = sidecar.read_polled_at(fd, buf, offset, usize::MAX).await;
+                let (read, buf) = multiring.read_polled_at(fd, buf, offset, usize::MAX).await;
                 assert_eq!(read.unwrap(), BUF_SIZE);
                 assert!(buf.iter().all(|&byte| byte == 0x44));
             }
@@ -248,9 +248,9 @@ fn buffered_files_are_refused() {
     let fd = Arc::new(OwnedFd::from(file));
 
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    let (runtime, sidecar) = setup(&pool);
+    let (runtime, multiring) = setup(&pool);
     runtime.block_on(async {
-        let (read, _buf) = sidecar
+        let (read, _buf) = multiring
             .read_polled_at(fd, pool.acquire().await, 0, usize::MAX)
             .await;
         assert_eq!(read.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
@@ -265,9 +265,9 @@ fn polled_operations_need_disk_rings() {
         disk: None,
         ..config(&pool, &plan(&[WORKERS]))
     };
-    let (runtime, sidecar) = build(&plan(&[WORKERS]), settings).unwrap();
+    let (runtime, multiring) = build(&plan(&[WORKERS]), settings).unwrap();
     runtime.block_on(async {
-        let (read, _buf) = sidecar
+        let (read, _buf) = multiring
             .read_polled_at(fd, pool.acquire().await, offset, usize::MAX)
             .await;
         assert_eq!(read.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);

@@ -159,7 +159,7 @@ impl Drop for Pool {
     fn drop(&mut self) {
         for chunk in self.chunks.drain(..) {
             // SAFETY: allocated as a `Box` in `grow`. The pool is dropped
-            // with the sidecar's last handle, when no future and no reactor
+            // with the multiring's last handle, when no future and no reactor
             // is left to use an arbiter.
             drop(unsafe { Box::from_raw(chunk.as_ptr()) });
         }
@@ -191,7 +191,7 @@ struct Rings {
     disk: Option<IoUring>,
 }
 
-/// What a sidecar has once its runtime is built.
+/// What a multiring has once its runtime is built.
 struct Started {
     workers: Box<[Shared]>,
     /// Keeps the kernel submission threads of the disk rings alive.
@@ -270,7 +270,7 @@ pub struct DiskConfig {
     pub plan: Plan,
 }
 
-/// The kernel submission threads of a sidecar, one per domain of the plan.
+/// The kernel submission threads of a multiring, one per domain of the plan.
 /// Each is kept alive by a ring that does no I/O, which the disk rings of
 /// the domain's workers attach to.
 struct Disk {
@@ -319,12 +319,12 @@ impl Disk {
 
 /// Handle to the reactor of one runtime. Cheap to clone.
 #[derive(Clone)]
-pub struct Sidecar {
+pub struct MultiRing {
     inner: Arc<Inner>,
 }
 
-impl Sidecar {
-    /// Makes the runtime that `builder` builds one that a sidecar drives:
+impl MultiRing {
+    /// Makes the runtime that `builder` builds one that a multiring drives:
     /// every worker gets a ring, sleeps in it when it has nothing to run,
     /// and the runtime's own sockets and other I/O resources are watched by
     /// those rings too. Returns the handle that operations are started on.
@@ -337,10 +337,10 @@ impl Sidecar {
     ///
     /// This takes the builder's `io_reactor` slot (flushing before stealing
     /// runs through [`Reactor::before_steal`], leaving
-    /// [`Builder::on_before_steal`] free for callers). A sidecar drives one
+    /// [`Builder::on_before_steal`] free for callers). A multiring drives one
     /// runtime: building a second one from the same builder fails with
     /// [`io::ErrorKind::AlreadyExists`].
-    pub fn install(builder: &mut Builder, config: Config) -> Sidecar {
+    pub fn install(builder: &mut Builder, config: Config) -> MultiRing {
         let inner = Arc::new_cyclic(|me| Inner {
             me: me.clone(),
             sq_entries: config.sq_entries,
@@ -356,7 +356,7 @@ impl Sidecar {
             reactor.start(workers)?;
             Ok(reactor.clone() as Arc<dyn Reactor>)
         });
-        Sidecar { inner }
+        MultiRing { inner }
     }
 
     /// The pool registered on the rings, if [`Config::buffers`] named one.
@@ -433,7 +433,7 @@ impl Sidecar {
 
     /// The arbiter of `ticket`'s operation.
     pub(crate) fn arbiter(&self, ticket: &Ticket) -> &Arbiter {
-        // SAFETY: the ticket came from this sidecar, which keeps the pool
+        // SAFETY: the ticket came from this multiring, which keeps the pool
         // alive for as long as it is borrowed.
         unsafe { ticket.cell.get() }
     }
@@ -456,26 +456,28 @@ impl Sidecar {
 }
 
 impl Inner {
-    /// The workers of the runtime this sidecar drives.
+    /// The workers of the runtime this multiring drives.
     ///
     /// # Panics
     ///
     /// Panics if the runtime has not been built.
     fn workers(&self) -> &[Shared] {
         let started = self.started.get();
-        &started.expect("the sidecar's runtime is not built").workers
+        &started
+            .expect("the multiring's runtime is not built")
+            .workers
     }
 
     /// Creates the rings of a runtime with this many workers.
     fn start(&self, workers: usize) -> io::Result<()> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
         if workers as u64 > TOKEN_WORKER_MASK {
-            return Err(invalid("too many workers for sidecar watch tokens"));
+            return Err(invalid("too many workers for multiring watch tokens"));
         }
         if self.started.get().is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "this sidecar already drives a runtime",
+                "this multiring already drives a runtime",
             ));
         }
         let disk = match &self.disk {
@@ -537,12 +539,12 @@ impl Inner {
         self.started.set(started).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "this sidecar already drives a runtime",
+                "this multiring already drives a runtime",
             )
         })
     }
 
-    /// This thread's worker, if it has one and it belongs to this sidecar.
+    /// This thread's worker, if it has one and it belongs to this multiring.
     fn local(&self) -> Option<Rc<Worker>> {
         // The thread-local is gone when a future is dropped during thread
         // teardown; such a thread is treated like any other non-worker.
@@ -550,7 +552,7 @@ impl Inner {
             .try_with(|current| current.borrow().clone())
             .ok()
             .flatten()
-            .filter(|worker| std::ptr::eq(Arc::as_ptr(&worker.sidecar), self))
+            .filter(|worker| std::ptr::eq(Arc::as_ptr(&worker.multiring), self))
     }
 
     /// The worker that takes the next piece of work from a thread without
@@ -575,7 +577,7 @@ impl Inner {
 
 impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Sidecar")
+        f.debug_struct("MultiRing")
             .field("workers", &self.started.get().map(|s| s.workers.len()))
             .finish_non_exhaustive()
     }
@@ -673,7 +675,7 @@ impl Reactor for Inner {
             Some(local) if local.index == worker => local.park(mode, timers),
             _ => panic!(
                 "worker {worker} went to sleep on a thread that does not own its ring: \
-                 a sidecar needs a multi-threaded runtime"
+                 a multiring needs a multi-threaded runtime"
             ),
         }
         true
@@ -705,24 +707,24 @@ impl Reactor for Inner {
         let rings = rings.unwrap_or_else(PoisonError::into_inner).take();
         let Some(rings) = rings else {
             panic!(
-                "worker {worker} started a second time: a runtime that a sidecar drives \
+                "worker {worker} started a second time: a runtime that a multiring drives \
                  cannot use `block_in_place`"
             );
         };
-        let sidecar = self.me.upgrade().expect("called through a reference");
-        Worker::install(sidecar, worker, rings);
+        let multiring = self.me.upgrade().expect("called through a reference");
+        Worker::install(multiring, worker, rings);
     }
 
     fn worker_stop(&self, _worker: usize) {
         let worker = CURRENT.with(|current| current.borrow_mut().take());
         debug_assert!(
-            worker.is_some_and(|worker| std::ptr::eq(Arc::as_ptr(&worker.sidecar), self))
+            worker.is_some_and(|worker| std::ptr::eq(Arc::as_ptr(&worker.multiring), self))
         );
     }
 }
 
 /// Flushes the current worker's ring: submits what its tasks have queued and
-/// delivers the completions that are ready. [`Sidecar::install`] has the
+/// delivers the completions that are ready. [`MultiRing::install`] has the
 /// runtime call it whenever a worker has run out of local work. A runtime
 /// that needs [`Builder::on_before_steal`] for something else has to call
 /// it from its own callback.
@@ -735,7 +737,7 @@ impl Reactor for Inner {
 /// runtime has every worker look at its ring every so many tasks, which
 /// submits what is queued and, every few looks, takes completions in.
 ///
-/// Without the hook the sidecar still works: a worker then flushes when it
+/// Without the hook the multiring still works: a worker then flushes when it
 /// is about to go to sleep, and at those regular looks.
 ///
 /// Does nothing on a thread that has no ring.
@@ -793,7 +795,7 @@ enum Report {
 /// that worker's thread.
 struct Worker {
     ring: RefCell<IoUring>,
-    /// The polled ring, if the sidecar has them.
+    /// The polled ring, if the multiring has them.
     disk: Option<RefCell<IoUring>>,
     /// In-flight operations, by the index in their token.
     slots: RefCell<Vec<Option<InFlight>>>,
@@ -820,14 +822,14 @@ struct Worker {
     /// Where the read that wakes the worker puts what it read. Leaked: the
     /// kernel may write to it after the ring is closed.
     woken: NonNull<[u8; 8]>,
-    sidecar: Arc<Inner>,
+    multiring: Arc<Inner>,
     index: usize,
 }
 
 impl Worker {
     /// Makes the calling thread the one that runs the worker with index
     /// `index`, and the only one to use its rings.
-    fn install(sidecar: Arc<Inner>, index: usize, rings: Rings) {
+    fn install(multiring: Arc<Inner>, index: usize, rings: Rings) {
         if let Err(error) = rings.ring.submitter().register_enable_rings() {
             panic!("worker {index} could not take over its ring: {error}");
         }
@@ -847,7 +849,7 @@ impl Worker {
             revisit: Cell::new(false),
             looks: Cell::new(0),
             woken: NonNull::from(Box::leak(Box::new([0; 8]))),
-            sidecar,
+            multiring,
             index,
         });
         worker.listen_for_wake();
@@ -857,7 +859,7 @@ impl Worker {
     }
 
     fn shared(&self) -> &Shared {
-        &self.sidecar.workers()[self.index]
+        &self.multiring.workers()[self.index]
     }
 
     /// Queues the read that a write to the worker's eventfd completes.
@@ -1360,8 +1362,8 @@ impl Worker {
             // there. Publish `timekeeper` with `SeqCst` *before* calling
             // `timers.next_timeout()` so any concurrent timer insert either
             // wakes us or is observed here.
-            let sidecar = &*self.sidecar;
-            let keeper = sidecar
+            let multiring = &*self.multiring;
+            let keeper = multiring
                 .timekeeper
                 .compare_exchange(0, self.index + 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok();
@@ -1378,7 +1380,7 @@ impl Worker {
                 self.wait(timeout);
             }
             if keeper {
-                sidecar.timekeeper.store(0, Ordering::SeqCst);
+                multiring.timekeeper.store(0, Ordering::SeqCst);
             }
             shared.sleep.store(AWAKE, Ordering::SeqCst);
             self.turn();

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use tokio_sidecar::{BufferPool, Config, DiskConfig, Domain, Hyperthreads, Plan, Sidecar};
+use tokio_multiring::{BufferPool, Config, DiskConfig, Domain, Hyperthreads, MultiRing, Plan};
 
 /// The CPUs each kernel submission thread of this process may run on.
 fn sq_thread_cpus() -> Vec<String> {
@@ -57,12 +57,12 @@ fn a_domain_shares_one_pinned_kernel_thread() {
         }),
         ..Config::default()
     };
-    let sidecar = Sidecar::install(&mut builder, config);
+    let multiring = MultiRing::install(&mut builder, config);
     assert!(sq_thread_cpus().is_empty());
 
     let runtime = plan.build(&mut builder).unwrap();
     runtime.block_on(async {
         assert_eq!(sq_thread_cpus(), expected);
-        sidecar.nop().await.unwrap();
+        multiring.nop().await.unwrap();
     });
 }

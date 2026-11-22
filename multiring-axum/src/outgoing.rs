@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::body::Body;
 use axum::response::{IntoResponse, Response};
-use tokio_sidecar::{FixedBuf, Reclaim, Segment};
+use tokio_multiring::{FixedBuf, Reclaim, Segment};
 use ureq_proto::server::Reply;
 use ureq_proto::server::state::SendBody;
 
@@ -147,7 +147,7 @@ impl DirectBodySlot {
 }
 
 /// Builds an [`axum::response::Response`] whose body is produced directly via
-/// [`DirectWrite`] when served by `sidecar-axum`.
+/// [`DirectWrite`] when served by `multiring-axum`.
 ///
 /// The caller should set `Content-Length` on `head` if known (required for
 /// zero-copy sends). Any Tower middleware that inspects or adds response

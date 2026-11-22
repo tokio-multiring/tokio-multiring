@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 use crate::buffers::FixedBuf;
 use crate::landing::{Landing, TaskRef};
 use crate::ops::{Reclaimed, Segment};
-use crate::reactor::{Sidecar, Ticket};
+use crate::reactor::{MultiRing, Ticket};
 
 /// An operation and everything the kernel needs kept alive while it runs.
 ///
@@ -448,15 +448,15 @@ enum Progress {
 /// `landing`. `Landing` is `!Unpin`, which pins this future in place, and
 /// `Drop` makes sure the reactor has let go before the memory is released.
 pub(crate) struct Op {
-    sidecar: Sidecar,
+    multiring: MultiRing,
     progress: Progress,
     landing: Landing,
 }
 
 impl Op {
-    pub(crate) fn new(sidecar: &Sidecar, operation: Operation) -> Self {
+    pub(crate) fn new(multiring: &MultiRing, operation: Operation) -> Self {
         Self {
-            sidecar: sidecar.clone(),
+            multiring: multiring.clone(),
             progress: Progress::Idle(operation),
             landing: Landing::new(),
         }
@@ -475,7 +475,9 @@ impl Future for Op {
             Progress::Idle(operation) => {
                 // SAFETY: no reactor knows about the landing yet.
                 unsafe { this.landing.set_waker(cx.waker()) };
-                let ticket = this.sidecar.submit(operation, TaskRef::new(&this.landing));
+                let ticket = this
+                    .multiring
+                    .submit(operation, TaskRef::new(&this.landing));
                 this.progress = Progress::InFlight(ticket);
                 Poll::Pending
             }
@@ -486,7 +488,7 @@ impl Future for Op {
                 }
                 this.progress = Progress::InFlight(ticket);
 
-                let arbiter = this.sidecar.arbiter(&ticket);
+                let arbiter = this.multiring.arbiter(&ticket);
                 if arbiter.lock_waker(ticket.generation()) {
                     // SAFETY: the waker lock is held.
                     unsafe { this.landing.set_waker(cx.waker()) };
@@ -508,7 +510,7 @@ impl Drop for Op {
         let Progress::InFlight(ticket) = self.progress else {
             return;
         };
-        let arbiter = self.sidecar.arbiter(&ticket);
+        let arbiter = self.multiring.arbiter(&ticket);
         let mut spins = 0u32;
         loop {
             if self.landing.is_done() {
@@ -529,6 +531,6 @@ impl Drop for Op {
         }
         // The kernel may be using the operation's buffers. They stay with
         // the reactor, which is asked to cut the operation short.
-        self.sidecar.cancel(ticket);
+        self.multiring.cancel(ticket);
     }
 }

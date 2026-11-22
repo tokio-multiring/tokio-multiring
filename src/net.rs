@@ -1,8 +1,8 @@
-//! TCP listeners and streams whose I/O goes through a [`Sidecar`].
+//! TCP listeners and streams whose I/O goes through a [`MultiRing`].
 //!
 //! They hold a socket in the mode the rings need and name the operations
 //! that make sense on it. Nothing here is a different path to the kernel:
-//! every method forwards to the operation of the same name on [`Sidecar`].
+//! every method forwards to the operation of the same name on [`MultiRing`].
 
 use std::future::Future;
 use std::io;
@@ -14,18 +14,18 @@ use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
 use crate::buffers::FixedBuf;
 use crate::ops::{Reclaim, Segment};
-use crate::reactor::Sidecar;
+use crate::reactor::MultiRing;
 
 /// A TCP socket that listens for connections.
 pub struct TcpListener {
-    sidecar: Sidecar,
+    multiring: MultiRing,
     fd: Arc<OwnedFd>,
 }
 
 impl TcpListener {
     /// Listens on `addr`.
-    pub fn bind(sidecar: &Sidecar, addr: SocketAddr) -> io::Result<TcpListener> {
-        Self::listen(sidecar, addr, false)
+    pub fn bind(multiring: &MultiRing, addr: SocketAddr) -> io::Result<TcpListener> {
+        Self::listen(multiring, addr, false)
     }
 
     /// Listens on `addr`, which other listeners made this way may share.
@@ -37,11 +37,15 @@ impl TcpListener {
     ///
     /// Port 0 picks a free port for this listener alone. To share it, bind
     /// the others to [`local_addr`](Self::local_addr).
-    pub fn bind_reuse_port(sidecar: &Sidecar, addr: SocketAddr) -> io::Result<TcpListener> {
-        Self::listen(sidecar, addr, true)
+    pub fn bind_reuse_port(multiring: &MultiRing, addr: SocketAddr) -> io::Result<TcpListener> {
+        Self::listen(multiring, addr, true)
     }
 
-    fn listen(sidecar: &Sidecar, addr: SocketAddr, reuse_port: bool) -> io::Result<TcpListener> {
+    fn listen(
+        multiring: &MultiRing,
+        addr: SocketAddr,
+        reuse_port: bool,
+    ) -> io::Result<TcpListener> {
         let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
         socket.set_reuse_address(true)?;
         if reuse_port {
@@ -50,16 +54,19 @@ impl TcpListener {
         socket.bind(&addr.into())?;
         socket.listen(libc::SOMAXCONN)?;
         Ok(TcpListener {
-            sidecar: sidecar.clone(),
+            multiring: multiring.clone(),
             fd: Arc::new(socket.into()),
         })
     }
 
     /// Takes over a listener made elsewhere, putting it in blocking mode.
-    pub fn from_std(sidecar: &Sidecar, listener: std::net::TcpListener) -> io::Result<TcpListener> {
+    pub fn from_std(
+        multiring: &MultiRing,
+        listener: std::net::TcpListener,
+    ) -> io::Result<TcpListener> {
         listener.set_nonblocking(false)?;
         Ok(TcpListener {
-            sidecar: sidecar.clone(),
+            multiring: multiring.clone(),
             fd: Arc::new(listener.into()),
         })
     }
@@ -74,11 +81,11 @@ impl TcpListener {
     /// If the future is dropped, a connection that had already been
     /// accepted for it is closed.
     pub fn accept(&self) -> impl Future<Output = io::Result<TcpStream>> + Send + use<> {
-        let sidecar = self.sidecar.clone();
-        let accepted = sidecar.accept(self.fd.clone());
+        let multiring = self.multiring.clone();
+        let accepted = multiring.accept(self.fd.clone());
         async move {
             Ok(TcpStream {
-                sidecar,
+                multiring,
                 fd: Arc::new(accepted.await?),
             })
         }
@@ -95,16 +102,16 @@ impl AsFd for TcpListener {
 /// which is how one task can send on it while another receives.
 #[derive(Clone)]
 pub struct TcpStream {
-    sidecar: Sidecar,
+    multiring: MultiRing,
     fd: Arc<OwnedFd>,
 }
 
 impl TcpStream {
     /// Takes over a connection made elsewhere, putting it in blocking mode.
-    pub fn from_std(sidecar: &Sidecar, stream: std::net::TcpStream) -> io::Result<TcpStream> {
+    pub fn from_std(multiring: &MultiRing, stream: std::net::TcpStream) -> io::Result<TcpStream> {
         stream.set_nonblocking(false)?;
         Ok(TcpStream {
-            sidecar: sidecar.clone(),
+            multiring: multiring.clone(),
             fd: Arc::new(stream.into()),
         })
     }
@@ -125,58 +132,60 @@ impl TcpStream {
         SockRef::from(&self.fd).set_tcp_nodelay(nodelay)
     }
 
-    /// See [`Sidecar::recv`].
+    /// See [`MultiRing::recv`].
     pub fn recv(
         &self,
         buf: FixedBuf,
         limit: usize,
     ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
-        self.sidecar.recv(self.fd.clone(), buf, limit)
+        self.multiring.recv(self.fd.clone(), buf, limit)
     }
 
-    /// See [`Sidecar::recv_vectored`].
+    /// See [`MultiRing::recv_vectored`].
     pub fn recv_vectored(
         &self,
         bufs: Vec<FixedBuf>,
         segments: &[Segment],
     ) -> impl Future<Output = (io::Result<usize>, Vec<FixedBuf>)> + Send + use<> {
-        self.sidecar.recv_vectored(self.fd.clone(), bufs, segments)
+        self.multiring
+            .recv_vectored(self.fd.clone(), bufs, segments)
     }
 
-    /// See [`Sidecar::send`].
+    /// See [`MultiRing::send`].
     pub fn send(
         &self,
         buf: FixedBuf,
         start: usize,
     ) -> impl Future<Output = (io::Result<usize>, FixedBuf)> + Send + use<> {
-        self.sidecar.send(self.fd.clone(), buf, start)
+        self.multiring.send(self.fd.clone(), buf, start)
     }
 
-    /// See [`Sidecar::send_vectored`].
+    /// See [`MultiRing::send_vectored`].
     pub fn send_vectored(
         &self,
         bufs: Vec<FixedBuf>,
         segments: &[Segment],
     ) -> impl Future<Output = (io::Result<usize>, Vec<FixedBuf>)> + Send + use<> {
-        self.sidecar.send_vectored(self.fd.clone(), bufs, segments)
+        self.multiring
+            .send_vectored(self.fd.clone(), bufs, segments)
     }
 
-    /// See [`Sidecar::send_zc_vectored`].
+    /// See [`MultiRing::send_zc_vectored`].
     pub fn send_zc_vectored(
         &self,
         bufs: Vec<FixedBuf>,
         segments: &[Segment],
     ) -> impl Future<Output = (io::Result<usize>, Reclaim)> + Send + use<> {
-        self.sidecar
+        self.multiring
             .send_zc_vectored(self.fd.clone(), bufs, segments)
     }
 
-    /// See [`Sidecar::shutdown`].
+    /// See [`MultiRing::shutdown`].
     pub fn shutdown(
         &self,
         how: std::net::Shutdown,
     ) -> impl Future<Output = io::Result<()>> + Send + use<> {
-        self.sidecar.shutdown(self.fd.clone(), how)
+        self.multiring.shutdown(self.fd.clone(), how)
     }
 }
 

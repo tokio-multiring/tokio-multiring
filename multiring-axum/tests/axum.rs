@@ -15,9 +15,9 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use bytes::Bytes;
 use futures_util::stream;
-use sidecar_axum::{BodySink, Config, DirectBody, DirectResponse, DirectWrite, Server, ZeroCopy};
+use multiring_axum::{BodySink, Config, DirectBody, DirectResponse, DirectWrite, Server, ZeroCopy};
 use tokio::runtime::{Builder, Runtime};
-use tokio_sidecar::{BufferPool, Segment, Sidecar};
+use tokio_multiring::{BufferPool, MultiRing, Segment};
 
 struct Harness {
     addr: SocketAddr,
@@ -30,9 +30,9 @@ impl Harness {
         let addr = listener.local_addr().unwrap();
         let mut builder = Builder::new_multi_thread();
         builder.worker_threads(2).enable_time();
-        let sidecar = Sidecar::install(
+        let multiring = MultiRing::install(
             &mut builder,
-            tokio_sidecar::Config {
+            tokio_multiring::Config {
                 buffers: pool,
                 ..Default::default()
             },
@@ -40,7 +40,7 @@ impl Harness {
         let rt = builder.build().unwrap();
         rt.block_on(async {
             let server = Server::new(
-                sidecar,
+                multiring,
                 Config {
                     connections: 32,
                     head_buffer: 4096,
@@ -343,7 +343,7 @@ fn direct_body_and_direct_response_with_middleware() {
             "/upload",
             put(|State(st): State<AppState>, body: DirectBody| async move {
                 let DirectBody::Direct(mut direct) = body else {
-                    panic!("expected DirectBody::Direct on sidecar-axum");
+                    panic!("expected DirectBody::Direct on multiring-axum");
                 };
                 direct.accept_100().await.unwrap();
                 let mut total = 0usize;
@@ -504,12 +504,12 @@ fn idle_timeout_closes_quiet_connection() {
     let addr = listener.local_addr().unwrap();
     let mut builder = Builder::new_multi_thread();
     builder.worker_threads(2).enable_time();
-    let sidecar = Sidecar::install(&mut builder, tokio_sidecar::Config::default());
+    let multiring = MultiRing::install(&mut builder, tokio_multiring::Config::default());
     let rt = builder.build().unwrap();
     rt.block_on(async {
         let router = Router::new().route("/ping", get(|| async { "pong" }));
         let server = Server::new(
-            sidecar,
+            multiring,
             Config {
                 connections: 8,
                 head_buffer: 4096,

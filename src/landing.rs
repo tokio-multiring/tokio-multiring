@@ -188,7 +188,7 @@ impl Landing {
 }
 
 /// Pointer to an arbiter in a worker's pool. Valid for as long as the
-/// sidecar it came from is alive.
+/// multiring it came from is alive.
 #[derive(Clone, Copy)]
 pub(crate) struct CellRef(NonNull<Arbiter>);
 
@@ -203,7 +203,7 @@ impl CellRef {
 
     /// # Safety
     ///
-    /// The sidecar this came from must be alive for `'a`.
+    /// The multiring this came from must be alive for `'a`.
     pub(crate) unsafe fn get<'a>(self) -> &'a Arbiter {
         // SAFETY: the caller's obligation.
         unsafe { self.0.as_ref() }

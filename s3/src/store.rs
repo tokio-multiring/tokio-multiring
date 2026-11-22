@@ -10,7 +10,7 @@
 //! final names, and then renames the first one over the key. A reader that
 //! opens the key therefore finds either the previous object or the new one,
 //! each with its own set of parts, never a mixture. All file data goes
-//! through `O_DIRECT` with the sidecar's registered buffers.
+//! through `O_DIRECT` with the multiring's registered buffers.
 
 use std::ffi::CString;
 use std::io;
@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
-use tokio_sidecar::{BufferPool, FixedBuf, Sidecar};
+use tokio_multiring::{BufferPool, FixedBuf, MultiRing};
 
 use crate::error::ApiError;
 use crate::join::join_all;
@@ -38,7 +38,7 @@ const OPEN_ATTEMPTS: usize = 8;
 const COMMIT_LOCKS: usize = 256;
 
 pub(crate) struct Store {
-    sidecar: Sidecar,
+    multiring: MultiRing,
     buffers: BufferPool,
     /// The root directory on each drive.
     drives: Vec<Arc<OwnedFd>>,
@@ -156,12 +156,12 @@ impl Store {
     /// The order of the roots and the unit are part of how objects are laid
     /// out: objects stored under one arrangement cannot be read under
     /// another.
-    pub(crate) fn open(sidecar: Sidecar, roots: &[PathBuf], unit: usize) -> io::Result<Store> {
+    pub(crate) fn open(multiring: MultiRing, roots: &[PathBuf], unit: usize) -> io::Result<Store> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
-        let buffers = sidecar
+        let buffers = multiring
             .buffers()
             .cloned()
-            .ok_or_else(|| invalid("the sidecar has no buffer pool"))?;
+            .ok_or_else(|| invalid("the multiring has no buffer pool"))?;
         let geometry = Geometry::new(roots.len(), unit, buffers.buf_size()).ok_or_else(|| {
             invalid(
                 "a store needs a root, a stripe unit that is a multiple of 4096, \
@@ -193,7 +193,7 @@ impl Store {
             drives.push(Arc::new(OwnedFd::from(std::fs::File::open(root)?)));
         }
         Ok(Store {
-            sidecar,
+            multiring,
             buffers,
             drives,
             geometry,
@@ -222,7 +222,7 @@ impl Store {
         let mut created = false;
         for drive in &self.drives {
             match self
-                .sidecar
+                .multiring
                 .mkdir_at(drive.clone(), bucket.path(), 0o755)
                 .await
             {
@@ -241,13 +241,13 @@ impl Store {
     pub(crate) async fn delete_bucket(&self, bucket: &Bucket) -> Result<(), StoreError> {
         let mut removed = Vec::new();
         for drive in &self.drives {
-            match self.sidecar.rmdir_at(drive.clone(), bucket.path()).await {
+            match self.multiring.rmdir_at(drive.clone(), bucket.path()).await {
                 Ok(()) => removed.push(drive),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
                     // The bucket stays, on every drive.
                     for drive in removed {
-                        let restored = self.sidecar.mkdir_at(drive.clone(), bucket.path(), 0o755);
+                        let restored = self.multiring.mkdir_at(drive.clone(), bucket.path(), 0o755);
                         if let Err(error) = restored.await {
                             log::error!("could not restore {:?}: {error}", bucket.path());
                         }
@@ -267,7 +267,9 @@ impl Store {
     }
 
     pub(crate) async fn head_bucket(&self, bucket: &Bucket) -> Result<(), StoreError> {
-        let stat = self.sidecar.stat_at(self.drives[0].clone(), bucket.path());
+        let stat = self
+            .multiring
+            .stat_at(self.drives[0].clone(), bucket.path());
         match stat.await {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 Err(ApiError::NO_SUCH_BUCKET.into())
@@ -292,10 +294,12 @@ impl Store {
         limit: usize,
     ) -> (io::Result<usize>, FixedBuf) {
         let file = file.clone();
-        if self.sidecar.has_disk_rings() {
-            self.sidecar.read_polled_at(file, buf, offset, limit).await
+        if self.multiring.has_disk_rings() {
+            self.multiring
+                .read_polled_at(file, buf, offset, limit)
+                .await
         } else {
-            self.sidecar.read_fixed_at(file, buf, offset, limit).await
+            self.multiring.read_fixed_at(file, buf, offset, limit).await
         }
     }
 
@@ -307,10 +311,10 @@ impl Store {
         offset: u64,
     ) -> (io::Result<()>, FixedBuf) {
         let file = file.clone();
-        let (written, buf) = if self.sidecar.has_disk_rings() {
-            self.sidecar.write_polled_at(file, buf, offset).await
+        let (written, buf) = if self.multiring.has_disk_rings() {
+            self.multiring.write_polled_at(file, buf, offset).await
         } else {
-            self.sidecar.write_fixed_at(file, buf, offset).await
+            self.multiring.write_fixed_at(file, buf, offset).await
         };
         let result = match written {
             Ok(written) if written == buf.len() => Ok(()),
@@ -343,7 +347,7 @@ impl Store {
     async fn open_first(&self, object: &Object) -> Result<Arc<OwnedFd>, StoreError> {
         let drive = self.drive(object.first_drive(self.drives.len()), 0);
         let flags = libc::O_RDONLY | libc::O_DIRECT;
-        match self.sidecar.open_at(drive, object.path(), flags, 0).await {
+        match self.multiring.open_at(drive, object.path(), flags, 0).await {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 Err(self.missing(object).await)
             }
@@ -376,7 +380,7 @@ impl Store {
                 let path = object.bucket.file(&part_name(header.id, part));
                 let flags = libc::O_RDONLY | libc::O_DIRECT;
                 let opened = self
-                    .sidecar
+                    .multiring
                     .open_at(self.drive(first, part), path, flags, 0);
                 match opened.await {
                     Ok(file) => files.push(Arc::new(file)),
@@ -459,7 +463,7 @@ impl Store {
         for part in 1..self.geometry.parts(header.size) {
             let path = bucket.file(&part_name(header.id, part));
             let removed = self
-                .sidecar
+                .multiring
                 .unlink_at(self.drive(first, part), path.clone());
             match removed.await {
                 Ok(()) => {}
@@ -485,7 +489,9 @@ impl Store {
             None => None,
         };
 
-        let removed = self.sidecar.unlink_at(self.drive(first, 0), object.path());
+        let removed = self
+            .multiring
+            .unlink_at(self.drive(first, 0), object.path());
         match removed.await {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return match self.missing(object).await {
@@ -508,7 +514,7 @@ impl Store {
         let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_DIRECT;
         let drive = self.drive(upload.first, part);
         let file = self
-            .sidecar
+            .multiring
             .open_at(drive, path.clone(), flags, 0o644)
             .await?;
         Ok(Staged {
@@ -632,7 +638,7 @@ impl Store {
         let first = async {
             if staged_first.padded {
                 let len = HEADER as u64 + self.geometry.part_len(upload.size, 0);
-                self.sidecar
+                self.multiring
                     .truncate(staged_first.file.clone(), len)
                     .await?;
             }
@@ -640,7 +646,7 @@ impl Store {
             scratch.extend_from_slice(&header.encode(&self.geometry));
             let (written, scratch) = self.write_at(&staged_first.file, scratch, 0).await;
             written?;
-            self.sidecar.fdatasync(staged_first.file.clone()).await?;
+            self.multiring.fdatasync(staged_first.file.clone()).await?;
             Ok::<_, io::Error>(scratch)
         };
         let others: Vec<_> = upload
@@ -652,13 +658,13 @@ impl Store {
             .map(|(part, staged)| async move {
                 if staged.padded {
                     let len = self.geometry.part_len(upload.size, part);
-                    self.sidecar.truncate(staged.file.clone(), len).await?;
+                    self.multiring.truncate(staged.file.clone(), len).await?;
                 }
-                self.sidecar.fdatasync(staged.file.clone()).await?;
+                self.multiring.fdatasync(staged.file.clone()).await?;
                 // Nothing refers to this name until the first part does.
                 let name = upload.object.bucket.file(&part_name(upload.id, part));
                 let drive = self.drive(upload.first, part);
-                self.sidecar
+                self.multiring
                     .rename_at(drive, staged.path.clone(), name)
                     .await
             })
@@ -674,7 +680,7 @@ impl Store {
             1 => None,
             _ => self.current(&upload.object, scratch).await.0,
         };
-        let renamed = self.sidecar.rename_at(
+        let renamed = self.multiring.rename_at(
             self.drive(upload.first, 0),
             staged_first.path.clone(),
             upload.object.path(),
@@ -702,7 +708,7 @@ impl Store {
             }
             for path in paths {
                 let removed = self
-                    .sidecar
+                    .multiring
                     .unlink_at(self.drive(upload.first, part), path.clone());
                 match removed.await {
                     Ok(()) => {}

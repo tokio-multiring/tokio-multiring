@@ -24,7 +24,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio_sidecar::{BufferPool, Config, DiskConfig, Domain, Hyperthreads, Plan, Sidecar};
+use tokio_multiring::{BufferPool, Config, DiskConfig, Domain, Hyperthreads, MultiRing, Plan};
 
 fn env<T: FromStr>(name: &str, default: T) -> T {
     match std::env::var(name) {
@@ -108,11 +108,11 @@ fn main() {
         }),
         ..Config::default()
     };
-    let sidecar = Sidecar::install(&mut builder, config);
+    let multiring = MultiRing::install(&mut builder, config);
     let runtime = plan.build(&mut builder).unwrap();
 
     if mode == "fill" {
-        runtime.block_on(fill(sidecar, pool, fd, span));
+        runtime.block_on(fill(multiring, pool, fd, span));
         return;
     }
     let (latencies, cpu) = runtime.block_on(async {
@@ -121,7 +121,7 @@ fn main() {
         let blocks = span / block as u64;
         let readers: Vec<_> = (0..tasks)
             .map(|task| {
-                let sidecar = sidecar.clone();
+                let multiring = multiring.clone();
                 let pool = pool.clone();
                 let fd = fd.clone();
                 tokio::spawn(async move {
@@ -137,11 +137,11 @@ fn main() {
                         buf.clear();
                         let started = Instant::now();
                         let (read, returned) = if polled {
-                            sidecar
+                            multiring
                                 .read_polled_at(fd.clone(), buf, offset, usize::MAX)
                                 .await
                         } else {
-                            sidecar
+                            multiring
                                 .read_fixed_at(fd.clone(), buf, offset, usize::MAX)
                                 .await
                         };
@@ -193,7 +193,7 @@ const FILL_PIECE: usize = 1 << 20;
 const FILL_WRITERS: usize = 16;
 
 /// Writes the whole span, in 1 MiB pieces.
-async fn fill(sidecar: Sidecar, pool: BufferPool, fd: Arc<OwnedFd>, span: u64) {
+async fn fill(multiring: MultiRing, pool: BufferPool, fd: Arc<OwnedFd>, span: u64) {
     const PIECE: usize = FILL_PIECE;
     const WRITERS: u64 = FILL_WRITERS as u64;
 
@@ -201,7 +201,7 @@ async fn fill(sidecar: Sidecar, pool: BufferPool, fd: Arc<OwnedFd>, span: u64) {
     let pieces = span / PIECE as u64;
     let writers: Vec<_> = (0..WRITERS)
         .map(|writer| {
-            let sidecar = sidecar.clone();
+            let multiring = multiring.clone();
             let pool = pool.clone();
             let fd = fd.clone();
             tokio::spawn(async move {
@@ -216,7 +216,7 @@ async fn fill(sidecar: Sidecar, pool: BufferPool, fd: Arc<OwnedFd>, span: u64) {
                         fill ^= fill << 17;
                         buf.extend_from_slice(&fill.to_ne_bytes());
                     }
-                    let (written, returned) = sidecar
+                    let (written, returned) = multiring
                         .write_polled_at(fd.clone(), buf, piece * PIECE as u64)
                         .await;
                     assert_eq!(written.unwrap(), PIECE);

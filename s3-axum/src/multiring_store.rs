@@ -1,5 +1,5 @@
-//! `tokio-sidecar` (`io_uring`) storage backend with registered buffers,
-//! `O_DIRECT` striped files, and zero-copy sends through `sidecar-axum`.
+//! `tokio-multiring` (`io_uring`) storage backend with registered buffers,
+//! `O_DIRECT` striped files, and zero-copy sends through `multiring-axum`.
 
 use std::collections::VecDeque;
 use std::ffi::CString;
@@ -14,11 +14,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use http_body_util::BodyExt;
+use multiring_axum::{BodyError, BodySink, DirectBody, DirectWrite, MultiRingDirectBody};
 use sha2::{Digest, Sha256};
-use sidecar_axum::{BodyError, BodySink, DirectBody, DirectWrite, SidecarDirectBody};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
-use tokio_sidecar::{BufferPool, FixedBuf, Reclaim, Sidecar};
+use tokio_multiring::{BufferPool, FixedBuf, MultiRing, Reclaim};
 
 use crate::error::{ApiError, StoreError};
 use crate::join::{Started, join_all};
@@ -36,8 +36,8 @@ const ZERO_COPY_MIN: usize = 64 * 1024;
 /// Small objects (<= 12 KiB) complete in one disk read and one buffer acquisition.
 const INLINE_READ: usize = 16 * 1024;
 
-pub struct SidecarStore {
-    sidecar: Sidecar,
+pub struct MultiRingStore {
+    multiring: MultiRing,
     buffers: BufferPool,
     roots: Vec<PathBuf>,
     drives: Vec<Arc<OwnedFd>>,
@@ -48,7 +48,7 @@ pub struct SidecarStore {
     commits: Box<[Mutex<()>]>,
 }
 
-pub(crate) struct SidecarStored {
+pub(crate) struct MultiRingStored {
     files: Vec<Arc<OwnedFd>>,
     /// For small single-part objects whose entire body was already fetched
     /// alongside the 4 KiB header in `open_object`.
@@ -56,7 +56,7 @@ pub(crate) struct SidecarStored {
     pub(crate) meta: Meta,
 }
 
-impl SidecarStored {
+impl MultiRingStored {
     pub(crate) fn parts(&self) -> usize {
         self.files.len()
     }
@@ -103,9 +103,9 @@ fn random() -> io::Result<u64> {
     Ok(u64::from_ne_bytes(bytes))
 }
 
-impl SidecarStore {
+impl MultiRingStore {
     pub fn open(
-        sidecar: Sidecar,
+        multiring: MultiRing,
         roots: &[PathBuf],
         unit: usize,
         window: usize,
@@ -114,10 +114,10 @@ impl SidecarStore {
         if window == 0 {
             return Err(invalid("window must be at least 1"));
         }
-        let buffers = sidecar
+        let buffers = multiring
             .buffers()
             .cloned()
-            .ok_or_else(|| invalid("the sidecar has no buffer pool"))?;
+            .ok_or_else(|| invalid("the multiring has no buffer pool"))?;
         let geometry = Geometry::new(roots.len(), unit, buffers.buf_size()).ok_or_else(|| {
             invalid("invalid geometry: need roots, 4096-aligned unit, and buffer multiple of unit")
         })?;
@@ -147,7 +147,7 @@ impl SidecarStore {
         }
 
         Ok(Arc::new(Self {
-            sidecar,
+            multiring,
             buffers,
             roots: roots.to_vec(),
             drives,
@@ -171,7 +171,7 @@ impl SidecarStore {
         let mut created = false;
         for drive in &self.drives {
             match self
-                .sidecar
+                .multiring
                 .mkdir_at(drive.clone(), bucket.path(), 0o755)
                 .await
             {
@@ -190,13 +190,13 @@ impl SidecarStore {
     pub(crate) async fn delete_bucket(&self, bucket: &Bucket) -> Result<(), StoreError> {
         let mut removed = Vec::new();
         for drive in &self.drives {
-            match self.sidecar.rmdir_at(drive.clone(), bucket.path()).await {
+            match self.multiring.rmdir_at(drive.clone(), bucket.path()).await {
                 Ok(()) => removed.push(drive),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
                     for drive in removed {
                         let _ = self
-                            .sidecar
+                            .multiring
                             .mkdir_at(drive.clone(), bucket.path(), 0o755)
                             .await;
                     }
@@ -216,7 +216,7 @@ impl SidecarStore {
 
     pub(crate) async fn head_bucket(&self, bucket: &Bucket) -> Result<(), StoreError> {
         match self
-            .sidecar
+            .multiring
             .stat_at(self.drives[0].clone(), bucket.path())
             .await
         {
@@ -319,7 +319,7 @@ impl SidecarStore {
             let rel = bucket.file(&file_name);
             let flags = libc::O_RDONLY | libc::O_DIRECT;
             let file = match self
-                .sidecar
+                .multiring
                 .open_at(self.drives[drive_idx].clone(), rel, flags, 0)
                 .await
             {
@@ -362,10 +362,12 @@ impl SidecarStore {
         limit: usize,
     ) -> (io::Result<usize>, FixedBuf) {
         let file = file.clone();
-        if self.sidecar.has_disk_rings() {
-            self.sidecar.read_polled_at(file, buf, offset, limit).await
+        if self.multiring.has_disk_rings() {
+            self.multiring
+                .read_polled_at(file, buf, offset, limit)
+                .await
         } else {
-            self.sidecar.read_fixed_at(file, buf, offset, limit).await
+            self.multiring.read_fixed_at(file, buf, offset, limit).await
         }
     }
 
@@ -376,10 +378,10 @@ impl SidecarStore {
         offset: u64,
     ) -> (io::Result<()>, FixedBuf) {
         let file = file.clone();
-        let (written, buf) = if self.sidecar.has_disk_rings() {
-            self.sidecar.write_polled_at(file, buf, offset).await
+        let (written, buf) = if self.multiring.has_disk_rings() {
+            self.multiring.write_polled_at(file, buf, offset).await
         } else {
-            self.sidecar.write_fixed_at(file, buf, offset).await
+            self.multiring.write_fixed_at(file, buf, offset).await
         };
         let result = match written {
             Ok(written) if written == buf.len() => Ok(()),
@@ -419,7 +421,7 @@ impl SidecarStore {
     async fn open_first(&self, object: &Object) -> Result<Arc<OwnedFd>, StoreError> {
         let drive = self.drive(object.first_drive(self.drives.len()), 0);
         let flags = libc::O_RDONLY | libc::O_DIRECT;
-        match self.sidecar.open_at(drive, object.path(), flags, 0).await {
+        match self.multiring.open_at(drive, object.path(), flags, 0).await {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 Err(self.missing(object).await)
             }
@@ -437,7 +439,7 @@ impl SidecarStore {
         })
     }
 
-    pub(crate) async fn open_object(&self, object: &Object) -> Result<SidecarStored, StoreError> {
+    pub(crate) async fn open_object(&self, object: &Object) -> Result<MultiRingStored, StoreError> {
         let first = object.first_drive(self.drives.len());
         let mut scratch = self.buffers.acquire().await;
         let inline_limit = INLINE_READ.min(scratch.capacity());
@@ -455,7 +457,7 @@ impl SidecarStore {
                 let path = object.bucket.file(&part_name(header.id, part));
                 let flags = libc::O_RDONLY | libc::O_DIRECT;
                 match self
-                    .sidecar
+                    .multiring
                     .open_at(self.drive(first, part), path, flags, 0)
                     .await
                 {
@@ -472,7 +474,7 @@ impl SidecarStore {
             } else {
                 None
             };
-            return Ok(SidecarStored {
+            return Ok(MultiRingStored {
                 files,
                 inline,
                 meta: Meta {
@@ -486,7 +488,7 @@ impl SidecarStore {
 
     async fn read_round(
         &self,
-        stored: &SidecarStored,
+        stored: &MultiRingStored,
         plan: Plan,
         bufs: Vec<FixedBuf>,
     ) -> (io::Result<()>, Vec<FixedBuf>, Plan) {
@@ -527,7 +529,7 @@ impl SidecarStore {
         // `statx` skips open + read + close for missing keys and all small
         // single-part objects.
         let drive = self.drive(object.first_drive(self.drives.len()), 0);
-        match self.sidecar.stat_at(drive, object.path()).await {
+        match self.multiring.stat_at(drive, object.path()).await {
             Ok(stat) if stat.size < (HEADER + self.geometry.unit()) as u64 => {
                 return (None, scratch);
             }
@@ -551,7 +553,10 @@ impl SidecarStore {
     async fn remove_parts(&self, bucket: &Bucket, first: usize, header: &Header) {
         for part in 1..self.geometry.parts(header.size) {
             let path = bucket.file(&part_name(header.id, part));
-            let _ = self.sidecar.unlink_at(self.drive(first, part), path).await;
+            let _ = self
+                .multiring
+                .unlink_at(self.drive(first, part), path)
+                .await;
         }
     }
 
@@ -567,7 +572,7 @@ impl SidecarStore {
             None => None,
         };
         match self
-            .sidecar
+            .multiring
             .unlink_at(self.drive(first, 0), object.path())
             .await
         {
@@ -591,7 +596,7 @@ impl SidecarStore {
         let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_DIRECT;
         let drive = self.drive(upload.first, part);
         let file = self
-            .sidecar
+            .multiring
             .open_at(drive, path.clone(), flags, 0o644)
             .await?;
         Ok(Staged {
@@ -698,7 +703,7 @@ impl SidecarStore {
         let first = async {
             if staged_first.padded {
                 let len = HEADER as u64 + self.geometry.part_len(upload.size, 0);
-                self.sidecar
+                self.multiring
                     .truncate(staged_first.file.clone(), len)
                     .await?;
             }
@@ -706,7 +711,7 @@ impl SidecarStore {
             scratch.extend_from_slice(&header.encode(&self.geometry));
             let (written, scratch) = self.write_at(&staged_first.file, scratch, 0).await;
             written?;
-            self.sidecar.fdatasync(staged_first.file.clone()).await?;
+            self.multiring.fdatasync(staged_first.file.clone()).await?;
             Ok::<_, io::Error>(scratch)
         };
         let others: Vec<_> = upload
@@ -718,12 +723,12 @@ impl SidecarStore {
             .map(|(part, staged)| async move {
                 if staged.padded {
                     let len = self.geometry.part_len(upload.size, part);
-                    self.sidecar.truncate(staged.file.clone(), len).await?;
+                    self.multiring.truncate(staged.file.clone(), len).await?;
                 }
-                self.sidecar.fdatasync(staged.file.clone()).await?;
+                self.multiring.fdatasync(staged.file.clone()).await?;
                 let name = upload.object.bucket.file(&part_name(upload.id, part));
                 let drive = self.drive(upload.first, part);
-                self.sidecar
+                self.multiring
                     .rename_at(drive, staged.path.clone(), name)
                     .await
             })
@@ -737,7 +742,7 @@ impl SidecarStore {
             1 => None,
             _ => self.current(&upload.object, scratch).await.0,
         };
-        self.sidecar
+        self.multiring
             .rename_at(
                 self.drive(upload.first, 0),
                 staged_first.path.clone(),
@@ -763,7 +768,7 @@ impl SidecarStore {
             }
             for path in paths {
                 let _ = self
-                    .sidecar
+                    .multiring
                     .unlink_at(self.drive(upload.first, part), path)
                     .await;
             }
@@ -784,7 +789,7 @@ impl SidecarStore {
     }
 
     /// Stores an object from a [`DirectBody`], taking the direct io_uring
-    /// `recv_vectored` fast path when served by `sidecar-axum`.
+    /// `recv_vectored` fast path when served by `multiring-axum`.
     pub(crate) async fn put_object(
         &self,
         object: &Object,
@@ -878,7 +883,7 @@ impl SidecarStore {
     /// Single-write fast path for small single-part objects (`<= stripe_unit`).
     async fn put_small_direct(
         &self,
-        direct: &mut SidecarDirectBody,
+        direct: &mut MultiRingDirectBody,
         upload: &mut Upload,
         len: usize,
         expected_sha256: Option<[u8; 32]>,
@@ -889,7 +894,7 @@ impl SidecarStore {
         let mut filled = 0usize;
         while filled < len && !direct.is_ended() {
             if !direct.has_pending() {
-                let seg = [tokio_sidecar::Segment {
+                let seg = [tokio_multiring::Segment {
                     buf: 0,
                     start: HEADER + filled,
                     len: len - filled,
@@ -948,18 +953,18 @@ impl SidecarStore {
         let (written, scratch) = self.write_at(&staged_first.file, buf, 0).await;
         written?;
         if aligned_len != HEADER + len {
-            self.sidecar
+            self.multiring
                 .truncate(staged_first.file.clone(), (HEADER + len) as u64)
                 .await?;
         }
-        self.sidecar.fdatasync(staged_first.file.clone()).await?;
+        self.multiring.fdatasync(staged_first.file.clone()).await?;
 
         let _commit = self.commits[Self::lock_of(&upload.object)].lock().await;
         let replaced = match self.drives.len() {
             1 => None,
             _ => self.current(&upload.object, scratch).await.0,
         };
-        self.sidecar
+        self.multiring
             .rename_at(
                 self.drive(upload.first, 0),
                 staged_first.path.clone(),
@@ -978,7 +983,7 @@ impl SidecarStore {
 
     async fn receive_direct(
         &self,
-        direct: &mut SidecarDirectBody,
+        direct: &mut MultiRingDirectBody,
         upload: &mut Upload,
         expected_sha256: Option<[u8; 32]>,
     ) -> Result<Vec<FixedBuf>, StoreError> {
@@ -1064,7 +1069,7 @@ impl SidecarStore {
 
     async fn receive_direct_aws_chunked(
         &self,
-        direct: &mut SidecarDirectBody,
+        direct: &mut MultiRingDirectBody,
         upload: &mut Upload,
         spec: AwsChunkedSpec,
     ) -> Result<Vec<FixedBuf>, StoreError> {
@@ -1115,7 +1120,7 @@ impl SidecarStore {
                             let want = usize::try_from(left)
                                 .unwrap_or(usize::MAX)
                                 .min(encoded.capacity());
-                            let seg = [tokio_sidecar::Segment {
+                            let seg = [tokio_multiring::Segment {
                                 buf: 0,
                                 start: 0,
                                 len: want,
@@ -1260,10 +1265,10 @@ impl SidecarStore {
 
     pub(crate) fn writer(
         self: &Arc<Self>,
-        stored: SidecarStored,
+        stored: MultiRingStored,
         range: Range<u64>,
-    ) -> SidecarObjectWriter {
-        SidecarObjectWriter {
+    ) -> MultiRingObjectWriter {
+        MultiRingObjectWriter {
             store: self.clone(),
             stored,
             range,
@@ -1274,13 +1279,13 @@ impl SidecarStore {
 /// [`DirectWrite`] implementation for streaming a stored object from NVMe
 /// drives to the client socket with read-ahead windowing, zero-copy `send_zc`
 /// (large remote objects), and coalesced header+body vectored send (small objects).
-pub(crate) struct SidecarObjectWriter {
-    store: Arc<SidecarStore>,
-    stored: SidecarStored,
+pub(crate) struct MultiRingObjectWriter {
+    store: Arc<MultiRingStore>,
+    stored: MultiRingStored,
     range: Range<u64>,
 }
 
-impl DirectWrite for SidecarObjectWriter {
+impl DirectWrite for MultiRingObjectWriter {
     fn write_to<'a>(
         self: Box<Self>,
         sink: &'a mut BodySink<'a>,
@@ -1293,7 +1298,7 @@ impl DirectWrite for SidecarObjectWriter {
             // 4 KiB header in `open_object` — zero extra disk read, zero extra
             // buffer acquire, and coalesced with HTTP response headers!
             if let Some(buf) = self.stored.inline {
-                let seg = [tokio_sidecar::Segment {
+                let seg = [tokio_multiring::Segment {
                     buf: 0,
                     start: HEADER + self.range.start as usize,
                     len: (self.range.end - self.range.start) as usize,

@@ -8,24 +8,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio_sidecar::{Config, Sidecar};
+use tokio_multiring::{Config, MultiRing};
 
-/// A runtime of four workers that a sidecar drives, and the sidecar.
-fn runtime(config: Config) -> (tokio::runtime::Runtime, Sidecar) {
+/// A runtime of four workers that a multiring drives, and the multiring.
+fn runtime(config: Config) -> (tokio::runtime::Runtime, MultiRing) {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(4).enable_time();
-    let sidecar = Sidecar::install(&mut builder, config);
-    (builder.build().unwrap(), sidecar)
+    let multiring = MultiRing::install(&mut builder, config);
+    (builder.build().unwrap(), multiring)
 }
 
 /// A runtime whose rings are flushed only when a worker goes to sleep or
 /// the runtime has it look at its ring.
-fn runtime_without_hook(config: Config) -> (tokio::runtime::Runtime, Sidecar) {
+fn runtime_without_hook(config: Config) -> (tokio::runtime::Runtime, MultiRing) {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(4).enable_time();
-    let sidecar = Sidecar::install(&mut builder, config);
+    let multiring = MultiRing::install(&mut builder, config);
     builder.on_before_steal(|| ());
-    (builder.build().unwrap(), sidecar)
+    (builder.build().unwrap(), multiring)
 }
 
 fn socket_pair() -> (Arc<OwnedFd>, UnixStream) {
@@ -33,9 +33,9 @@ fn socket_pair() -> (Arc<OwnedFd>, UnixStream) {
     (Arc::new(OwnedFd::from(reader)), writer)
 }
 
-async fn wait_for_idle(sidecar: &Sidecar) {
+async fn wait_for_idle(multiring: &MultiRing) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        while sidecar.in_flight() != 0 {
+        while multiring.in_flight() != 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
@@ -45,9 +45,9 @@ async fn wait_for_idle(sidecar: &Sidecar) {
 
 #[test]
 fn nop_on_a_worker() {
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
-        tokio::spawn(async move { sidecar.nop().await })
+        tokio::spawn(async move { multiring.nop().await })
             .await
             .unwrap()
             .unwrap();
@@ -57,11 +57,11 @@ fn nop_on_a_worker() {
 #[test]
 fn works_without_the_hook() {
     let (reader, mut writer) = socket_pair();
-    let (runtime, sidecar) = runtime_without_hook(Config::default());
+    let (runtime, multiring) = runtime_without_hook(Config::default());
     runtime.block_on(async {
         let read = tokio::spawn(async move {
-            sidecar.nop().await.unwrap();
-            sidecar.read_at(reader, Vec::with_capacity(16), 0).await
+            multiring.nop().await.unwrap();
+            multiring.read_at(reader, Vec::with_capacity(16), 0).await
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -83,14 +83,14 @@ fn works_without_the_hook() {
 fn a_worker_does_not_sleep_on_what_it_just_woke() {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(1);
-    let sidecar = Sidecar::install(&mut builder, Config::default());
+    let multiring = MultiRing::install(&mut builder, Config::default());
     builder.on_before_steal(|| ());
     let runtime = builder.build().unwrap();
 
     let (done, finished) = std::sync::mpsc::channel();
     runtime.spawn(async move {
         for _ in 0..100 {
-            sidecar.nop().await.unwrap();
+            multiring.nop().await.unwrap();
         }
         done.send(()).unwrap();
     });
@@ -127,7 +127,7 @@ fn busy_worker_still_flushes() {
         sq_entries: SQ_ENTRIES as u32,
         ..Config::default()
     };
-    let sidecar = Sidecar::install(&mut builder, config);
+    let multiring = MultiRing::install(&mut builder, config);
     let runtime = builder.build().unwrap();
     runtime.block_on(async {
         tokio::spawn(async move {
@@ -135,10 +135,10 @@ fn busy_worker_still_flushes() {
             let done = Arc::new(AtomicUsize::new(0));
             let nops: Vec<_> = (0..OPS)
                 .map(|_| {
-                    let sidecar = sidecar.clone();
+                    let multiring = multiring.clone();
                     let done = done.clone();
                     tokio::spawn(async move {
-                        sidecar.nop().await.unwrap();
+                        multiring.nop().await.unwrap();
                         done.fetch_add(1, Ordering::Relaxed);
                     })
                 })
@@ -166,17 +166,17 @@ fn busy_worker_still_flushes() {
 /// submissions are handed to a worker.
 #[test]
 fn nop_off_worker() {
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         for _ in 0..16 {
-            sidecar.nop().await.unwrap();
+            multiring.nop().await.unwrap();
         }
     });
 }
 
 #[test]
 fn file_round_trip() {
-    let path = std::env::temp_dir().join(format!("tokio-sidecar-{}", std::process::id()));
+    let path = std::env::temp_dir().join(format!("tokio-multiring-{}", std::process::id()));
     let file = std::fs::File::options()
         .read(true)
         .write(true)
@@ -186,19 +186,19 @@ fn file_round_trip() {
     std::fs::remove_file(&path).unwrap();
     let fd = Arc::new(OwnedFd::from(file));
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         tokio::spawn(async move {
-            let (written, _) = sidecar
-                .write_at(fd.clone(), b"hello sidecar".to_vec(), 0)
+            let (written, _) = multiring
+                .write_at(fd.clone(), b"hello multiring".to_vec(), 0)
                 .await;
-            assert_eq!(written.unwrap(), 13);
+            assert_eq!(written.unwrap(), 15);
 
             let mut buf = Vec::with_capacity(64);
             buf.extend_from_slice(b"> ");
-            let (read, buf) = sidecar.read_at(fd, buf, 6).await;
-            assert_eq!(read.unwrap(), 7);
-            assert_eq!(buf, b"> sidecar");
+            let (read, buf) = multiring.read_at(fd, buf, 6).await;
+            assert_eq!(read.unwrap(), 9);
+            assert_eq!(buf, b"> multiring");
         })
         .await
         .unwrap();
@@ -210,10 +210,10 @@ fn file_round_trip() {
 #[test]
 fn completion_wakes_a_parked_worker() {
     let (reader, mut writer) = socket_pair();
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         let read =
-            tokio::spawn(async move { sidecar.read_at(reader, Vec::with_capacity(16), 0).await });
+            tokio::spawn(async move { multiring.read_at(reader, Vec::with_capacity(16), 0).await });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         std::thread::spawn(move || writer.write_all(b"late").unwrap());
@@ -230,9 +230,9 @@ fn completion_wakes_a_parked_worker() {
 #[test]
 fn drop_cancels_on_the_same_worker() {
     let (reader, _writer) = socket_pair();
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
-        let handle = sidecar.clone();
+        let handle = multiring.clone();
         tokio::spawn(async move {
             let read = handle.read_at(reader, Vec::with_capacity(16), 0);
             assert!(
@@ -243,7 +243,7 @@ fn drop_cancels_on_the_same_worker() {
         })
         .await
         .unwrap();
-        wait_for_idle(&sidecar).await;
+        wait_for_idle(&multiring).await;
     });
 }
 
@@ -252,15 +252,15 @@ fn drop_cancels_on_the_same_worker() {
 #[test]
 fn drop_cancels_from_another_thread() {
     let (reader, _writer) = socket_pair();
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
-        let read = sidecar.read_at(reader, Vec::with_capacity(16), 0);
+        let read = multiring.read_at(reader, Vec::with_capacity(16), 0);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), read)
                 .await
                 .is_err()
         );
-        wait_for_idle(&sidecar).await;
+        wait_for_idle(&multiring).await;
     });
 }
 
@@ -269,9 +269,9 @@ fn drop_cancels_from_another_thread() {
 #[test]
 fn drop_on_another_thread_cancels_a_local_submission() {
     let (reader, _writer) = socket_pair();
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
-        let handle = sidecar.clone();
+        let handle = multiring.clone();
         let (parked, read) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let mut read = Box::pin(handle.read_at(reader, Vec::with_capacity(16), 0));
@@ -285,10 +285,10 @@ fn drop_on_another_thread_cancels_a_local_submission() {
         .await
         .unwrap();
         let read = read.await.unwrap();
-        assert_eq!(sidecar.in_flight(), 1);
+        assert_eq!(multiring.in_flight(), 1);
 
         drop(read);
-        wait_for_idle(&sidecar).await;
+        wait_for_idle(&multiring).await;
     });
 }
 
@@ -298,7 +298,7 @@ fn drop_on_another_thread_cancels_a_local_submission() {
 fn completion_races_with_poll_and_drop_on_other_threads() {
     type Boxed = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Boxed>();
 
@@ -332,11 +332,11 @@ fn completion_races_with_poll_and_drop_on_other_threads() {
 
         let producers: Vec<_> = (0..3)
             .map(|_| {
-                let sidecar = sidecar.clone();
+                let multiring = multiring.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     for round in 0..20_000 {
-                        let mut op: Boxed = Box::pin(sidecar.nop());
+                        let mut op: Boxed = Box::pin(multiring.nop());
                         std::future::poll_fn(|cx| {
                             let _ = op.as_mut().poll(cx);
                             Poll::Ready(())
@@ -360,7 +360,7 @@ fn completion_races_with_poll_and_drop_on_other_threads() {
             drop(tx);
             consumer.await.unwrap();
         }
-        wait_for_idle(&sidecar).await;
+        wait_for_idle(&multiring).await;
     });
 }
 
@@ -372,12 +372,12 @@ fn completion_races_with_poll_and_drop_on_other_threads() {
 fn delivery_races_with_drop_and_repoll() {
     type Read = Pin<Box<dyn Future<Output = (std::io::Result<usize>, Vec<u8>)> + Send>>;
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         for round in 0..3000u32 {
             let (reader, mut writer) = socket_pair();
             let (parked, read) = tokio::sync::oneshot::channel::<Read>();
-            let handle = sidecar.clone();
+            let handle = multiring.clone();
             tokio::spawn(async move {
                 let mut read: Read = Box::pin(handle.read_at(reader, Vec::with_capacity(4), 0));
                 std::future::poll_fn(|cx| {
@@ -408,7 +408,7 @@ fn delivery_races_with_drop_and_repoll() {
                 assert_eq!(buf, b"x");
             }
         }
-        wait_for_idle(&sidecar).await;
+        wait_for_idle(&multiring).await;
     });
 }
 
@@ -416,14 +416,14 @@ fn delivery_races_with_drop_and_repoll() {
 /// polled to completion on a different thread than the one that submitted.
 #[test]
 fn many_tasks_across_workers() {
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         let tasks: Vec<_> = (0..256)
             .map(|_| {
-                let sidecar = sidecar.clone();
+                let multiring = multiring.clone();
                 tokio::spawn(async move {
                     for _ in 0..200 {
-                        sidecar.nop().await.unwrap();
+                        multiring.nop().await.unwrap();
                         tokio::task::yield_now().await;
                     }
                 })
@@ -432,20 +432,20 @@ fn many_tasks_across_workers() {
         for task in tasks {
             task.await.unwrap();
         }
-        assert_eq!(sidecar.in_flight(), 0);
+        assert_eq!(multiring.in_flight(), 0);
     });
 }
 
 /// More submissions in one batch than the ring has entries.
 #[test]
 fn submission_queue_overflow() {
-    let (runtime, sidecar) = runtime(Config {
+    let (runtime, multiring) = runtime(Config {
         sq_entries: 8,
         ..Config::default()
     });
     runtime.block_on(async {
         tokio::spawn(async move {
-            let nops: Vec<_> = (0..1000).map(|_| tokio::spawn(sidecar.nop())).collect();
+            let nops: Vec<_> = (0..1000).map(|_| tokio::spawn(multiring.nop())).collect();
             for nop in nops {
                 nop.await.unwrap().unwrap();
             }
@@ -456,15 +456,15 @@ fn submission_queue_overflow() {
 }
 
 #[test]
-fn a_sidecar_drives_one_runtime() {
+fn a_multiring_drives_one_runtime() {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
-    let sidecar = Sidecar::install(&mut builder, Config::default());
+    let multiring = MultiRing::install(&mut builder, Config::default());
     let runtime = builder.build().unwrap();
     let second = builder.build().err().unwrap();
     assert_eq!(second.kind(), std::io::ErrorKind::AlreadyExists);
 
     runtime.block_on(async {
-        tokio::spawn(async move { sidecar.nop().await })
+        tokio::spawn(async move { multiring.nop().await })
             .await
             .unwrap()
             .unwrap();

@@ -6,7 +6,7 @@ use std::io;
 use std::ops::Range;
 
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
-use tokio_sidecar::{FixedBuf, Reclaim};
+use tokio_multiring::{FixedBuf, Reclaim};
 use ureq_proto::server::state::{ProvideResponse, RecvBody, Send100, SendBody};
 use ureq_proto::server::{RecvRequestResult, Reply, SendResponseResult};
 

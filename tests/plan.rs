@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use tokio_sidecar::{Domain, Hyperthreads, Plan};
+use tokio_multiring::{Domain, Hyperthreads, Plan};
 
 /// The CPUs the calling thread may run on.
 fn affinity() -> Vec<u32> {

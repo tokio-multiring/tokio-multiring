@@ -3,14 +3,14 @@ use std::io::ErrorKind;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
-use tokio_sidecar::{Config, Sidecar};
+use tokio_multiring::{Config, MultiRing};
 
-/// A runtime of two workers that a sidecar drives, and the sidecar.
-fn runtime(config: Config) -> (tokio::runtime::Runtime, Sidecar) {
+/// A runtime of two workers that a multiring drives, and the multiring.
+fn runtime(config: Config) -> (tokio::runtime::Runtime, MultiRing) {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(2).enable_time();
-    let sidecar = Sidecar::install(&mut builder, config);
-    (builder.build().unwrap(), sidecar)
+    let multiring = MultiRing::install(&mut builder, config);
+    (builder.build().unwrap(), multiring)
 }
 
 /// A fresh directory, and a descriptor for it.
@@ -29,27 +29,33 @@ fn c(path: &str) -> CString {
 #[test]
 fn a_files_life() {
     let (path, dir) = scratch_dir("life");
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
-        sidecar
+        multiring
             .mkdir_at(dir.clone(), c("sub"), 0o755)
             .await
             .unwrap();
-        let again = sidecar.mkdir_at(dir.clone(), c("sub"), 0o755).await;
+        let again = multiring.mkdir_at(dir.clone(), c("sub"), 0o755).await;
         assert_eq!(again.unwrap_err().kind(), ErrorKind::AlreadyExists);
-        assert!(sidecar.stat_at(dir.clone(), c("sub")).await.unwrap().is_dir);
+        assert!(
+            multiring
+                .stat_at(dir.clone(), c("sub"))
+                .await
+                .unwrap()
+                .is_dir
+        );
 
         let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
-        let file = sidecar.open_at(dir.clone(), c("sub/draft"), flags, 0o644);
+        let file = multiring.open_at(dir.clone(), c("sub/draft"), flags, 0o644);
         let file = Arc::new(file.await.unwrap());
-        let (written, _) = sidecar
+        let (written, _) = multiring
             .write_at(file.clone(), b"hello, files".to_vec(), 0)
             .await;
         assert_eq!(written.unwrap(), 12);
 
-        sidecar.truncate(file.clone(), 5).await.unwrap();
-        sidecar.fdatasync(file.clone()).await.unwrap();
-        let stat = sidecar.stat(file.clone()).await.unwrap();
+        multiring.truncate(file.clone(), 5).await.unwrap();
+        multiring.fdatasync(file.clone()).await.unwrap();
+        let stat = multiring.stat(file.clone()).await.unwrap();
         assert_eq!(stat.size, 5);
         assert!(!stat.is_dir);
         let now = std::time::SystemTime::now()
@@ -58,27 +64,30 @@ fn a_files_life() {
             .as_secs() as i64;
         assert!((now - 60..=now + 60).contains(&stat.modified.0));
 
-        sidecar
+        multiring
             .rename_at(dir.clone(), c("sub/draft"), c("sub/final"))
             .await
             .unwrap();
-        let gone = sidecar.stat_at(dir.clone(), c("sub/draft")).await;
+        let gone = multiring.stat_at(dir.clone(), c("sub/draft")).await;
         assert_eq!(gone.unwrap_err().kind(), ErrorKind::NotFound);
         assert_eq!(
-            sidecar.stat_at(dir.clone(), c("sub/final")).await.unwrap(),
+            multiring
+                .stat_at(dir.clone(), c("sub/final"))
+                .await
+                .unwrap(),
             stat
         );
         assert_eq!(std::fs::read(path.join("sub/final")).unwrap(), b"hello");
 
-        let busy = sidecar.rmdir_at(dir.clone(), c("sub")).await;
+        let busy = multiring.rmdir_at(dir.clone(), c("sub")).await;
         assert_eq!(busy.unwrap_err().kind(), ErrorKind::DirectoryNotEmpty);
-        sidecar
+        multiring
             .unlink_at(dir.clone(), c("sub/final"))
             .await
             .unwrap();
-        let gone = sidecar.unlink_at(dir.clone(), c("sub/final")).await;
+        let gone = multiring.unlink_at(dir.clone(), c("sub/final")).await;
         assert_eq!(gone.unwrap_err().kind(), ErrorKind::NotFound);
-        sidecar.rmdir_at(dir.clone(), c("sub")).await.unwrap();
+        multiring.rmdir_at(dir.clone(), c("sub")).await.unwrap();
     });
     assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
     std::fs::remove_dir(&path).unwrap();
@@ -87,9 +96,9 @@ fn a_files_life() {
 #[test]
 fn opening_a_missing_file_fails() {
     let (path, dir) = scratch_dir("missing");
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
-        let missing = sidecar.open_at(dir, c("nope"), libc::O_RDONLY, 0).await;
+        let missing = multiring.open_at(dir, c("nope"), libc::O_RDONLY, 0).await;
         assert_eq!(missing.unwrap_err().kind(), ErrorKind::NotFound);
     });
     std::fs::remove_dir(&path).unwrap();

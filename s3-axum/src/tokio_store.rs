@@ -1,5 +1,5 @@
 //! Standard mainline Tokio storage backend (`spawn_blocking` + `std::fs`)
-//! using the exact same on-disk striped format as [`crate::sidecar_store`].
+//! using the exact same on-disk striped format as [`crate::multiring_store`].
 //!
 //! Supports both idiomatic buffered page-cache I/O (`direct = false`, the
 //! default for mainline Tokio apps) and `O_DIRECT` blocking I/O (`direct = true`)
@@ -22,8 +22,8 @@ use axum::body::Body;
 use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
 use http_body_util::BodyExt;
+use multiring_axum::DirectBody;
 use sha2::{Digest, Sha256};
-use sidecar_axum::DirectBody;
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, spawn_blocking};

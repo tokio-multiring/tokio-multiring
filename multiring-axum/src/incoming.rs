@@ -1,8 +1,8 @@
-//! Request-body bridge between `ureq-proto` + `tokio-sidecar` and Axum.
+//! Request-body bridge between `ureq-proto` + `tokio-multiring` and Axum.
 //!
 //! Two interfaces share the same underlying connection handoff slot:
 //!
-//! - [`SidecarIncoming`] implements [`http_body::Body`] so every standard Axum
+//! - [`MultiRingIncoming`] implements [`http_body::Body`] so every standard Axum
 //!   extractor (`Bytes`, `String`, `Json`, `Body`, Tower middleware) works
 //!   unmodified.
 //! - [`DirectBody`] implements [`axum::extract::FromRequest`] so handlers that
@@ -20,7 +20,7 @@ use axum::body::Body;
 use axum::extract::{FromRequest, Request};
 use bytes::{Bytes, BytesMut};
 use http_body::{Frame, SizeHint};
-use tokio_sidecar::{FixedBuf, Segment};
+use tokio_multiring::{FixedBuf, Segment};
 use ureq_proto::server::Reply;
 use ureq_proto::server::state::{RecvBody, Send100};
 
@@ -42,7 +42,7 @@ pub(crate) struct ActiveConn {
     pub(crate) io_error: bool,
 }
 
-/// Shared handoff slot between the connection driver, [`SidecarIncoming`],
+/// Shared handoff slot between the connection driver, [`MultiRingIncoming`],
 /// and [`DirectBody`]. Uncontended during normal HTTP/1.1 execution.
 #[derive(Clone)]
 pub(crate) struct ConnSlot {
@@ -68,7 +68,7 @@ impl ConnSlot {
     }
 }
 
-/// Request extension inserted by `sidecar-axum` when a request has a body.
+/// Request extension inserted by `multiring-axum` when a request has a body.
 #[derive(Clone)]
 pub(crate) struct DirectBodySlot(pub(crate) ConnSlot);
 
@@ -162,7 +162,7 @@ pub(crate) async fn read_body_into(
 
 /// Extractor for direct io_uring request body reception.
 ///
-/// When running on `sidecar-axum`, this claims the underlying connection and
+/// When running on `multiring-axum`, this claims the underlying connection and
 /// `ureq-proto` body state directly — enabling zero-copy `recv_vectored` into
 /// registered [`FixedBuf`]s and explicit `Expect: 100-continue` approval.
 ///
@@ -174,7 +174,7 @@ pub enum DirectBody {
     /// Request has no body (e.g. `Content-Length: 0` or GET).
     Empty,
     /// Live io_uring connection + `ureq-proto` body state.
-    Direct(SidecarDirectBody),
+    Direct(MultiRingDirectBody),
     /// Standard Axum body (when served by Hyper / `axum::serve` or after a
     /// body-wrapping middleware).
     Fallback(Body),
@@ -187,7 +187,7 @@ impl<S: Send + Sync> FromRequest<S> for DirectBody {
         if let Some(DirectBodySlot(slot)) = req.extensions_mut().remove::<DirectBodySlot>()
             && let Some(active) = slot.take()
         {
-            return Ok(DirectBody::Direct(SidecarDirectBody {
+            return Ok(DirectBody::Direct(MultiRingDirectBody {
                 slot,
                 active: Some(active),
             }));
@@ -205,12 +205,12 @@ impl<S: Send + Sync> FromRequest<S> for DirectBody {
 ///
 /// Returns the connection to the server automatically on drop so the server
 /// can send the response (or reject/discard/abandon an unread body).
-pub struct SidecarDirectBody {
+pub struct MultiRingDirectBody {
     slot: ConnSlot,
     active: Option<Box<ActiveConn>>,
 }
 
-impl SidecarDirectBody {
+impl MultiRingDirectBody {
     fn active(&self) -> &ActiveConn {
         self.active
             .as_deref()
@@ -309,7 +309,7 @@ impl SidecarDirectBody {
     }
 }
 
-impl Drop for SidecarDirectBody {
+impl Drop for MultiRingDirectBody {
     fn drop(&mut self) {
         if let Some(active) = self.active.take() {
             self.slot.put(active);
@@ -330,12 +330,12 @@ enum IncomingState {
 }
 
 /// [`http_body::Body`] adapter for standard Axum request body extractors.
-pub(crate) struct SidecarIncoming {
+pub(crate) struct MultiRingIncoming {
     state: IncomingState,
     remaining_hint: Option<u64>,
 }
 
-impl SidecarIncoming {
+impl MultiRingIncoming {
     pub(crate) fn new(slot: ConnSlot, remaining_hint: Option<u64>) -> Self {
         Self {
             state: IncomingState::Idle(slot),
@@ -344,7 +344,7 @@ impl SidecarIncoming {
     }
 }
 
-impl http_body::Body for SidecarIncoming {
+impl http_body::Body for MultiRingIncoming {
     type Data = Bytes;
     type Error = io::Error;
 

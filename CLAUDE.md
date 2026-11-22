@@ -1,33 +1,33 @@
-# tokio-sidecar, sidecar-s3, sidecar-axum and s3-axum
+# tokio-multiring, multiring-s3, multiring-axum and s3-axum
 
 Four crates in one workspace:
 
-- **`tokio-sidecar`** (repo root): an io_uring reactor that drives a tokio
+- **`tokio-multiring`** (repo root): an io_uring reactor that drives a tokio
   runtime in place of tokio's own I/O driver, one ring per worker. Workers
   sleep in their rings, tokio's sockets are watched by them, and the crate's
   own operations go straight onto them. Operation futures are `Send`; buffers
   and descriptors move into an operation and come back with its result.
-- **`sidecar-s3`** (`s3/`): hand-rolled S3-style object server built on it,
+- **`multiring-s3`** (`s3/`): hand-rolled S3-style object server built on it,
   speaking HTTP through the server half of ureq-proto. Kept as the zero-overhead
   reference baseline.
-- **`sidecar-axum`** (`sidecar-axum/`): serves any real `axum::Router`
+- **`multiring-axum`** (`multiring-axum/`): serves any real `axum::Router`
   (`tower_service::Service<Request<Body>, Response = Response<Body>>`) over
-  `tokio-sidecar` and `ureq-proto` — no Hyper and no Axum fork. Standard Axum
+  `tokio-multiring` and `ureq-proto` — no Hyper and no Axum fork. Standard Axum
   extractors, responses, and Tower middleware work unmodified; handlers can opt
   into `DirectBody` (`FromRequest`, transparent fallback to `axum::body::Body`
   on Hyper) and `DirectResponse` / `DirectWrite` (`IntoResponse`) for registered
   buffers, coalesced head+body vectored sends, and `send_zc_vectored`.
 - **`s3-axum`** (`s3-axum/`): unified Axum S3 app (one `axum::Router`,
   middleware, `ListBuckets`/`ListObjectsV2`, optional AWS SigV4 + `aws-chunked`)
-  running on **three** runtimes/backends: `--runtime sidecar` (`tokio-sidecar`
-  + `sidecar-axum`, interrupt-driven `io_uring`, no IOPOLL threads),
+  running on **three** runtimes/backends: `--runtime multiring` (`tokio-multiring`
+  + `multiring-axum`, interrupt-driven `io_uring`, no IOPOLL threads),
   `--runtime tokio` (standard Tokio mio/epoll + `axum::serve`/Hyper +
   `spawn_blocking`), and `--runtime tokio-uring` (mainline Tokio's experimental
   `io-uring` `tokio::fs` + `axum::serve`/Hyper). All three share the exact same
   on-disk striped format and interoperate directly.
 
 The repository is local only: no remote, nothing published. Work in small,
-focused commits. The branch `axum-s3` adds `sidecar-axum` and `s3-axum` on top
+focused commits. The branch `axum-s3` adds `multiring-axum` and `s3-axum` on top
 of `io-driver`; `main` is the state before the reactor-driver move.
 
 ## Build and test
@@ -51,7 +51,7 @@ RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --offline --workspace 
   `target/{debug,release}/deps/`) at least 30 times in both profiles. A new
   test for a race should be shown to fail when the fix is removed.
 - The integration tests write under `target/tmp/` and do not clean up.
-- `tests/disk.rs` uses a file by default. `SIDECAR_SCRATCH_DEVICE=/dev/...`
+- `tests/disk.rs` uses a file by default. `MULTIRING_SCRATCH_DEVICE=/dev/...`
   points it at a block device, whose first blocks it **overwrites**.
 
 ## Dependencies that are not from crates.io
@@ -59,15 +59,15 @@ RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --offline --workspace 
 | Crate | Source | Why |
 |---|---|---|
 | tokio | path `../tokio-io-reactor-wl/tokio`, branch `io-reactor-wl` (`io-reactor` merged with `local-worker-v3` `ff2d7368`; `[patch.crates-io]` unifies axum/hyper-util onto it) | the reactor seam (`runtime::reactor::Reactor`, `Builder::io_reactor`) and upgraded worker-local tasks (`spawn_worker_local`, `run_on_each_worker`, `run_on_any_worker`, `worker_local_queue_interval`); uses stock crates.io `mio` |
-| ureq-proto | `../ureq-proto-combined`, branch `axum-proto` (for `sidecar-axum`); `s3/` keeps `combined-0.7.1` rev `29bb652` | server state machine with HTTP/1.0 framing, strict transfer-encoding, any-final-status `Send100::reject`, and chunked finish capacity check |
+| ureq-proto | `../ureq-proto-combined`, branch `axum-proto` (for `multiring-axum`); `s3/` keeps `combined-0.7.1` rev `29bb652` | server state machine with HTTP/1.0 framing, strict transfer-encoding, any-final-status `Send100::reject`, and chunked finish capacity check |
 
 ## Layout
 
 ```
-src/reactor.rs   Sidecar and its `Reactor` impl for tokio, per-worker `Worker`, the turn loop, sleeping, watches, disk rings
+src/reactor.rs   MultiRing and its `Reactor` impl for tokio, per-worker `Worker`, the turn loop, sleeping, watches, disk rings
 src/landing.rs   arbitration between a future and the reactor (read its module docs first)
 src/op.rs        Operation enum (one variant per kind of I/O), Op future, Completion
-src/ops.rs       the public operations on Sidecar
+src/ops.rs       the public operations on MultiRing
 src/buffers.rs   BufferPool, FixedBuf
 src/net.rs       TcpListener, TcpStream: sockets in the mode the rings need
 src/plan.rs      Plan: which CPU each runtime thread runs on
@@ -83,25 +83,25 @@ s3/src/join.rs   join_all, and Started (poll once now, finish later)
 s3/src/main.rs   the binary and its flags
 s3/examples/load.rs      HTTP load generator
 
-sidecar-axum/src/server.rs    HTTP/1.1 connection driver for axum Routers (worker-local via run_on_any_worker, idle_timeout)
-sidecar-axum/src/incoming.rs  SidecarIncoming (http_body::Body) and DirectBody (FromRequest fast path + Hyper fallback)
-sidecar-axum/src/outgoing.rs  DirectWrite / DirectResponse / BodySink (coalesced head+body send_vectored, send_zero_copy)
-sidecar-axum/src/conn.rs      buffered connection over Sidecar
+multiring-axum/src/server.rs    HTTP/1.1 connection driver for axum Routers (worker-local via run_on_any_worker, idle_timeout)
+multiring-axum/src/incoming.rs  MultiRingIncoming (http_body::Body) and DirectBody (FromRequest fast path + Hyper fallback)
+multiring-axum/src/outgoing.rs  DirectWrite / DirectResponse / BodySink (coalesced head+body send_vectored, send_zero_copy)
+multiring-axum/src/conn.rs      buffered connection over MultiRing
 
 s3-axum/src/app.rs            unified Axum S3 Router, handlers, ListBuckets/ListObjectsV2, request-id/timing/SigV4 middleware
 s3-axum/src/sigv4.rs          AWS4-HMAC-SHA256 verification and streaming aws-chunked decoder (signed & unsigned, trailers)
-s3-axum/src/sidecar_store.rs  io_uring O_DIRECT store (inline small GET, single-write small PUT, statx overwrite fast path)
+s3-axum/src/multiring_store.rs  io_uring O_DIRECT store (inline small GET, single-write small PUT, statx overwrite fast path)
 s3-axum/src/tokio_store.rs       standard Tokio spawn_blocking store (same striped layout; buffered or --direct)
 s3-axum/src/tokio_uring_store.rs mainline Tokio io-uring tokio::fs store (single shared ring behind epoll)
-s3-axum/src/main.rs              CLI launching --runtime sidecar|tokio|tokio-uring
+s3-axum/src/main.rs              CLI launching --runtime multiring|tokio|tokio-uring
 ```
 
 ## Design decisions (settled with Louis; do not relitigate)
 
-**Sidecar**
+**MultiRing**
 
-- The sidecar is the runtime's I/O reactor (Louis, 2026-11-20): it
-  implements `tokio::runtime::reactor::Reactor`, and `Sidecar::install` puts
+- `MultiRing` is the runtime's I/O reactor (Louis, 2026-11-20): it
+  implements `tokio::runtime::reactor::Reactor`, and `MultiRing::install` puts
   it on a runtime builder. Tokio's own mio/epoll driver is not constructed, so
   there is no epoll and `tokio::signal` and `tokio::process` panic on such a
   runtime.
@@ -212,7 +212,7 @@ never by `nvmeXnY`. The other namespace on each drive is half of md0
 (`/data/bio`, family data).
 
 ```sh
-target/release/sidecar-s3 --root /srv/sidecar-s3/d0 --root /srv/sidecar-s3/d1 \
+target/release/multiring-s3 --root /srv/sidecar-s3/d0 --root /srv/sidecar-s3/d1 \
     --listen 127.0.0.1:19000 --domains 4 [--polled] [--zero-copy never|remote|always]
 ```
 
@@ -261,7 +261,7 @@ workers share it.
 
 Unified Axum S3 (`s3-axum`, same `axum::Router` + middleware, **zero IOPOLL threads**, November 2026):
 
-| Case | `s3-axum` (`sidecar`) | `s3-axum` (`tokio-uring`) | `s3-axum` (`tokio --direct`) | `s3-axum` (`tokio` buffered) |
+| Case | `s3-axum` (`multiring`) | `s3-axum` (`tokio-uring`) | `s3-axum` (`tokio --direct`) | `s3-axum` (`tokio` buffered) |
 |---|---|---|---|---|
 | GET 16 MiB over 100G, 2w, 16c | **11.75 GiB/s** (100G wire), p99 26.5 ms, **1.10c** | 2.14 GiB/s, p99 150 ms, 1.75c | 3.05 GiB/s, p99 133 ms, 1.86c | 2.82 GiB/s, p99 146 ms, 1.86c |
 | GET 16 MiB over 100G, 1w, 16c | **8.80 GiB/s** (~74 Gbps), p99 32.5 ms, **0.85c** | 1.60 GiB/s, p99 197 ms, 0.93c | 1.73 GiB/s, p99 318 ms, 0.94c | 1.73 GiB/s, p99 219 ms, 0.93c |

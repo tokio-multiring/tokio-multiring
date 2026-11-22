@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use sidecar_s3::{Config, Server, ZeroCopy};
-use tokio_sidecar::{BufferPool, DiskConfig, Hyperthreads, Plan, Sidecar};
+use multiring_s3::{Config, Server, ZeroCopy};
+use tokio_multiring::{BufferPool, DiskConfig, Hyperthreads, MultiRing, Plan};
 
 const USAGE: &str = "\
-usage: sidecar-s3 --root DIR [--root DIR ...] [options]
+usage: multiring-s3 --root DIR [--root DIR ...] [options]
 
   --root DIR            directory the buckets live in. Given once per drive,
                         objects are striped over the drives. The roots, their
@@ -139,16 +139,16 @@ fn run(options: Options) -> std::io::Result<()> {
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_time();
-    let rings = tokio_sidecar::Config {
+    let rings = tokio_multiring::Config {
         buffers: Some(buffers),
         disk: options.polled.then(|| DiskConfig {
             sq_entries: 256,
             sq_thread_idle: Duration::from_millis(100),
             plan: plan.clone(),
         }),
-        ..tokio_sidecar::Config::default()
+        ..tokio_multiring::Config::default()
     };
-    let sidecar = Sidecar::install(&mut builder, rings);
+    let multiring = MultiRing::install(&mut builder, rings);
     let runtime = plan.build(&mut builder)?;
 
     runtime.block_on(async {
@@ -161,7 +161,7 @@ fn run(options: Options) -> std::io::Result<()> {
             config.window = window;
         }
         config.zero_copy = options.zero_copy;
-        Server::new(sidecar, config)?.listen(listener);
+        Server::new(multiring, config)?.listen(listener);
         let roots: Vec<_> = options.roots.iter().map(|root| root.display()).collect();
         log::info!(
             "serving {roots:?} on http://{address} with {workers} workers in {domains} domains, {}",
@@ -189,7 +189,7 @@ fn main() -> ExitCode {
     match run(options) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("sidecar-s3: {error}");
+            eprintln!("multiring-s3: {error}");
             ExitCode::FAILURE
         }
     }

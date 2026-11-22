@@ -1,4 +1,4 @@
-//! What tokio itself gets from a runtime that a sidecar drives: its own
+//! What tokio itself gets from a runtime that a multiring drives: its own
 //! sockets are watched by the rings, its workers sleep in them, and its
 //! timers still fire.
 
@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_sidecar::{BufferPool, Config, Sidecar};
+use tokio_multiring::{BufferPool, Config, MultiRing};
 
-/// A runtime with this many workers that a sidecar drives, and the sidecar.
-fn runtime(workers: usize, config: Config) -> (tokio::runtime::Runtime, Sidecar) {
+/// A runtime with this many workers that a multiring drives, and the multiring.
+fn runtime(workers: usize, config: Config) -> (tokio::runtime::Runtime, MultiRing) {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(workers).enable_time();
-    let sidecar = Sidecar::install(&mut builder, config);
-    (builder.build().unwrap(), sidecar)
+    let multiring = MultiRing::install(&mut builder, config);
+    (builder.build().unwrap(), multiring)
 }
 
 fn loopback() -> SocketAddr {
@@ -71,13 +71,13 @@ async fn echo(clients: usize, rounds: usize) {
 
 #[test]
 fn tokios_sockets_are_served() {
-    let (runtime, _sidecar) = runtime(4, Config::default());
+    let (runtime, _multiring) = runtime(4, Config::default());
     runtime.block_on(echo(32, 50));
 }
 
 #[test]
 fn tokios_sockets_are_served_by_a_single_worker() {
-    let (runtime, _sidecar) = runtime(1, Config::default());
+    let (runtime, _multiring) = runtime(1, Config::default());
     runtime.block_on(echo(8, 20));
 }
 
@@ -85,7 +85,7 @@ fn tokios_sockets_are_served_by_a_single_worker() {
 /// ring, so a worker is asked to watch it. Dropping it there asks again.
 #[test]
 fn a_socket_of_a_thread_without_a_ring_is_watched() {
-    let (runtime, _sidecar) = runtime(2, Config::default());
+    let (runtime, _multiring) = runtime(2, Config::default());
     runtime.block_on(async {
         for _ in 0..8 {
             let listener = TcpListener::bind(loopback()).await.unwrap();
@@ -106,7 +106,7 @@ fn a_socket_of_a_thread_without_a_ring_is_watched() {
 /// Here another worker, or the `block_on` thread, ends up dropping it.
 #[test]
 fn a_socket_can_be_dropped_away_from_its_ring() {
-    let (runtime, _sidecar) = runtime(4, Config::default());
+    let (runtime, _multiring) = runtime(4, Config::default());
     runtime.block_on(async {
         let listener = TcpListener::bind(loopback()).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -126,7 +126,7 @@ fn a_socket_can_be_dropped_away_from_its_ring() {
     });
 }
 
-/// The same task uses a socket of tokio's and operations of the sidecar,
+/// The same task uses a socket of tokio's and operations of the multiring,
 /// which then share a ring.
 #[test]
 fn tokios_sockets_mix_with_operations() {
@@ -135,9 +135,9 @@ fn tokios_sockets_mix_with_operations() {
         buffers: Some(pool.clone()),
         ..Config::default()
     };
-    let (runtime, sidecar) = runtime(2, config);
+    let (runtime, multiring) = runtime(2, config);
     runtime.block_on(async {
-        let ours = tokio_sidecar::TcpListener::bind(&sidecar, loopback()).unwrap();
+        let ours = tokio_multiring::TcpListener::bind(&multiring, loopback()).unwrap();
         let address = ours.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let stream = ours.accept().await.unwrap();
@@ -170,7 +170,7 @@ fn tokios_sockets_mix_with_operations() {
 #[test]
 fn a_timer_wakes_sleeping_workers() {
     for workers in [1, 4] {
-        let (runtime, _sidecar) = runtime(workers, Config::default());
+        let (runtime, _multiring) = runtime(workers, Config::default());
         let started = Instant::now();
         runtime.block_on(async {
             tokio::spawn(tokio::time::sleep(Duration::from_millis(50)))
@@ -187,7 +187,7 @@ fn a_timer_wakes_sleeping_workers() {
 /// `block_on` thread sets one. And then a sooner one.
 #[test]
 fn a_timer_set_while_the_workers_sleep_fires_on_time() {
-    let (runtime, _sidecar) = runtime(2, Config::default());
+    let (runtime, _multiring) = runtime(2, Config::default());
     std::thread::sleep(Duration::from_millis(50));
 
     let started = Instant::now();
@@ -212,7 +212,7 @@ fn a_timer_set_while_the_workers_sleep_fires_on_time() {
 /// Many timers at once, on workers that sleep between them.
 #[test]
 fn many_timers() {
-    let (runtime, _sidecar) = runtime(4, Config::default());
+    let (runtime, _multiring) = runtime(4, Config::default());
     let fired = Arc::new(AtomicUsize::new(0));
     runtime.block_on(async {
         let sleepers: Vec<_> = (0..200u64)
@@ -240,7 +240,7 @@ fn many_timers() {
 /// asleep in its ring.
 #[test]
 fn a_task_from_outside_wakes_a_worker() {
-    let (runtime, _sidecar) = runtime(2, Config::default());
+    let (runtime, _multiring) = runtime(2, Config::default());
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(2));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -254,7 +254,7 @@ fn a_task_from_outside_wakes_a_worker() {
 /// that is gone.
 #[test]
 fn sockets_fail_once_the_runtime_is_gone() {
-    let (runtime, _sidecar) = runtime(2, Config::default());
+    let (runtime, _multiring) = runtime(2, Config::default());
     let (listener, stream, _peer) = runtime.block_on(async {
         let listener = TcpListener::bind(loopback()).await.unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap())

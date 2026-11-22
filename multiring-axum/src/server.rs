@@ -1,5 +1,5 @@
 //! HTTP/1.1 connection driver for `axum::Router` / `tower_service::Service`
-//! on top of `tokio-sidecar` and `ureq-proto`.
+//! on top of `tokio-multiring` and `ureq-proto`.
 
 use std::convert::Infallible;
 use std::future::poll_fn;
@@ -14,7 +14,7 @@ use http::{HeaderValue, Request, Response, StatusCode, header};
 use http_body::Body as HttpBody;
 use http_body_util::BodyExt;
 use tokio::sync::Semaphore;
-use tokio_sidecar::{BufferPool, Sidecar};
+use tokio_multiring::{BufferPool, MultiRing};
 use tower_service::Service;
 use ureq_proto::server::state::{ProvideResponse, RecvBody};
 use ureq_proto::server::{RecvRequestResult, Reply, SendResponseResult};
@@ -22,7 +22,7 @@ use ureq_proto::server::{RecvRequestResult, Reply, SendResponseResult};
 use crate::conn::{Conn, Filled};
 use crate::incoming::{
     ActiveConn, BodyError, ConnSlot, DirectBodySlot as IncomingDirectSlot, IncomingReply,
-    SidecarIncoming, read_body_into,
+    MultiRingIncoming, read_body_into,
 };
 use crate::outgoing::{BodySink, DirectBodySlot as OutgoingDirectSlot};
 
@@ -89,7 +89,7 @@ impl Default for Config {
 }
 
 struct Shared {
-    sidecar: Sidecar,
+    multiring: MultiRing,
     heads: BufferPool,
     slots: Arc<Semaphore>,
     zero_copy: ZeroCopy,
@@ -98,15 +98,15 @@ struct Shared {
 }
 
 /// Serves an Axum `Router` (or any compatible `tower_service::Service`) over a
-/// [`Sidecar`].
+/// [`MultiRing`].
 #[derive(Clone)]
 pub struct Server {
     shared: Arc<Shared>,
 }
 
 impl Server {
-    /// Creates a new server backed by `sidecar`.
-    pub fn new(sidecar: Sidecar, config: Config) -> io::Result<Self> {
+    /// Creates a new server backed by `multiring`.
+    pub fn new(multiring: MultiRing, config: Config) -> io::Result<Self> {
         let invalid = |msg| io::Error::new(io::ErrorKind::InvalidInput, msg);
         if config.connections == 0 {
             return Err(invalid("a server needs room for at least one connection"));
@@ -114,7 +114,7 @@ impl Server {
         let heads = BufferPool::new(config.head_buffer, 2 * config.connections)?;
         Ok(Self {
             shared: Arc::new(Shared {
-                sidecar,
+                multiring,
                 heads,
                 slots: Arc::new(Semaphore::new(config.connections)),
                 zero_copy: config.zero_copy,
@@ -166,7 +166,7 @@ where
             .acquire_owned()
             .await
             .expect("connection semaphore is never closed");
-        let socket = match shared.sidecar.accept(listener.clone()).await {
+        let socket = match shared.multiring.accept(listener.clone()).await {
             Ok(socket) => socket,
             Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
                 return log::error!("cannot accept on listener: {error}");
@@ -197,7 +197,7 @@ where
                 .expect("a connection slot guarantees two head buffers")
         };
         let conn = Conn::new(
-            shared.sidecar.clone(),
+            shared.multiring.clone(),
             socket.into(),
             buf(),
             buf(),
@@ -412,7 +412,7 @@ where
     });
     let (mut parts, ()) = head.into_parts();
     parts.extensions.insert(IncomingDirectSlot(slot.clone()));
-    let body = Body::new(SidecarIncoming::new(slot.clone(), remaining_hint));
+    let body = Body::new(MultiRingIncoming::new(slot.clone(), remaining_hint));
     let req = Request::from_parts(parts, body);
 
     let Ok(()) = poll_fn(|cx| service.poll_ready(cx)).await;

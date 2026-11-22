@@ -38,7 +38,7 @@ pub(crate) async fn join_all<F: Future>(mut futures: Vec<F>) -> Vec<F::Output> {
 /// A future that has been polled once, so that the operations it begins
 /// with are under way, to be finished later.
 ///
-/// The sidecar's operations go to the kernel the first time they are polled
+/// The multiring's operations go to the kernel the first time they are polled
 /// and complete whether or not anyone polls them again. Starting several
 /// futures and finishing them one at a time therefore runs their I/O side
 /// by side.

@@ -50,7 +50,7 @@ struct Inner {
 /// threads.
 ///
 /// `block_in_place` moves a worker onto a different thread, which the plan
-/// knows nothing about; a runtime that hosts a sidecar cannot use it anyway.
+/// knows nothing about; a runtime that hosts a multiring cannot use it anyway.
 #[derive(Clone)]
 pub struct Plan {
     inner: Arc<Inner>,

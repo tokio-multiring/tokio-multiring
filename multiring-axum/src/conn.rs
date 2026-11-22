@@ -1,5 +1,5 @@
 //! One client connection: buffered input and output over a socket driven by
-//! a [`Sidecar`].
+//! a [`MultiRing`].
 
 use std::collections::VecDeque;
 use std::io;
@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio_sidecar::{FixedBuf, Reclaim, Release, Segment, Sidecar};
+use tokio_multiring::{FixedBuf, MultiRing, Reclaim, Release, Segment};
 
 /// How long a connection being closed is kept open for the client to finish
 /// sending.
@@ -28,7 +28,7 @@ pub(crate) enum Filled {
 }
 
 pub(crate) struct Conn {
-    sidecar: Sidecar,
+    multiring: MultiRing,
     fd: Arc<OwnedFd>,
     /// Bytes received. Those before `consumed` have been dealt with.
     input: Option<FixedBuf>,
@@ -47,14 +47,14 @@ fn lost() -> io::Error {
 
 impl Conn {
     pub(crate) fn new(
-        sidecar: Sidecar,
+        multiring: MultiRing,
         fd: OwnedFd,
         input: FixedBuf,
         output: FixedBuf,
         zero_copy: bool,
     ) -> Conn {
         Conn {
-            sidecar,
+            multiring,
             fd: Arc::new(fd),
             input: Some(input),
             consumed: 0,
@@ -94,7 +94,10 @@ impl Conn {
             self.input = Some(input);
             return Ok(Filled::Full);
         }
-        let (received, input) = self.sidecar.recv(self.fd.clone(), input, usize::MAX).await;
+        let (received, input) = self
+            .multiring
+            .recv(self.fd.clone(), input, usize::MAX)
+            .await;
         self.input = Some(input);
         Ok(match received? {
             0 => Filled::Closed,
@@ -110,7 +113,7 @@ impl Conn {
         segments: &[Segment],
     ) -> (io::Result<usize>, Vec<FixedBuf>) {
         assert!(self.pending().is_empty());
-        self.sidecar
+        self.multiring
             .recv_vectored(self.fd.clone(), bufs, segments)
             .await
     }
@@ -141,7 +144,7 @@ impl Conn {
     /// Sends the contents of `buf` from `start` on.
     pub(crate) async fn send(&mut self, buf: FixedBuf, start: usize) -> (io::Result<()>, FixedBuf) {
         let expected = buf.len() - start;
-        let (sent, buf) = self.sidecar.send(self.fd.clone(), buf, start).await;
+        let (sent, buf) = self.multiring.send(self.fd.clone(), buf, start).await;
         let result = match sent {
             Ok(sent) if sent == expected => Ok(()),
             Ok(_) => Err(io::ErrorKind::WriteZero.into()),
@@ -174,7 +177,7 @@ impl Conn {
             combined.extend_from_slice(segments);
             let expected: usize = combined.iter().map(|s| s.len).sum();
             let (sent, mut bufs) = self
-                .sidecar
+                .multiring
                 .send_vectored(self.fd.clone(), bufs, &combined)
                 .await;
             let mut head = bufs.pop().expect("head buffer was pushed above");
@@ -190,7 +193,7 @@ impl Conn {
 
         let expected: usize = segments.iter().map(|segment| segment.len).sum();
         let (sent, bufs) = self
-            .sidecar
+            .multiring
             .send_vectored(self.fd.clone(), bufs, segments)
             .await;
         let result = match sent {
@@ -211,7 +214,7 @@ impl Conn {
         debug_assert!(!self.has_output());
         let expected: usize = segments.iter().map(|segment| segment.len).sum();
         let (sent, reclaim) = self
-            .sidecar
+            .multiring
             .send_zc_vectored(self.fd.clone(), bufs, segments)
             .await;
         let result = match sent {
@@ -227,7 +230,7 @@ impl Conn {
     pub(crate) async fn send_bytes(&mut self, buf: Bytes) -> io::Result<()> {
         debug_assert!(!self.has_output());
         let expected = buf.len();
-        match self.sidecar.send_bytes(self.fd.clone(), buf).await {
+        match self.multiring.send_bytes(self.fd.clone(), buf).await {
             Ok(sent) if sent == expected => Ok(()),
             Ok(_) => Err(io::ErrorKind::WriteZero.into()),
             Err(error) => Err(error),
@@ -253,7 +256,7 @@ impl Conn {
             oldest.await;
         }
         let expected = buf.len();
-        let (sent, release) = self.sidecar.send_bytes_zc(self.fd.clone(), buf).await;
+        let (sent, release) = self.multiring.send_bytes_zc(self.fd.clone(), buf).await;
         self.in_flight_zc.push_back(release);
         match sent {
             Ok(sent) if sent == expected => Ok(()),
@@ -265,7 +268,7 @@ impl Conn {
     /// Closes the connection cleanly so the client can read the last response.
     pub(crate) async fn close(mut self) {
         let announced = self
-            .sidecar
+            .multiring
             .shutdown(self.fd.clone(), std::net::Shutdown::Write);
         if announced.await.is_err() {
             return;
@@ -273,7 +276,10 @@ impl Conn {
         let drain = async {
             while let Some(mut input) = self.input.take() {
                 input.clear();
-                let (received, input) = self.sidecar.recv(self.fd.clone(), input, usize::MAX).await;
+                let (received, input) = self
+                    .multiring
+                    .recv(self.fd.clone(), input, usize::MAX)
+                    .await;
                 if !matches!(received, Ok(1..)) {
                     break;
                 }

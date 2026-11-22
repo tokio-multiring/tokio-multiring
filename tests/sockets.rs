@@ -7,14 +7,14 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use tokio_sidecar::{BufferPool, Config, Segment, Sidecar};
+use tokio_multiring::{BufferPool, Config, MultiRing, Segment};
 
-/// A runtime of four workers that a sidecar drives, and the sidecar.
-fn runtime(config: Config) -> (tokio::runtime::Runtime, Sidecar) {
+/// A runtime of four workers that a multiring drives, and the multiring.
+fn runtime(config: Config) -> (tokio::runtime::Runtime, MultiRing) {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(4).enable_time();
-    let sidecar = Sidecar::install(&mut builder, config);
-    (builder.build().unwrap(), sidecar)
+    let multiring = MultiRing::install(&mut builder, config);
+    (builder.build().unwrap(), multiring)
 }
 
 /// A connected pair of TCP sockets, ours first.
@@ -45,14 +45,14 @@ fn tcp_echo() {
         reply
     });
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         tokio::spawn(async move {
-            let stream = Arc::new(sidecar.accept(listener).await.unwrap());
+            let stream = Arc::new(multiring.accept(listener).await.unwrap());
 
             let mut request = pool.acquire().await;
             while request.len() < 5 {
-                let (received, buf) = sidecar.recv(stream.clone(), request, usize::MAX).await;
+                let (received, buf) = multiring.recv(stream.clone(), request, usize::MAX).await;
                 assert_ne!(received.unwrap(), 0);
                 request = buf;
             }
@@ -60,7 +60,7 @@ fn tcp_echo() {
 
             let mut reply = pool.acquire().await;
             reply.extend_from_slice(b"polo!");
-            let (sent, _) = sidecar.send(stream, reply, 0).await;
+            let (sent, _) = multiring.send(stream, reply, 0).await;
             assert_eq!(sent.unwrap(), 5);
         })
         .await
@@ -89,12 +89,12 @@ fn send_delivers_the_whole_buffer() {
         }
     });
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         let mut buf = pool.acquire().await;
         let pattern: Vec<u8> = (0..SIZE).map(|index| (index % 251) as u8).collect();
         buf.extend_from_slice(&pattern);
-        let (sent, buf) = sidecar.send(ours, buf, 0).await;
+        let (sent, buf) = multiring.send(ours, buf, 0).await;
         assert_eq!(sent.unwrap(), SIZE);
         drop(buf);
     });
@@ -116,13 +116,13 @@ fn recv_reports_the_end_of_the_stream() {
     theirs.write_all(b"last words").unwrap();
     drop(theirs);
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
-        let (received, buf) = sidecar
+        let (received, buf) = multiring
             .recv(ours.clone(), pool.acquire().await, usize::MAX)
             .await;
         assert_eq!(received.unwrap(), 10);
-        let (received, buf) = sidecar.recv(ours, buf, usize::MAX).await;
+        let (received, buf) = multiring.recv(ours, buf, usize::MAX).await;
         assert_eq!(received.unwrap(), 0);
         assert_eq!(&buf[..], b"last words");
     });
@@ -136,18 +136,18 @@ fn recv_limit_and_send_offset() {
     let pool = BufferPool::new(4096, 1).unwrap();
     theirs.write_all(b"headbody").unwrap();
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
-        let (received, buf) = sidecar.recv(ours.clone(), pool.acquire().await, 4).await;
+        let (received, buf) = multiring.recv(ours.clone(), pool.acquire().await, 4).await;
         assert_eq!(received.unwrap(), 4);
         assert_eq!(&buf[..], b"head");
-        let (received, buf) = sidecar.recv(ours.clone(), buf, usize::MAX).await;
+        let (received, buf) = multiring.recv(ours.clone(), buf, usize::MAX).await;
         assert_eq!(received.unwrap(), 4);
         assert_eq!(&buf[..], b"headbody");
 
-        let (sent, buf) = sidecar.send(ours.clone(), buf, 4).await;
+        let (sent, buf) = multiring.send(ours.clone(), buf, 4).await;
         assert_eq!(sent.unwrap(), 4);
-        let (sent, _) = sidecar.send(ours, buf, 8).await;
+        let (sent, _) = multiring.send(ours, buf, 8).await;
         assert_eq!(sent.unwrap(), 0);
     });
 
@@ -166,7 +166,7 @@ fn send_vectored_interleaves_buffers() {
     let (ours, mut theirs) = socket_pair();
     let pool = BufferPool::new(4096, 2).unwrap();
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         let mut bufs = pool.acquire_many(2).await;
         bufs[0].extend_from_slice(b"ACExx");
@@ -178,11 +178,11 @@ fn send_vectored_interleaves_buffers() {
             segment(1, 3, 1),
             segment(0, 2, 1),
         ];
-        let (sent, bufs) = sidecar.send_vectored(ours.clone(), bufs, &segments).await;
+        let (sent, bufs) = multiring.send_vectored(ours.clone(), bufs, &segments).await;
         assert_eq!(sent.unwrap(), 5);
         assert_eq!((&bufs[0][..], &bufs[1][..]), (&b"ACExx"[..], &b"..BD"[..]));
 
-        let (sent, _) = sidecar.send_vectored(ours, bufs, &[]).await;
+        let (sent, _) = multiring.send_vectored(ours, bufs, &[]).await;
         assert_eq!(sent.unwrap(), 0);
     });
 
@@ -206,11 +206,11 @@ fn recv_vectored_fills_every_region() {
         theirs
     });
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         let bufs = pool.acquire_many(2).await;
         let segments = [segment(0, 0, 3), segment(1, 100, 4), segment(0, 3, 3)];
-        let (received, mut bufs) = sidecar.recv_vectored(ours.clone(), bufs, &segments).await;
+        let (received, mut bufs) = multiring.recv_vectored(ours.clone(), bufs, &segments).await;
         assert_eq!(received.unwrap(), 10);
         assert!(bufs[0].is_empty() && bufs[1].is_empty());
         bufs[0].grow(6);
@@ -222,7 +222,9 @@ fn recv_vectored_fills_every_region() {
         let mut theirs = writer.join().unwrap();
         theirs.write_all(b"ab").unwrap();
         drop(theirs);
-        let (received, bufs) = sidecar.recv_vectored(ours, bufs, &[segment(1, 0, 8)]).await;
+        let (received, bufs) = multiring
+            .recv_vectored(ours, bufs, &[segment(1, 0, 8)])
+            .await;
         assert_eq!(received.unwrap(), 2);
         assert_eq!(&bufs[1][..2], b"ab");
     });
@@ -242,7 +244,7 @@ fn vectored_transfers_larger_than_the_socket_buffer() {
         .map(|unit| segment(unit % 2, unit / 2 * UNIT, UNIT))
         .collect();
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         let mut sending = pool.acquire_many(2).await;
         for (index, buf) in sending.iter_mut().enumerate() {
@@ -253,8 +255,8 @@ fn vectored_transfers_larger_than_the_socket_buffer() {
         }
         let receiving = pool.acquire_many(2).await;
 
-        let send = tokio::spawn(sidecar.send_vectored(ours, sending, &segments));
-        let (received, mut receiving) = sidecar.recv_vectored(theirs, receiving, &segments).await;
+        let send = tokio::spawn(multiring.send_vectored(ours, sending, &segments));
+        let (received, mut receiving) = multiring.recv_vectored(theirs, receiving, &segments).await;
         assert_eq!(received.unwrap(), 2 * UNITS * UNIT);
         let (sent, sending) = send.await.unwrap();
         assert_eq!(sent.unwrap(), 2 * UNITS * UNIT);
@@ -267,7 +269,7 @@ fn vectored_transfers_larger_than_the_socket_buffer() {
 }
 
 /// A pool of two buffers of `size` bytes, on huge pages or not. The two
-/// kinds are sent in different ways: see `Sidecar::send_zc_vectored`.
+/// kinds are sent in different ways: see `MultiRing::send_zc_vectored`.
 fn pool_of(size: usize, huge_pages: bool) -> BufferPool {
     match huge_pages {
         true => BufferPool::new(size, 2).unwrap(),
@@ -275,7 +277,7 @@ fn pool_of(size: usize, huge_pages: bool) -> BufferPool {
     }
 }
 
-/// Settings for a sidecar with `pool` registered on its rings.
+/// Settings for a multiring with `pool` registered on its rings.
 fn config_with(pool: &BufferPool) -> Config {
     Config {
         buffers: Some(pool.clone()),
@@ -302,7 +304,7 @@ fn zero_copy_send(huge_pages: bool) {
         received
     });
 
-    let (runtime, sidecar) = runtime(config_with(&pool));
+    let (runtime, multiring) = runtime(config_with(&pool));
     runtime.block_on(async {
         let mut bufs = pool.acquire_many(2).await;
         for (index, buf) in bufs.iter_mut().enumerate() {
@@ -316,7 +318,7 @@ fn zero_copy_send(huge_pages: bool) {
             .flat_map(|segment| bufs[segment.buf][segment.start..][..segment.len].to_vec())
             .collect();
 
-        let (sent, reclaim) = sidecar.send_zc_vectored(ours, bufs, &segments).await;
+        let (sent, reclaim) = multiring.send_zc_vectored(ours, bufs, &segments).await;
         assert_eq!(sent.unwrap(), total);
         // The kernel still has the buffers, or has just handed them over:
         // either way they are not in the pool.
@@ -333,7 +335,7 @@ fn zero_copy_send(huge_pages: bool) {
 
         drop(reclaimed);
         assert_eq!(pool.available(), 2);
-        assert_eq!(sidecar.in_flight(), 0);
+        assert_eq!(multiring.in_flight(), 0);
     });
 }
 
@@ -353,13 +355,13 @@ fn unclaimed_zero_copy_buffers_return_to_the_pool() {
     let (ours, mut theirs) = tcp_pair();
     let pool = pool_of(4096, false);
 
-    let (runtime, sidecar) = runtime(config_with(&pool));
+    let (runtime, multiring) = runtime(config_with(&pool));
     runtime.block_on(async {
         let mut bufs = pool.acquire_many(2).await;
         bufs[0].extend_from_slice(b"zero ");
         bufs[1].extend_from_slice(b"copy");
         let segments = [segment(0, 0, 5), segment(1, 0, 4)];
-        let (sent, reclaim) = sidecar.send_zc_vectored(ours, bufs, &segments).await;
+        let (sent, reclaim) = multiring.send_zc_vectored(ours, bufs, &segments).await;
         assert_eq!(sent.unwrap(), 9);
         drop(reclaim);
 
@@ -369,7 +371,7 @@ fn unclaimed_zero_copy_buffers_return_to_the_pool() {
         tokio::time::timeout(Duration::from_secs(5), pool.acquire_many(2))
             .await
             .expect("buffers never came back");
-        assert_eq!(sidecar.in_flight(), 0);
+        assert_eq!(multiring.in_flight(), 0);
     });
 }
 
@@ -383,18 +385,18 @@ fn zero_copy_buffers_are_held_while_the_peer_does_not_read() {
     let (ours, mut theirs) = tcp_pair();
     let pool = pool_of(SIZE, false);
 
-    let (runtime, sidecar) = runtime(config_with(&pool));
+    let (runtime, multiring) = runtime(config_with(&pool));
     runtime.block_on(async {
         let mut bufs = pool.acquire_many(1).await;
         bufs[0].extend_from_slice(&vec![7; SIZE]);
         let whole = [segment(0, 0, SIZE)];
-        let (sent, mut reclaim) = sidecar.send_zc_vectored(ours, bufs, &whole).await;
+        let (sent, mut reclaim) = multiring.send_zc_vectored(ours, bufs, &whole).await;
         assert_eq!(sent.unwrap(), SIZE);
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(reclaim.try_take().is_none());
         assert_eq!(pool.available(), 1);
-        assert_eq!(sidecar.in_flight(), 1);
+        assert_eq!(multiring.in_flight(), 1);
 
         let reader = std::thread::spawn(move || {
             let mut received = vec![0; SIZE];
@@ -419,7 +421,7 @@ fn dropped_zero_copy_send_returns_its_buffers() {
     let (ours, theirs) = tcp_pair();
     let pool = pool_of(SIZE, false);
 
-    let (runtime, sidecar) = runtime(config_with(&pool));
+    let (runtime, multiring) = runtime(config_with(&pool));
     runtime.block_on(async {
         let mut bufs = pool.acquire_many(2).await;
         for buf in &mut bufs {
@@ -427,7 +429,7 @@ fn dropped_zero_copy_send_returns_its_buffers() {
         }
         // More than the socket takes with nobody reading.
         let segments = [segment(0, 0, SIZE), segment(1, 0, SIZE)];
-        let send = sidecar.send_zc_vectored(ours, bufs, &segments);
+        let send = multiring.send_zc_vectored(ours, bufs, &segments);
         assert!(
             tokio::time::timeout(Duration::from_millis(100), send)
                 .await
@@ -440,7 +442,7 @@ fn dropped_zero_copy_send_returns_its_buffers() {
         tokio::time::timeout(Duration::from_secs(5), pool.acquire_many(2))
             .await
             .expect("buffers never came back");
-        assert_eq!(sidecar.in_flight(), 0);
+        assert_eq!(multiring.in_flight(), 0);
     });
 }
 
@@ -466,12 +468,12 @@ fn failed_zero_copy_send_hands_its_buffers_back() {
     assert_eq!(set, 0);
     drop(theirs);
 
-    let (runtime, sidecar) = runtime(config_with(&pool));
+    let (runtime, multiring) = runtime(config_with(&pool));
     runtime.block_on(async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let mut bufs = pool.acquire_many(1).await;
         bufs[0].extend_from_slice(b"anyone?");
-        let (sent, reclaim) = sidecar
+        let (sent, reclaim) = multiring
             .send_zc_vectored(ours, bufs, &[segment(0, 0, 7)])
             .await;
         assert!(sent.is_err());
@@ -479,7 +481,7 @@ fn failed_zero_copy_send_hands_its_buffers_back() {
             .await
             .expect("the buffer never came back");
         assert_eq!(&reclaimed.bufs[0][..], b"anyone?");
-        assert_eq!(sidecar.in_flight(), 0);
+        assert_eq!(multiring.in_flight(), 0);
     });
 }
 
@@ -490,16 +492,16 @@ fn shutdown_of_one_direction() {
     let (ours, mut theirs) = socket_pair();
     let pool = BufferPool::new(4096, 1).unwrap();
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
-        sidecar
+        multiring
             .shutdown(ours.clone(), std::net::Shutdown::Write)
             .await
             .unwrap();
         assert_eq!(theirs.read(&mut [0; 8]).unwrap(), 0);
 
         theirs.write_all(b"still open").unwrap();
-        let (received, buf) = sidecar.recv(ours, pool.acquire().await, usize::MAX).await;
+        let (received, buf) = multiring.recv(ours, pool.acquire().await, usize::MAX).await;
         assert_eq!(received.unwrap(), 10);
         assert_eq!(&buf[..], b"still open");
     });
@@ -512,11 +514,11 @@ fn send_to_a_closed_peer_is_an_error() {
     let pool = BufferPool::new(4096, 1).unwrap();
     drop(theirs);
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         let mut buf = pool.acquire().await;
         buf.extend_from_slice(b"anyone?");
-        let (sent, buf) = sidecar.send(ours, buf, 0).await;
+        let (sent, buf) = multiring.send(ours, buf, 0).await;
         assert_eq!(sent.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
         assert_eq!(&buf[..], b"anyone?");
     });
@@ -531,13 +533,13 @@ fn dropped_accept_closes_the_connection() {
     let address = listener.local_addr().unwrap();
     let listener = Arc::new(OwnedFd::from(listener));
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
         let (parked, accept) = tokio::sync::oneshot::channel();
         tokio::spawn({
-            let sidecar = sidecar.clone();
+            let multiring = multiring.clone();
             async move {
-                let mut accept = Box::pin(sidecar.accept(listener));
+                let mut accept = Box::pin(multiring.accept(listener));
                 std::future::poll_fn(|cx| {
                     assert!(accept.as_mut().poll(cx).is_pending());
                     Poll::Ready(())
@@ -550,7 +552,7 @@ fn dropped_accept_closes_the_connection() {
 
         let mut client = TcpStream::connect(address).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while sidecar.in_flight() != 0 {
+            while multiring.in_flight() != 0 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
@@ -570,9 +572,9 @@ fn dropped_recv_is_cancelled() {
     let (ours, _theirs) = socket_pair();
     let pool = BufferPool::new(4096, 1).unwrap();
 
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
-        let recv = sidecar.recv(ours, pool.acquire().await, usize::MAX);
+        let recv = multiring.recv(ours, pool.acquire().await, usize::MAX);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), recv)
                 .await
@@ -598,17 +600,17 @@ fn send_bytes_and_send_bytes_zc_transfer_large_payloads() {
             assert_eq!(received, expected.as_ref());
         });
 
-        let (runtime, sidecar) = runtime(Config::default());
+        let (runtime, multiring) = runtime(Config::default());
         let data = payload.clone();
         runtime.block_on(async move {
             if use_zc {
-                let (sent, release) = sidecar.send_bytes_zc(ours, data).await;
+                let (sent, release) = multiring.send_bytes_zc(ours, data).await;
                 assert_eq!(sent.unwrap(), TOTAL);
                 let copied = release.await;
                 // Loopback reports copied = true.
                 assert!(copied);
             } else {
-                let sent = sidecar.send_bytes(ours, data).await.unwrap();
+                let sent = multiring.send_bytes(ours, data).await.unwrap();
                 assert_eq!(sent, TOTAL);
             }
         });

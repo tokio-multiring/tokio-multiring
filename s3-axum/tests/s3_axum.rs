@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use axum::serve::ListenerExt;
 use hmac::{Hmac, Mac};
+use multiring_axum::{Config as HttpConfig, Server, ZeroCopy};
 use s3_axum::{
-    AppOptions, AuthConfig, Backend, SidecarStore, TokioStore, TokioUringStore, router,
+    AppOptions, AuthConfig, Backend, MultiRingStore, TokioStore, TokioUringStore, router,
     router_with_options,
 };
 use sha2::{Digest, Sha256};
-use sidecar_axum::{Config as HttpConfig, Server, ZeroCopy};
 use tokio::runtime::{Builder, Runtime};
-use tokio_sidecar::{BufferPool, Sidecar};
+use tokio_multiring::{BufferPool, MultiRing};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -38,15 +38,15 @@ struct RunningServer {
 }
 
 impl RunningServer {
-    fn start_sidecar(roots: &[PathBuf], zero_copy: ZeroCopy) -> Self {
+    fn start_multiring(roots: &[PathBuf], zero_copy: ZeroCopy) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let pool = BufferPool::without_huge_pages(64 * 1024, 32).unwrap();
         let mut builder = Builder::new_multi_thread();
         builder.worker_threads(2).enable_time();
-        let sidecar = Sidecar::install(
+        let multiring = MultiRing::install(
             &mut builder,
-            tokio_sidecar::Config {
+            tokio_multiring::Config {
                 buffers: Some(pool),
                 ..Default::default()
             },
@@ -54,10 +54,10 @@ impl RunningServer {
         let rt = builder.build().unwrap();
         let roots = roots.to_vec();
         rt.block_on(async move {
-            let store = SidecarStore::open(sidecar.clone(), &roots, 16 * 1024, 2).unwrap();
-            let app = router(Backend::Sidecar(store));
+            let store = MultiRingStore::open(multiring.clone(), &roots, 16 * 1024, 2).unwrap();
+            let app = router(Backend::MultiRing(store));
             let server = Server::new(
-                sidecar,
+                multiring,
                 HttpConfig {
                     connections: 32,
                     head_buffer: 4096,
@@ -365,9 +365,9 @@ fn cleanup(roots: &[PathBuf]) {
 }
 
 #[test]
-fn sidecar_runtime_suite() {
-    let roots = scratch_roots("sidecar", 2);
-    let server = RunningServer::start_sidecar(&roots, ZeroCopy::Always);
+fn multiring_runtime_suite() {
+    let roots = scratch_roots("multiring", 2);
+    let server = RunningServer::start_multiring(&roots, ZeroCopy::Always);
     run_suite(&server);
     drop(server);
     cleanup(&roots);
@@ -403,13 +403,13 @@ fn tokio_uring_runtime_suite() {
 #[test]
 fn cross_runtime_on_disk_interoperability() {
     let roots = scratch_roots("interop", 2);
-    let sidecar = RunningServer::start_sidecar(&roots, ZeroCopy::Always);
+    let multiring = RunningServer::start_multiring(&roots, ZeroCopy::Always);
     let tokio_srv = RunningServer::start_tokio(&roots, false);
 
-    let mut s_sidecar = sidecar.connect();
+    let mut s_multiring = multiring.connect();
     let mut s_tokio = tokio_srv.connect();
 
-    // Create bucket via Tokio, PUT via Tokio, GET via Sidecar!
+    // Create bucket via Tokio, PUT via Tokio, GET via MultiRing!
     let (st, _, _) = send_request(
         &mut s_tokio,
         "PUT /shared HTTP/1.1\r\nhost: test\r\ncontent-length: 0\r\n\r\n",
@@ -425,30 +425,30 @@ fn cross_runtime_on_disk_interoperability() {
     assert_eq!(send_request(&mut s_tokio, &req, &from_tokio).0, 200);
 
     let (st, _, got) = send_request(
-        &mut s_sidecar,
+        &mut s_multiring,
         "GET /shared/from-tokio HTTP/1.1\r\nhost: test\r\n\r\n",
         b"",
     );
     assert_eq!(st, 200);
     assert_eq!(got, from_tokio);
 
-    // PUT via Sidecar, GET via Tokio!
-    let from_sidecar: Vec<u8> = (0..220_000usize).map(|i| ((i * 13) % 251) as u8).collect();
+    // PUT via MultiRing, GET via Tokio!
+    let from_multiring: Vec<u8> = (0..220_000usize).map(|i| ((i * 13) % 251) as u8).collect();
     let req = format!(
-        "PUT /shared/from-sidecar HTTP/1.1\r\nhost: test\r\ncontent-length: {}\r\n\r\n",
-        from_sidecar.len()
+        "PUT /shared/from-multiring HTTP/1.1\r\nhost: test\r\ncontent-length: {}\r\n\r\n",
+        from_multiring.len()
     );
-    assert_eq!(send_request(&mut s_sidecar, &req, &from_sidecar).0, 200);
+    assert_eq!(send_request(&mut s_multiring, &req, &from_multiring).0, 200);
 
     let (st, _, got) = send_request(
         &mut s_tokio,
-        "GET /shared/from-sidecar HTTP/1.1\r\nhost: test\r\n\r\n",
+        "GET /shared/from-multiring HTTP/1.1\r\nhost: test\r\n\r\n",
         b"",
     );
     assert_eq!(st, 200);
-    assert_eq!(got, from_sidecar);
+    assert_eq!(got, from_multiring);
 
-    drop(sidecar);
+    drop(multiring);
     drop(tokio_srv);
     cleanup(&roots);
 }
@@ -631,16 +631,16 @@ fn sigv4_and_aws_chunked_on_both_runtimes() {
         secret_key: "supersecretkey1234567890".into(),
     };
 
-    // 1. Sidecar runtime
-    let roots_sc = scratch_roots("sigv4-sidecar", 2);
+    // 1. MultiRing runtime
+    let roots_sc = scratch_roots("sigv4-multiring", 2);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let pool = BufferPool::without_huge_pages(64 * 1024, 32).unwrap();
     let mut builder = Builder::new_multi_thread();
     builder.worker_threads(2).enable_time();
-    let sidecar = Sidecar::install(
+    let multiring = MultiRing::install(
         &mut builder,
-        tokio_sidecar::Config {
+        tokio_multiring::Config {
             buffers: Some(pool),
             ..Default::default()
         },
@@ -649,16 +649,16 @@ fn sigv4_and_aws_chunked_on_both_runtimes() {
     let auth_sc = auth.clone();
     let roots_clone = roots_sc.clone();
     rt_sc.block_on(async move {
-        let store = SidecarStore::open(sidecar.clone(), &roots_clone, 16 * 1024, 2).unwrap();
+        let store = MultiRingStore::open(multiring.clone(), &roots_clone, 16 * 1024, 2).unwrap();
         let app = router_with_options(
-            Backend::Sidecar(store),
+            Backend::MultiRing(store),
             AppOptions {
                 trace: false,
                 auth: Some(auth_sc),
             },
         );
         Server::new(
-            sidecar,
+            multiring,
             HttpConfig {
                 connections: 16,
                 head_buffer: 4096,

@@ -3,7 +3,7 @@ name = "s3-axum"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Unified Axum S3 server running on both standard Tokio (Hyper) and tokio-sidecar (io_uring)"
+description = "Unified Axum S3 server running on both standard Tokio (Hyper) and tokio-multiring (io_uring)"
 license = "MIT"
 publish = false
 
@@ -20,10 +20,10 @@ libc = "0.2"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
-sidecar-axum = { path = "../sidecar-axum" }
+multiring-axum = { path = "../multiring-axum" }
 subtle = "2"
 tokio = { path = "../../tokio-io-reactor-wl/tokio", features = ["fs", "io-uring", "io-util", "macros", "net", "rt-multi-thread", "sync", "time", "worker-local"] }
-tokio-sidecar = { path = ".." }
+tokio-multiring = { path = ".." }
 
 [dev-dependencies]
 tower-service = "0.3"

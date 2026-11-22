@@ -2,8 +2,8 @@
 //!
 //! Buckets are directories and objects are files in them. HTTP is spoken
 //! with ureq-proto's server state machine, and all I/O goes through a
-//! [`tokio_sidecar::Sidecar`]: an object's bytes travel between the socket
-//! and the drives in the sidecar's registered buffers, without being copied
+//! [`tokio_multiring::MultiRing`]: an object's bytes travel between the socket
+//! and the drives in the multiring's registered buffers, without being copied
 //! on the way.
 //!
 //! Given several drives, the server stripes each object over them: the
@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
-use tokio_sidecar::{BufferPool, Sidecar};
+use tokio_multiring::{BufferPool, MultiRing};
 
 use crate::conn::Conn;
 use crate::store::Store;
@@ -60,11 +60,11 @@ pub struct Config {
     /// reordering roots makes the objects stored so far unreadable.
     pub roots: Vec<PathBuf>,
     /// Size of the units that objects are cut into when there are several
-    /// roots: a multiple of 4096 that the size of the sidecar's buffers is a
+    /// roots: a multiple of 4096 that the size of the multiring's buffers is a
     /// multiple of. Part of how objects are stored, like the roots.
     pub stripe_unit: usize,
     /// How many rounds of an object a transfer keeps going at once, a round
-    /// being one sidecar buffer per drive: at least 1. A download reads
+    /// being one multiring buffer per drive: at least 1. A download reads
     /// that far ahead of what it is sending, and an upload writes that far
     /// behind what it is receiving. A transfer waits for the buffers of one
     /// round and takes the rest only while they are free.
@@ -112,9 +112,9 @@ pub enum ZeroCopy {
 }
 
 struct Inner {
-    sidecar: Sidecar,
+    multiring: MultiRing,
     store: Store,
-    /// The sidecar's registered buffers, which object data moves through.
+    /// The multiring's registered buffers, which object data moves through.
     bodies: BufferPool,
     /// How many rounds a transfer keeps going at once.
     window: usize,
@@ -132,15 +132,15 @@ pub struct Server {
 }
 
 impl Server {
-    /// Sets the server up over `sidecar`, which must have a pool of at least
+    /// Sets the server up over `multiring`, which must have a pool of at least
     /// as many buffers as there are roots. Objects are read and written
-    /// through the sidecar's polled disk rings if it has them.
-    pub fn new(sidecar: Sidecar, config: Config) -> io::Result<Server> {
+    /// through the multiring's polled disk rings if it has them.
+    pub fn new(multiring: MultiRing, config: Config) -> io::Result<Server> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
-        let bodies = sidecar
+        let bodies = multiring
             .buffers()
             .cloned()
-            .ok_or_else(|| invalid("the sidecar has no buffer pool"))?;
+            .ok_or_else(|| invalid("the multiring has no buffer pool"))?;
         if config.connections == 0 {
             return Err(invalid("a server needs room for a connection"));
         }
@@ -148,10 +148,10 @@ impl Server {
             return Err(invalid("a transfer needs a window of at least one round"));
         }
         let heads = BufferPool::new(config.head_buffer, 2 * config.connections)?;
-        let store = Store::open(sidecar.clone(), &config.roots, config.stripe_unit)?;
+        let store = Store::open(multiring.clone(), &config.roots, config.stripe_unit)?;
         Ok(Server {
             inner: Arc::new(Inner {
-                sidecar,
+                multiring,
                 store,
                 bodies,
                 window: config.window,
@@ -187,7 +187,7 @@ async fn accept(inner: Arc<Inner>, listener: Arc<OwnedFd>) {
     loop {
         let slot = inner.slots.clone().acquire_owned().await;
         let slot = slot.expect("the semaphore is never closed");
-        let socket = match inner.sidecar.accept(listener.clone()).await {
+        let socket = match inner.multiring.accept(listener.clone()).await {
             Ok(socket) => socket,
             Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
                 return log::error!("cannot accept on the listener: {error}");
@@ -222,7 +222,7 @@ async fn accept(inner: Arc<Inner>, listener: Arc<OwnedFd>) {
                 .expect("a slot stands for two head buffers")
         };
         let conn = Conn::new(
-            inner.sidecar.clone(),
+            inner.multiring.clone(),
             socket.into(),
             buffer(),
             buffer(),

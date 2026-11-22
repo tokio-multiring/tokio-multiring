@@ -5,16 +5,16 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio_sidecar::{BufferPool, Config, Sidecar};
+use tokio_multiring::{BufferPool, Config, MultiRing};
 
 const BUF_SIZE: usize = 64 * 1024;
 
-/// A runtime of four workers that a sidecar drives, and the sidecar.
-fn runtime(config: Config) -> (tokio::runtime::Runtime, Sidecar) {
+/// A runtime of four workers that a multiring drives, and the multiring.
+fn runtime(config: Config) -> (tokio::runtime::Runtime, MultiRing) {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(4).enable_time();
-    let sidecar = Sidecar::install(&mut builder, config);
-    (builder.build().unwrap(), sidecar)
+    let multiring = MultiRing::install(&mut builder, config);
+    (builder.build().unwrap(), multiring)
 }
 
 #[test]
@@ -158,13 +158,13 @@ fn acquire_many_does_not_deadlock() {
 fn one_pool_registers_on_many_rings() {
     let pool = BufferPool::new(BUF_SIZE, 16).unwrap();
     for _ in 0..2 {
-        let (runtime, sidecar) = runtime(Config {
+        let (runtime, multiring) = runtime(Config {
             buffers: Some(pool.clone()),
             ..Config::default()
         });
         runtime.block_on(async {
-            assert_eq!(sidecar.buffers().unwrap().buf_size(), BUF_SIZE);
-            tokio::spawn(async move { sidecar.nop().await })
+            assert_eq!(multiring.buffers().unwrap().buf_size(), BUF_SIZE);
+            tokio::spawn(async move { multiring.nop().await })
                 .await
                 .unwrap()
                 .unwrap();
@@ -172,7 +172,7 @@ fn one_pool_registers_on_many_rings() {
     }
 }
 
-/// Settings for a sidecar with `pool` registered on its rings.
+/// Settings for a multiring with `pool` registered on its rings.
 fn config_with(pool: &BufferPool) -> Config {
     Config {
         buffers: Some(pool.clone()),
@@ -199,7 +199,7 @@ fn direct_io_round_trip() {
     let fd = Arc::new(OwnedFd::from(file));
 
     let pool = BufferPool::new(BUF_SIZE, 4).unwrap();
-    let (runtime, sidecar) = runtime(config_with(&pool));
+    let (runtime, multiring) = runtime(config_with(&pool));
     runtime.block_on(async {
         tokio::spawn({
             let pool = pool.clone();
@@ -207,24 +207,26 @@ fn direct_io_round_trip() {
                 // One full buffer, then a single block.
                 let mut buf = pool.acquire().await;
                 buf.extend_from_slice(&[0xa5; BUF_SIZE]);
-                let (written, mut buf) = sidecar.write_fixed_at(fd.clone(), buf, 0).await;
+                let (written, mut buf) = multiring.write_fixed_at(fd.clone(), buf, 0).await;
                 assert_eq!(written.unwrap(), BUF_SIZE);
 
                 buf.clear();
                 buf.extend_from_slice(&[0x5a; BLOCK]);
-                let (written, mut buf) = sidecar
+                let (written, mut buf) = multiring
                     .write_fixed_at(fd.clone(), buf, BUF_SIZE as u64)
                     .await;
                 assert_eq!(written.unwrap(), BLOCK);
 
                 buf.clear();
-                let (read, mut buf) = sidecar.read_fixed_at(fd.clone(), buf, 0, usize::MAX).await;
+                let (read, mut buf) = multiring
+                    .read_fixed_at(fd.clone(), buf, 0, usize::MAX)
+                    .await;
                 assert_eq!(read.unwrap(), BUF_SIZE);
                 assert!(buf.iter().all(|&byte| byte == 0xa5));
 
                 // The file ends one block into this read.
                 buf.clear();
-                let (read, buf) = sidecar
+                let (read, buf) = multiring
                     .read_fixed_at(fd, buf, BUF_SIZE as u64, usize::MAX)
                     .await;
                 assert_eq!(read.unwrap(), BLOCK);
@@ -245,13 +247,13 @@ fn read_stops_at_its_limit() {
     writer.write_all(b"onetwo").unwrap();
 
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    let (runtime, sidecar) = runtime(config_with(&pool));
+    let (runtime, multiring) = runtime(config_with(&pool));
     runtime.block_on(async {
-        let (read, buf) = sidecar
+        let (read, buf) = multiring
             .read_fixed_at(reader.clone(), pool.acquire().await, 0, 3)
             .await;
         assert_eq!(read.unwrap(), 3);
-        let (read, buf) = sidecar.read_fixed_at(reader, buf, 0, usize::MAX).await;
+        let (read, buf) = multiring.read_fixed_at(reader, buf, 0, usize::MAX).await;
         assert_eq!(read.unwrap(), 3);
         assert_eq!(&buf[..], b"onetwo");
     });
@@ -264,11 +266,11 @@ fn read_appends_to_the_contents() {
     writer.write_all(b"world").unwrap();
 
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    let (runtime, sidecar) = runtime(config_with(&pool));
+    let (runtime, multiring) = runtime(config_with(&pool));
     runtime.block_on(async {
         let mut buf = pool.acquire().await;
         buf.extend_from_slice(b"hello ");
-        let (read, buf) = sidecar.read_fixed_at(reader, buf, 0, usize::MAX).await;
+        let (read, buf) = multiring.read_fixed_at(reader, buf, 0, usize::MAX).await;
         assert_eq!(read.unwrap(), 5);
         assert_eq!(&buf[..], b"hello world");
     });
@@ -280,9 +282,9 @@ fn cancelled_read_returns_its_buffer() {
     let reader = Arc::new(OwnedFd::from(reader));
 
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    let (runtime, sidecar) = runtime(config_with(&pool));
+    let (runtime, multiring) = runtime(config_with(&pool));
     runtime.block_on(async {
-        let read = sidecar.read_fixed_at(reader, pool.acquire().await, 0, usize::MAX);
+        let read = multiring.read_fixed_at(reader, pool.acquire().await, 0, usize::MAX);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), read)
                 .await
@@ -302,19 +304,19 @@ fn buffers_from_elsewhere_are_refused() {
 
     let registered = BufferPool::new(BUF_SIZE, 1).unwrap();
     let other = BufferPool::new(BUF_SIZE, 1).unwrap();
-    let (runtime, sidecar) = runtime(config_with(&registered));
+    let (runtime, multiring) = runtime(config_with(&registered));
     runtime.block_on(async {
         let mut buf = other.acquire().await;
         buf.extend_from_slice(b"kept");
 
-        let (result, buf) = sidecar
+        let (result, buf) = multiring
             .read_fixed_at(reader.clone(), buf, 0, usize::MAX)
             .await;
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
-        let (result, buf) = sidecar.write_fixed_at(reader, buf, 0).await;
+        let (result, buf) = multiring.write_fixed_at(reader, buf, 0).await;
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(&buf[..], b"kept");
-        assert_eq!(sidecar.in_flight(), 0);
+        assert_eq!(multiring.in_flight(), 0);
     });
 }
 
@@ -324,9 +326,9 @@ fn fixed_operations_need_a_pool() {
     let reader = Arc::new(OwnedFd::from(reader));
 
     let pool = BufferPool::new(BUF_SIZE, 1).unwrap();
-    let (runtime, sidecar) = runtime(Config::default());
+    let (runtime, multiring) = runtime(Config::default());
     runtime.block_on(async {
-        let (result, _buf) = sidecar
+        let (result, _buf) = multiring
             .read_fixed_at(reader, pool.acquire().await, 0, usize::MAX)
             .await;
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);

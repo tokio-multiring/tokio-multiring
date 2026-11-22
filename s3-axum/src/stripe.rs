@@ -1,12 +1,13 @@
 //! How an object's bytes are laid out across drives (identical on-disk format
-//! to `sidecar-s3` so both runtimes interoperate on the same directories).
+//! to `multiring-s3` so both runtimes interoperate on the same directories).
 
 use std::ops::Range;
 
-use tokio_sidecar::Segment;
+use tokio_multiring::Segment;
 
 pub(crate) const BLOCK: usize = 4096;
 pub(crate) const HEADER: usize = BLOCK;
+/// Preserved from the crate's original name for on-disk compatibility.
 const MAGIC: &[u8; 8] = b"sidecar1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

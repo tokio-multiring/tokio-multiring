@@ -7,8 +7,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use sidecar_s3::{Config, Server, ZeroCopy};
-use tokio_sidecar::{BufferPool, DiskConfig, Domain, Hyperthreads, Plan, Sidecar};
+use multiring_s3::{Config, Server, ZeroCopy};
+use tokio_multiring::{BufferPool, DiskConfig, Domain, Hyperthreads, MultiRing, Plan};
 
 /// Size of the units objects are cut into.
 const UNIT: usize = 128 * 1024;
@@ -94,16 +94,16 @@ fn serve(roots: Vec<PathBuf>, setup: Setup) -> Fixture {
     };
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_time();
-    let rings = tokio_sidecar::Config {
+    let rings = tokio_multiring::Config {
         buffers: Some(pool.clone()),
         disk: setup.polled.then(|| DiskConfig {
             sq_entries: 32,
             sq_thread_idle: Duration::from_millis(50),
             plan: plan.clone(),
         }),
-        ..tokio_sidecar::Config::default()
+        ..tokio_multiring::Config::default()
     };
-    let sidecar = Sidecar::install(&mut builder, rings);
+    let multiring = MultiRing::install(&mut builder, rings);
     let runtime = plan.build(&mut builder).unwrap();
     runtime.block_on(async {
         let mut config = Config::new(&roots);
@@ -114,7 +114,7 @@ fn serve(roots: Vec<PathBuf>, setup: Setup) -> Fixture {
             true => ZeroCopy::Always,
             false => ZeroCopy::Never,
         };
-        Server::new(sidecar, config).unwrap().listen(listener);
+        Server::new(multiring, config).unwrap().listen(listener);
     });
     Fixture {
         address,

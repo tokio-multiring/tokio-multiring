@@ -19,8 +19,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio_sidecar::{
-    BufferPool, Config, Domain, Plan, Reclaim, Segment, Sidecar, TcpListener, TcpStream,
+use tokio_multiring::{
+    BufferPool, Config, Domain, MultiRing, Plan, Reclaim, Segment, TcpListener, TcpStream,
 };
 
 #[derive(Clone, Copy)]
@@ -147,19 +147,19 @@ fn main() -> std::io::Result<()> {
         buffers: Some(pool.clone()),
         ..Config::default()
     };
-    let sidecar = Sidecar::install(&mut builder, config);
+    let multiring = MultiRing::install(&mut builder, config);
     let runtime = plan.build(&mut builder)?;
 
     runtime.block_on(async {
         if per_worker {
             // Bound here once so that an address that cannot be had is an
             // error from `main`, and kept as the first worker's listener.
-            let mut first = Some(Arc::new(TcpListener::bind_reuse_port(&sidecar, address)?));
+            let mut first = Some(Arc::new(TcpListener::bind_reuse_port(&multiring, address)?));
             tokio::task::run_on_each_worker(|worker| {
                 let listener = match worker {
                     0 => first.take().expect("worker 0 runs once"),
                     _ => Arc::new(
-                        TcpListener::bind_reuse_port(&sidecar, address)
+                        TcpListener::bind_reuse_port(&multiring, address)
                             .expect("the address was bound a moment ago"),
                     ),
                 };
@@ -169,7 +169,7 @@ fn main() -> std::io::Result<()> {
                 }
             });
         } else {
-            let listener = Arc::new(TcpListener::bind(&sidecar, address)?);
+            let listener = Arc::new(TcpListener::bind(&multiring, address)?);
             tokio::task::run_on_each_worker(|_| {
                 let listener = listener.clone();
                 let pool = pool.clone();

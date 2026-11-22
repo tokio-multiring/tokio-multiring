@@ -329,6 +329,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "multiring-axum"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "log",
+ "tokio",
+ "tokio-multiring",
+ "tower",
+ "tower-service",
+ "ureq-proto 0.7.1",
+]
+
+[[package]]
+name = "multiring-s3"
+version = "0.1.0"
+dependencies = [
+ "http",
+ "libc",
+ "log",
+ "tokio",
+ "tokio-multiring",
+ "ureq-proto 0.7.1 (git+https://github.com/lthiery/ureq-proto?rev=29bb65256f6a3854d52ca6c00a552b0c1da34be3)",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -378,12 +408,12 @@ dependencies = [
  "http-body-util",
  "libc",
  "log",
+ "multiring-axum",
  "serde",
  "sha2",
- "sidecar-axum",
  "subtle",
  "tokio",
- "tokio-sidecar",
+ "tokio-multiring",
  "tower-service",
  "ureq-proto 0.7.1",
 ]
@@ -466,36 +496,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sidecar-axum"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bytes",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "log",
- "tokio",
- "tokio-sidecar",
- "tower",
- "tower-service",
- "ureq-proto 0.7.1",
-]
-
-[[package]]
-name = "sidecar-s3"
-version = "0.1.0"
-dependencies = [
- "http",
- "libc",
- "log",
- "tokio",
- "tokio-sidecar",
- "ureq-proto 0.7.1 (git+https://github.com/lthiery/ureq-proto?rev=29bb65256f6a3854d52ca6c00a552b0c1da34be3)",
-]
-
-[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -567,7 +567,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-sidecar"
+name = "tokio-multiring"
 version = "0.1.0"
 dependencies = [
  "bytes",

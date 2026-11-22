@@ -73,7 +73,7 @@ impl BufferPool {
     /// Huge pages make a registered buffer cheaper for the kernel to walk,
     /// which helps file I/O. They cannot be combined with registered
     /// zero-copy sends, though: see
-    /// [`Sidecar::send_zc_vectored`](crate::Sidecar::send_zc_vectored),
+    /// [`MultiRing::send_zc_vectored`](crate::MultiRing::send_zc_vectored),
     /// which registers nothing for a pool on huge pages and has the kernel
     /// pin the pages on every send instead. A pool on ordinary pages spares
     /// it that.
