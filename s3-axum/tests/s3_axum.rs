@@ -5,7 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::serve::ListenerExt;
-use s3_axum::{Backend, SidecarStore, TokioStore, router};
+use hmac::{Hmac, Mac};
+use s3_axum::{
+    AppOptions, AuthConfig, Backend, SidecarStore, TokioStore, router, router_with_options,
+};
+use sha2::{Digest, Sha256};
 use sidecar_axum::{Config as HttpConfig, Server, ZeroCopy};
 use tokio::runtime::{Builder, Runtime};
 use tokio_sidecar::{BufferPool, Sidecar};
@@ -106,11 +110,21 @@ fn send_request(stream: &mut TcpStream, head: &str, body: &[u8]) -> (u16, String
     read_response(stream, head.starts_with("HEAD "))
 }
 
+fn read_some(stream: &mut TcpStream, buf: &mut [u8]) -> usize {
+    loop {
+        match stream.read(buf) {
+            Ok(n) => return n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+}
+
 fn read_response(stream: &mut TcpStream, head_only: bool) -> (u16, String, Vec<u8>) {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 8192];
     let head_end = loop {
-        let n = stream.read(&mut chunk).unwrap();
+        let n = read_some(stream, &mut chunk);
         assert!(n > 0, "unexpected EOF waiting for headers");
         raw.extend_from_slice(&chunk[..n]);
         if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -131,7 +145,7 @@ fn read_response(stream: &mut TcpStream, head_only: bool) -> (u16, String, Vec<u
     {
         let len: usize = line["content-length:".len()..].trim().parse().unwrap();
         while body.len() < len {
-            let n = stream.read(&mut chunk).unwrap();
+            let n = read_some(stream, &mut chunk);
             assert!(n > 0, "unexpected EOF reading body");
             body.extend_from_slice(&chunk[..n]);
         }
@@ -363,4 +377,258 @@ fn cross_runtime_on_disk_interoperability() {
     drop(sidecar);
     drop(tokio_srv);
     cleanup(&roots);
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+    mac.update(data);
+    mac.finalize().into_bytes().into()
+}
+
+fn sigv4_headers(
+    method: &str,
+    path: &str,
+    query: &str,
+    host: &str,
+    payload_hash: &str,
+    extra: &[(&str, &str)],
+    auth: &AuthConfig,
+) -> (String, String, [u8; 32]) {
+    let amz_date = "20261122T040000Z";
+    let date = &amz_date[..8];
+    let scope = format!("{date}/us-east-1/s3/aws4_request");
+
+    let mut hdrs: Vec<(&str, &str)> = vec![
+        ("host", host),
+        ("x-amz-content-sha256", payload_hash),
+        ("x-amz-date", amz_date),
+    ];
+    hdrs.extend_from_slice(extra);
+    hdrs.sort_by_key(|(k, _)| *k);
+
+    let mut canon_hdrs = String::new();
+    let mut signed_names = Vec::new();
+    for (k, v) in &hdrs {
+        canon_hdrs.push_str(k);
+        canon_hdrs.push(':');
+        canon_hdrs.push_str(v.trim());
+        canon_hdrs.push('\n');
+        signed_names.push(*k);
+    }
+    let signed_str = signed_names.join(";");
+    let canon_req =
+        format!("{method}\n{path}\n{query}\n{canon_hdrs}\n{signed_str}\n{payload_hash}");
+    let canon_hash = hex::encode(Sha256::digest(canon_req.as_bytes()));
+    let sts = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{canon_hash}");
+
+    let k_date = hmac_sha256(
+        format!("AWS4{}", auth.secret_key).as_bytes(),
+        date.as_bytes(),
+    );
+    let k_region = hmac_sha256(&k_date, b"us-east-1");
+    let k_service = hmac_sha256(&k_region, b"s3");
+    let k_signing = hmac_sha256(&k_service, b"aws4_request");
+    let sig = hex::encode(hmac_sha256(&k_signing, sts.as_bytes()));
+
+    let auth_header = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_str}, Signature={sig}",
+        auth.access_key
+    );
+    let mut raw = format!(
+        "{method} {}{} HTTP/1.1\r\n",
+        path,
+        if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{query}")
+        }
+    );
+    for (k, v) in &hdrs {
+        raw.push_str(&format!("{k}: {v}\r\n"));
+    }
+    raw.push_str(&format!("authorization: {auth_header}\r\n"));
+    (raw, sig, k_signing)
+}
+
+fn run_sigv4_suite(addr: SocketAddr, auth: &AuthConfig) {
+    let host = addr.to_string();
+    let empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    let connect = || {
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_nodelay(true).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    };
+
+    // Unauthenticated request -> 403 AccessDenied
+    let mut s = connect();
+    let (st, _, _) = send_request(&mut s, "GET / HTTP/1.1\r\nhost: test\r\n\r\n", b"");
+    assert_eq!(st, 403);
+
+    // Bad signature -> 403 SignatureDoesNotMatch
+    let wrong = AuthConfig {
+        access_key: auth.access_key.clone(),
+        secret_key: "wrong-secret".into(),
+    };
+    let (mut req, _, _) = sigv4_headers("GET", "/", "", &host, empty_hash, &[], &wrong);
+    req.push_str("\r\n");
+    let (st, _, body) = send_request(&mut s, &req, b"");
+    assert_eq!(st, 403);
+    assert!(String::from_utf8_lossy(&body).contains("SignatureDoesNotMatch"));
+
+    // Create bucket with valid SigV4
+    let (mut req, _, _) = sigv4_headers("PUT", "/secure", "", &host, empty_hash, &[], auth);
+    req.push_str("content-length: 0\r\n\r\n");
+    let (st, _, _) = send_request(&mut s, &req, b"");
+    assert_eq!(st, 200);
+
+    // PUT with exact SHA-256 hash verification
+    let payload: Vec<u8> = (0..100_000usize).map(|i| ((i * 17) & 0xff) as u8).collect();
+    let good_hash = hex::encode(Sha256::digest(&payload));
+    let (mut req, _, _) = sigv4_headers("PUT", "/secure/hashed", "", &host, &good_hash, &[], auth);
+    req.push_str(&format!("content-length: {}\r\n\r\n", payload.len()));
+    let (st, _, _) = send_request(&mut s, &req, &payload);
+    assert_eq!(st, 200);
+
+    // PUT with mismatched SHA-256 -> 400 XAmzContentSHA256Mismatch
+    let mut bad_payload = payload.clone();
+    bad_payload[42] ^= 0xff;
+    let (mut req, _, _) = sigv4_headers("PUT", "/secure/badhash", "", &host, &good_hash, &[], auth);
+    req.push_str(&format!("content-length: {}\r\n\r\n", bad_payload.len()));
+    let (st, _, body) = send_request(&mut s, &req, &bad_payload);
+    assert_eq!(st, 400);
+    assert!(String::from_utf8_lossy(&body).contains("XAmzContentSHA256Mismatch"));
+
+    // Signed aws-chunked upload with trailing checksum header (AWS CLI v2 / SDK style)
+    let chunked_data: Vec<u8> = (0..120_000usize).map(|i| ((i * 29) & 0xff) as u8).collect();
+    let decoded_len_str = chunked_data.len().to_string();
+    let (mut req, mut prev_sig, key) = sigv4_headers(
+        "PUT",
+        "/secure/streamed",
+        "",
+        &host,
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+        &[
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", &decoded_len_str),
+        ],
+        auth,
+    );
+    let mut wire = Vec::new();
+    for piece in chunked_data.chunks(32_768).chain(std::iter::once(&[][..])) {
+        let piece_hash = hex::encode(Sha256::digest(piece));
+        let sts = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n20261122T040000Z\n20261122/us-east-1/s3/aws4_request\n{prev_sig}\n{empty_hash}\n{piece_hash}"
+        );
+        prev_sig = hex::encode(hmac_sha256(&key, sts.as_bytes()));
+        wire.extend_from_slice(
+            format!("{:x};chunk-signature={prev_sig}\r\n", piece.len()).as_bytes(),
+        );
+        wire.extend_from_slice(piece);
+        if !piece.is_empty() {
+            wire.extend_from_slice(b"\r\n");
+        }
+    }
+    wire.extend_from_slice(b"x-amz-checksum-crc32:AAAAAA==\r\n\r\n");
+    req.push_str(&format!("content-length: {}\r\n\r\n", wire.len()));
+    let (st, _, _) = send_request(&mut s, &req, &wire);
+    assert_eq!(st, 200);
+
+    // GET back both objects with valid SigV4 and verify exact bytes
+    let (mut req, _, _) = sigv4_headers("GET", "/secure/hashed", "", &host, empty_hash, &[], auth);
+    req.push_str("\r\n");
+    let (st, _, body) = send_request(&mut s, &req, b"");
+    assert_eq!(st, 200);
+    assert_eq!(body, payload);
+
+    let (mut req, _, _) =
+        sigv4_headers("GET", "/secure/streamed", "", &host, empty_hash, &[], auth);
+    req.push_str("\r\n");
+    let (st, _, body) = send_request(&mut s, &req, b"");
+    assert_eq!(st, 200);
+    assert_eq!(body, chunked_data);
+}
+
+#[test]
+fn sigv4_and_aws_chunked_on_both_runtimes() {
+    let auth = AuthConfig {
+        access_key: "AKIAEXAMPLEKEY".into(),
+        secret_key: "supersecretkey1234567890".into(),
+    };
+
+    // 1. Sidecar runtime
+    let roots_sc = scratch_roots("sigv4-sidecar", 2);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let pool = BufferPool::without_huge_pages(64 * 1024, 32).unwrap();
+    let mut builder = Builder::new_multi_thread();
+    builder.worker_threads(2).enable_time();
+    let sidecar = Sidecar::install(
+        &mut builder,
+        tokio_sidecar::Config {
+            buffers: Some(pool),
+            ..Default::default()
+        },
+    );
+    let rt_sc = builder.build().unwrap();
+    let auth_sc = auth.clone();
+    let roots_clone = roots_sc.clone();
+    rt_sc.block_on(async move {
+        let store = SidecarStore::open(sidecar.clone(), &roots_clone, 16 * 1024, 2).unwrap();
+        let app = router_with_options(
+            Backend::Sidecar(store),
+            AppOptions {
+                trace: false,
+                auth: Some(auth_sc),
+            },
+        );
+        Server::new(
+            sidecar,
+            HttpConfig {
+                connections: 16,
+                head_buffer: 4096,
+                zero_copy: ZeroCopy::Always,
+                worker_local_connections: true,
+                idle_timeout: None,
+            },
+        )
+        .unwrap()
+        .listen(listener, app);
+    });
+    run_sigv4_suite(addr, &auth);
+    drop(rt_sc);
+    cleanup(&roots_sc);
+
+    // 2. Standard Tokio runtime
+    let roots_tk = scratch_roots("sigv4-tokio", 2);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut builder = Builder::new_multi_thread();
+    builder.worker_threads(2).enable_all();
+    let rt_tk = builder.build().unwrap();
+    let auth_tk = auth.clone();
+    let roots_clone = roots_tk.clone();
+    rt_tk.block_on(async move {
+        let store = TokioStore::open(&roots_clone, 16 * 1024, 64 * 1024, false).unwrap();
+        let app = router_with_options(
+            Backend::Tokio(store),
+            AppOptions {
+                trace: false,
+                auth: Some(auth_tk),
+            },
+        );
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .unwrap()
+            .tap_io(|s| {
+                let _ = s.set_nodelay(true);
+            });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+    });
+    run_sigv4_suite(addr, &auth);
+    drop(rt_tk);
+    cleanup(&roots_tk);
 }

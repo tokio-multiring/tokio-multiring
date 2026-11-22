@@ -28,10 +28,12 @@ macro_rules! errors {
 }
 
 errors! {
+    ACCESS_DENIED = FORBIDDEN, "AccessDenied", "Access Denied.";
     BAD_REQUEST = BAD_REQUEST, "BadRequest", "The request body is malformed.";
     BUCKET_EXISTS = CONFLICT, "BucketAlreadyOwnedByYou", "The bucket already exists.";
     BUCKET_NOT_EMPTY = CONFLICT, "BucketNotEmpty", "The bucket is not empty.";
     INTERNAL = INTERNAL_SERVER_ERROR, "InternalError", "The server could not complete the request.";
+    INVALID_ACCESS_KEY = FORBIDDEN, "InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.";
     INVALID_BUCKET_NAME = BAD_REQUEST, "InvalidBucketName", "The bucket name is not valid.";
     INVALID_RANGE = RANGE_NOT_SATISFIABLE, "InvalidRange", "The requested range is not satisfiable.";
     INVALID_URI = BAD_REQUEST, "InvalidURI", "The request path could not be parsed.";
@@ -40,6 +42,8 @@ errors! {
     NOT_IMPLEMENTED = NOT_IMPLEMENTED, "NotImplemented", "The operation is not implemented.";
     NO_SUCH_BUCKET = NOT_FOUND, "NoSuchBucket", "The bucket does not exist.";
     NO_SUCH_KEY = NOT_FOUND, "NoSuchKey", "The key does not exist.";
+    PAYLOAD_MISMATCH = BAD_REQUEST, "XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.";
+    SIGNATURE_MISMATCH = FORBIDDEN, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.";
 }
 
 impl ApiError {

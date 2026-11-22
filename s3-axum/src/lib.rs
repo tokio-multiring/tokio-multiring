@@ -7,9 +7,11 @@ mod error;
 mod join;
 mod name;
 mod sidecar_store;
+mod sigv4;
 mod stripe;
 mod tokio_store;
 
 pub use app::{AppOptions, Backend, router, router_with_options};
 pub use sidecar_store::SidecarStore;
+pub use sigv4::AuthConfig;
 pub use tokio_store::TokioStore;

@@ -22,13 +22,16 @@ use axum::body::Body;
 use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
 use http_body_util::BodyExt;
+use sha2::{Digest, Sha256};
 use sidecar_axum::DirectBody;
+use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, spawn_blocking};
 
 use crate::error::{ApiError, StoreError};
 use crate::join::join_all;
 use crate::name::{Bucket, Object, PART_PREFIX, UPLOAD_PREFIX, decode_key};
+use crate::sigv4::{AwsChunkedDecoder, PayloadMode};
 use crate::stripe::{BLOCK, Geometry, HEADER, Header, ListPage, ListedBucket, ListedObject, Meta};
 
 const OPEN_ATTEMPTS: usize = 8;
@@ -612,6 +615,7 @@ impl TokioStore {
         &self,
         object: &Object,
         body: DirectBody,
+        mode: PayloadMode,
     ) -> Result<Meta, StoreError> {
         let number = self.next_upload.fetch_add(1, Ordering::Relaxed);
         let mut upload = Upload {
@@ -632,8 +636,23 @@ impl TokioStore {
         let geometry = self.geometry;
         let round_len = geometry.round_len();
 
+        let expected_sha256 = match &mode {
+            PayloadMode::ExpectedSha256(d) => Some(*d),
+            _ => None,
+        };
+        let mut hasher = expected_sha256.map(|_| Sha256::new());
+        let mut decoder = match mode {
+            PayloadMode::AwsChunked(spec) => Some(AwsChunkedDecoder::new(spec)),
+            _ => None,
+        };
+
         match body {
-            DirectBody::Empty => {}
+            DirectBody::Empty => {
+                if decoder.is_some() {
+                    self.abort(upload).await;
+                    return Err(ApiError::BAD_REQUEST.into());
+                }
+            }
             DirectBody::Fallback(mut body) => {
                 let mut bufs: Vec<AlignedBuf> = (0..geometry.drives())
                     .map(|_| AlignedBuf::new(geometry.chunk()))
@@ -651,29 +670,67 @@ impl TokioStore {
                         continue;
                     };
                     let mut slice = data.as_ref();
-                    while !slice.is_empty() {
-                        let take = slice.len().min(round_len - filled);
-                        let segments = geometry.fill(filled..filled + take);
-                        let mut offset = 0;
-                        for seg in segments {
-                            bufs[seg.buf].as_mut_slice()[seg.start..][..seg.len]
-                                .copy_from_slice(&slice[offset..offset + seg.len]);
-                            offset += seg.len;
-                        }
-                        filled += take;
-                        slice = &slice[take..];
-                        if filled == round_len {
-                            let to_write = std::mem::replace(
-                                &mut bufs,
-                                (0..geometry.drives())
-                                    .map(|_| AlignedBuf::new(geometry.chunk()))
-                                    .collect(),
-                            );
-                            if let Err(e) = self.write_round(&mut upload, filled, to_write).await {
-                                self.abort(upload).await;
-                                return Err(e.into());
+                    if let Some(ref mut dec) = decoder {
+                        while !slice.is_empty() && !dec.is_done() {
+                            let room = geometry.fill(filled..round_len);
+                            let next = room.first().expect("round is not full");
+                            let output =
+                                &mut bufs[next.buf].as_mut_slice()[next.start..][..next.len];
+                            let (used, produced) = match dec.decode(slice, output) {
+                                Ok(pair) => pair,
+                                Err(err) => {
+                                    self.abort(upload).await;
+                                    return Err(err.into());
+                                }
+                            };
+                            slice = &slice[used..];
+                            filled += produced;
+                            if filled == round_len {
+                                let to_write = std::mem::replace(
+                                    &mut bufs,
+                                    (0..geometry.drives())
+                                        .map(|_| AlignedBuf::new(geometry.chunk()))
+                                        .collect(),
+                                );
+                                if let Err(e) =
+                                    self.write_round(&mut upload, filled, to_write).await
+                                {
+                                    self.abort(upload).await;
+                                    return Err(e.into());
+                                }
+                                filled = 0;
                             }
-                            filled = 0;
+                        }
+                    } else {
+                        if let Some(ref mut h) = hasher {
+                            h.update(slice);
+                        }
+                        while !slice.is_empty() {
+                            let take = slice.len().min(round_len - filled);
+                            let segments = geometry.fill(filled..filled + take);
+                            let mut offset = 0;
+                            for seg in segments {
+                                bufs[seg.buf].as_mut_slice()[seg.start..][..seg.len]
+                                    .copy_from_slice(&slice[offset..offset + seg.len]);
+                                offset += seg.len;
+                            }
+                            filled += take;
+                            slice = &slice[take..];
+                            if filled == round_len {
+                                let to_write = std::mem::replace(
+                                    &mut bufs,
+                                    (0..geometry.drives())
+                                        .map(|_| AlignedBuf::new(geometry.chunk()))
+                                        .collect(),
+                                );
+                                if let Err(e) =
+                                    self.write_round(&mut upload, filled, to_write).await
+                                {
+                                    self.abort(upload).await;
+                                    return Err(e.into());
+                                }
+                                filled = 0;
+                            }
                         }
                     }
                 }
@@ -689,6 +746,20 @@ impl TokioStore {
                 return Err(StoreError::Io(io::Error::other(
                     "TokioStore received DirectBody::Direct unexpectedly",
                 )));
+            }
+        }
+
+        if let Some(dec) = decoder
+            && let Err(err) = dec.finish()
+        {
+            self.abort(upload).await;
+            return Err(err.into());
+        }
+        if let (Some(expected), Some(h)) = (expected_sha256, hasher) {
+            let actual: [u8; 32] = h.finalize().into();
+            if actual.ct_eq(&expected).unwrap_u8() != 1 {
+                self.abort(upload).await;
+                return Err(ApiError::PAYLOAD_MISMATCH.into());
             }
         }
 

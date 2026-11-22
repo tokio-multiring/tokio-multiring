@@ -14,13 +14,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use http_body_util::BodyExt;
+use sha2::{Digest, Sha256};
 use sidecar_axum::{BodyError, BodySink, DirectBody, DirectWrite, SidecarDirectBody};
+use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tokio_sidecar::{BufferPool, FixedBuf, Reclaim, Sidecar};
 
 use crate::error::{ApiError, StoreError};
 use crate::join::{Started, join_all};
 use crate::name::{Bucket, Object, PART_PREFIX, UPLOAD_PREFIX, decode_key};
+use crate::sigv4::{AwsChunkedDecoder, AwsChunkedSpec, PayloadMode};
 use crate::stripe::{
     BLOCK, Geometry, HEADER, Header, ListPage, ListedBucket, ListedObject, Meta, Plan,
 };
@@ -744,10 +747,27 @@ impl SidecarStore {
         &self,
         object: &Object,
         body: DirectBody,
+        mode: PayloadMode,
     ) -> Result<Meta, StoreError> {
         let mut upload = self.begin(object).await?;
         let scratch = match body {
-            DirectBody::Empty => self.buffers.acquire().await,
+            DirectBody::Empty => {
+                match mode {
+                    PayloadMode::Plain => {}
+                    PayloadMode::ExpectedSha256(expected) => {
+                        let actual: [u8; 32] = Sha256::digest([]).into();
+                        if actual.ct_eq(&expected).unwrap_u8() != 1 {
+                            self.abort(upload).await;
+                            return Err(ApiError::PAYLOAD_MISMATCH.into());
+                        }
+                    }
+                    PayloadMode::AwsChunked(_) => {
+                        self.abort(upload).await;
+                        return Err(ApiError::BAD_REQUEST.into());
+                    }
+                }
+                self.buffers.acquire().await
+            }
             DirectBody::Direct(mut direct) => {
                 if let Err(err) = direct.accept_100().await {
                     self.abort(upload).await;
@@ -756,7 +776,18 @@ impl SidecarStore {
                         BodyError::Malformed(_) => StoreError::Api(ApiError::BAD_REQUEST),
                     });
                 }
-                match self.receive_direct(&mut direct, &mut upload).await {
+                let res = match mode {
+                    PayloadMode::Plain => self.receive_direct(&mut direct, &mut upload, None).await,
+                    PayloadMode::ExpectedSha256(expected) => {
+                        self.receive_direct(&mut direct, &mut upload, Some(expected))
+                            .await
+                    }
+                    PayloadMode::AwsChunked(spec) => {
+                        self.receive_direct_aws_chunked(&mut direct, &mut upload, spec)
+                            .await
+                    }
+                };
+                match res {
                     Ok(mut bufs) => bufs.swap_remove(0),
                     Err(err) => {
                         self.abort(upload).await;
@@ -765,7 +796,7 @@ impl SidecarStore {
                 }
             }
             DirectBody::Fallback(mut body) => {
-                match self.receive_fallback(&mut body, &mut upload).await {
+                match self.receive_fallback(&mut body, &mut upload, mode).await {
                     Ok(mut bufs) => bufs.swap_remove(0),
                     Err(err) => {
                         self.abort(upload).await;
@@ -781,6 +812,7 @@ impl SidecarStore {
         &self,
         direct: &mut SidecarDirectBody,
         upload: &mut Upload,
+        expected_sha256: Option<[u8; 32]>,
     ) -> Result<Vec<FixedBuf>, StoreError> {
         let geometry = self.geometry;
         let round_len = geometry.round_len();
@@ -790,6 +822,7 @@ impl SidecarStore {
         };
         let mut free = self.acquire_window(parts, rounds).await;
         let mut writing = VecDeque::new();
+        let mut hasher = expected_sha256.map(|_| Sha256::new());
 
         loop {
             let mut bufs = match free.pop() {
@@ -835,6 +868,11 @@ impl SidecarStore {
                 free.push(bufs);
                 break;
             }
+            if let Some(ref mut h) = hasher {
+                for seg in geometry.fill(0..filled) {
+                    h.update(&bufs[seg.buf].spare_capacity_mut()[seg.start..][..seg.len]);
+                }
+            }
             let round = self.begin_round(upload, filled).await?;
             writing.push_back(Started::start(self.write_round(round, bufs)).await);
             if direct.is_ended() {
@@ -847,6 +885,83 @@ impl SidecarStore {
             written?;
             free.push(bufs);
         }
+        if let (Some(expected), Some(h)) = (expected_sha256, hasher) {
+            let actual: [u8; 32] = h.finalize().into();
+            if actual.ct_eq(&expected).unwrap_u8() != 1 {
+                return Err(ApiError::PAYLOAD_MISMATCH.into());
+            }
+        }
+        Ok(free.into_iter().flatten().collect())
+    }
+
+    async fn receive_direct_aws_chunked(
+        &self,
+        direct: &mut SidecarDirectBody,
+        upload: &mut Upload,
+        spec: AwsChunkedSpec,
+    ) -> Result<Vec<FixedBuf>, StoreError> {
+        let geometry = self.geometry;
+        let round_len = geometry.round_len();
+        let (parts, rounds) = match spec.decoded_len {
+            Some(len) => (geometry.parts(len), len.div_ceil(round_len as u64).max(1)),
+            None => (geometry.drives(), u64::MAX),
+        };
+        let mut free = self.acquire_window(parts, rounds).await;
+        let mut writing = VecDeque::new();
+        let mut decoder = AwsChunkedDecoder::new(spec);
+        let mut encoded = vec![0u8; 64 * 1024];
+        let mut enc_start = 0usize;
+        let mut enc_end = 0usize;
+
+        loop {
+            let mut bufs = match free.pop() {
+                Some(bufs) => bufs,
+                None => {
+                    let oldest: Started<_> = writing.pop_front().expect("every buffer is in use");
+                    let (written, bufs) = oldest.finish().await;
+                    written?;
+                    bufs
+                }
+            };
+            bufs.iter_mut().for_each(FixedBuf::clear);
+            let mut filled = 0usize;
+
+            while filled < round_len && !decoder.is_done() {
+                if enc_start == enc_end {
+                    enc_start = 0;
+                    enc_end = direct.read_into(&mut encoded).await.map_err(|e| match e {
+                        BodyError::Io(err) => StoreError::Io(err),
+                        BodyError::Malformed(_) => StoreError::Api(ApiError::BAD_REQUEST),
+                    })?;
+                    if enc_end == 0 {
+                        break;
+                    }
+                }
+                let room = geometry.fill(filled..round_len);
+                let next = room.first().expect("round is not full");
+                let output = &mut bufs[next.buf].spare_capacity_mut()[next.start..][..next.len];
+                let (used, produced) = decoder.decode(&encoded[enc_start..enc_end], output)?;
+                enc_start += used;
+                filled += produced;
+            }
+
+            if filled == 0 {
+                free.push(bufs);
+                break;
+            }
+            let round = self.begin_round(upload, filled).await?;
+            writing.push_back(Started::start(self.write_round(round, bufs)).await);
+            if decoder.is_done() {
+                break;
+            }
+        }
+
+        for write in writing {
+            let (written, bufs) = write.finish().await;
+            written?;
+            free.push(bufs);
+        }
+        decoder.finish()?;
         Ok(free.into_iter().flatten().collect())
     }
 
@@ -854,6 +969,7 @@ impl SidecarStore {
         &self,
         body: &mut axum::body::Body,
         upload: &mut Upload,
+        mode: PayloadMode,
     ) -> Result<Vec<FixedBuf>, StoreError> {
         let geometry = self.geometry;
         let round_len = geometry.round_len();
@@ -861,30 +977,62 @@ impl SidecarStore {
         bufs.iter_mut().for_each(FixedBuf::clear);
         let mut filled = 0usize;
 
+        let expected_sha256 = match &mode {
+            PayloadMode::ExpectedSha256(d) => Some(*d),
+            _ => None,
+        };
+        let mut hasher = expected_sha256.map(|_| Sha256::new());
+        let mut decoder = match mode {
+            PayloadMode::AwsChunked(spec) => Some(AwsChunkedDecoder::new(spec)),
+            _ => None,
+        };
+
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(|e| StoreError::Io(io::Error::other(e)))?;
             let Ok(data) = frame.into_data() else {
                 continue;
             };
             let mut slice = data.as_ref();
-            while !slice.is_empty() {
-                let take = slice.len().min(round_len - filled);
-                let segments = geometry.fill(filled..filled + take);
-                let mut offset = 0;
-                for seg in segments {
-                    bufs[seg.buf].spare_capacity_mut()[seg.start..][..seg.len]
-                        .copy_from_slice(&slice[offset..offset + seg.len]);
-                    offset += seg.len;
+            if let Some(ref mut dec) = decoder {
+                while !slice.is_empty() && !dec.is_done() {
+                    let room = geometry.fill(filled..round_len);
+                    let next = room.first().expect("round is not full");
+                    let output = &mut bufs[next.buf].spare_capacity_mut()[next.start..][..next.len];
+                    let (used, produced) = dec.decode(slice, output)?;
+                    slice = &slice[used..];
+                    filled += produced;
+                    if filled == round_len {
+                        let round = self.begin_round(upload, filled).await?;
+                        let (written, returned) = self.write_round(round, bufs).await;
+                        bufs = returned;
+                        written?;
+                        bufs.iter_mut().for_each(FixedBuf::clear);
+                        filled = 0;
+                    }
                 }
-                filled += take;
-                slice = &slice[take..];
-                if filled == round_len {
-                    let round = self.begin_round(upload, filled).await?;
-                    let (written, returned) = self.write_round(round, bufs).await;
-                    bufs = returned;
-                    written?;
-                    bufs.iter_mut().for_each(FixedBuf::clear);
-                    filled = 0;
+            } else {
+                if let Some(ref mut h) = hasher {
+                    h.update(slice);
+                }
+                while !slice.is_empty() {
+                    let take = slice.len().min(round_len - filled);
+                    let segments = geometry.fill(filled..filled + take);
+                    let mut offset = 0;
+                    for seg in segments {
+                        bufs[seg.buf].spare_capacity_mut()[seg.start..][..seg.len]
+                            .copy_from_slice(&slice[offset..offset + seg.len]);
+                        offset += seg.len;
+                    }
+                    filled += take;
+                    slice = &slice[take..];
+                    if filled == round_len {
+                        let round = self.begin_round(upload, filled).await?;
+                        let (written, returned) = self.write_round(round, bufs).await;
+                        bufs = returned;
+                        written?;
+                        bufs.iter_mut().for_each(FixedBuf::clear);
+                        filled = 0;
+                    }
                 }
             }
         }
@@ -893,6 +1041,15 @@ impl SidecarStore {
             let (written, returned) = self.write_round(round, bufs).await;
             bufs = returned;
             written?;
+        }
+        if let Some(dec) = decoder {
+            dec.finish()?;
+        }
+        if let (Some(expected), Some(h)) = (expected_sha256, hasher) {
+            let actual: [u8; 32] = h.finalize().into();
+            if actual.ct_eq(&expected).unwrap_u8() != 1 {
+                return Err(ApiError::PAYLOAD_MISMATCH.into());
+            }
         }
         Ok(bufs)
     }

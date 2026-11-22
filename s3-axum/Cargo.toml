@@ -11,12 +11,16 @@ publish = false
 axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio"] }
 bytes = "1"
 futures-core = "0.3"
+hex = "0.4"
+hmac = "0.12"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
 libc = "0.2"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 sidecar-axum = { path = "../sidecar-axum" }
+subtle = "2"
 tokio = { path = "../../tokio-uring-wl/tokio", features = ["macros", "net", "rt-multi-thread", "sync", "time", "worker-local"] }
 tokio-sidecar = { path = ".." }

@@ -22,6 +22,7 @@ use crate::date;
 use crate::error::{ApiError, StoreError};
 use crate::name::{Bucket, Object, Target};
 use crate::sidecar_store::{SidecarStore, SidecarStored};
+use crate::sigv4::{self, AuthConfig, PayloadMode};
 use crate::stripe::Meta;
 use crate::tokio_store::{TokioStore, TokioStored};
 
@@ -46,10 +47,13 @@ impl Backend {
 }
 
 /// Optional router-level middleware settings.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct AppOptions {
     /// Log method, path, status, and latency for every request via Axum middleware.
     pub trace: bool,
+    /// Optional AWS SigV4 authentication credentials. When `Some`, every request
+    /// must carry a valid `AWS4-HMAC-SHA256` `Authorization` header.
+    pub auth: Option<AuthConfig>,
 }
 
 /// Builds the unified Axum S3 [`Router`] for either runtime with default options.
@@ -89,11 +93,31 @@ pub fn router_with_options(backend: Backend, options: AppOptions) -> Router {
         .fallback(fallback_handler)
         .with_state(backend);
 
+    // Optional SigV4 authentication layer (runs before the handler while
+    // leaving DirectBody / DirectResponse completely intact).
+    let app = if let Some(auth) = options.auth {
+        let auth = Arc::new(auth);
+        app.layer(middleware::from_fn(move |mut req: Request, next: Next| {
+            let auth = auth.clone();
+            async move {
+                match sigv4::verify_request(&auth, req.method(), req.uri(), req.headers()) {
+                    Ok(mode) => {
+                        req.extensions_mut().insert(mode);
+                        next.run(req).await
+                    }
+                    Err(err) => err.into_response(),
+                }
+            }
+        }))
+    } else {
+        app
+    };
+
     // Real Axum middleware layer that runs on every request on BOTH runtimes
     // while leaving `DirectBody` and `DirectResponse` intact on sidecar-axum.
+    let trace = options.trace;
     app.layer(middleware::from_fn(move |req: Request, next: Next| {
         let runtime_header = runtime_header.clone();
-        let trace = options.trace;
         async move {
             let started = trace.then(Instant::now);
             let method = trace.then(|| req.method().clone());
@@ -330,12 +354,18 @@ async fn delete_bucket(State(backend): State<Backend>, uri: Uri) -> Result<Respo
 async fn put_object(
     State(backend): State<Backend>,
     uri: Uri,
+    headers: HeaderMap,
+    extensions: http::Extensions,
     body: DirectBody,
 ) -> Result<Response, StoreError> {
     let object = parse_object(&uri)?;
+    let mode = extensions
+        .get::<PayloadMode>()
+        .cloned()
+        .unwrap_or_else(|| sigv4::detect_unauthenticated_mode(&headers));
     let meta = match &backend {
-        Backend::Sidecar(s) => s.put_object(&object, body).await?,
-        Backend::Tokio(s) => s.put_object(&object, body).await?,
+        Backend::Sidecar(s) => s.put_object(&object, body, mode).await?,
+        Backend::Tokio(s) => s.put_object(&object, body, mode).await?,
     };
     Ok(Response::builder()
         .status(StatusCode::OK)

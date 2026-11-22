@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use axum::serve::ListenerExt;
-use s3_axum::{AppOptions, Backend, SidecarStore, TokioStore, router_with_options};
+use s3_axum::{AppOptions, AuthConfig, Backend, SidecarStore, TokioStore, router_with_options};
 use sidecar_axum::{Config as HttpConfig, Server, ZeroCopy};
 use tokio_sidecar::{BufferPool, DiskConfig, Domain, Hyperthreads, Plan, Sidecar};
 
@@ -28,6 +28,8 @@ usage: s3-axum --runtime sidecar|tokio --root DIR [--root DIR ...] [options]
   --steal-connections   spawn connection tasks with tokio::spawn instead of worker-local
   --idle-timeout SECS   close idle keep-alive connections after SECS (sidecar)
   --trace               log method, path, status, and latency via Axum middleware
+  --access-key KEY      enable AWS SigV4 auth (must pair with --secret-key)
+  --secret-key SECRET   AWS SigV4 secret key (must pair with --access-key)
   --polled              opt into IOPOLL+SQPOLL disk rings (off by default)
   --direct              use O_DIRECT in spawn_blocking (tokio runtime only)";
 
@@ -54,6 +56,8 @@ struct Options {
     worker_local_connections: bool,
     idle_timeout: Option<Duration>,
     trace: bool,
+    access_key: Option<String>,
+    secret_key: Option<String>,
     polled: bool,
     direct: bool,
 }
@@ -77,6 +81,8 @@ impl Options {
             worker_local_connections: true,
             idle_timeout: None,
             trace: false,
+            access_key: None,
+            secret_key: None,
             polled: false,
             direct: false,
         };
@@ -125,6 +131,12 @@ impl Options {
                     opts.idle_timeout = Some(Duration::from_secs(secs as u64));
                 }
                 "--trace" => opts.trace = true,
+                "--access-key" => {
+                    opts.access_key = Some(args.next().ok_or("--access-key needs a value")?);
+                }
+                "--secret-key" => {
+                    opts.secret_key = Some(args.next().ok_or("--secret-key needs a value")?);
+                }
                 "--polled" => opts.polled = true,
                 "--direct" => opts.direct = true,
                 other => return Err(format!("unknown option `{other}`")),
@@ -132,6 +144,9 @@ impl Options {
         }
         if opts.roots.is_empty() {
             return Err("--root is required".into());
+        }
+        if opts.access_key.is_some() != opts.secret_key.is_some() {
+            return Err("--access-key and --secret-key must be provided together".into());
         }
         Ok(opts)
     }
@@ -188,6 +203,18 @@ fn run(opts: Options) -> std::io::Result<()> {
     let address = listener.local_addr()?;
     let roots_display: Vec<_> = opts.roots.iter().map(|r| r.display()).collect();
 
+    let auth = match (opts.access_key, opts.secret_key) {
+        (Some(access_key), Some(secret_key)) => Some(AuthConfig {
+            access_key,
+            secret_key,
+        }),
+        _ => None,
+    };
+    let app_opts = AppOptions {
+        trace: opts.trace,
+        auth,
+    };
+
     match opts.runtime {
         RuntimeKind::Sidecar => {
             let buffers = match opts.small_pages {
@@ -215,8 +242,7 @@ fn run(opts: Options) -> std::io::Result<()> {
                     opts.stripe_unit,
                     opts.window,
                 )?;
-                let app =
-                    router_with_options(Backend::Sidecar(store), AppOptions { trace: opts.trace });
+                let app = router_with_options(Backend::Sidecar(store), app_opts);
                 let http_cfg = HttpConfig {
                     connections: opts.connections,
                     zero_copy: opts.zero_copy,
@@ -251,8 +277,7 @@ fn run(opts: Options) -> std::io::Result<()> {
             runtime.block_on(async {
                 let store =
                     TokioStore::open(&opts.roots, opts.stripe_unit, opts.buffer_size, opts.direct)?;
-                let app =
-                    router_with_options(Backend::Tokio(store), AppOptions { trace: opts.trace });
+                let app = router_with_options(Backend::Tokio(store), app_opts);
                 let listener = tokio::net::TcpListener::from_std(listener)?.tap_io(|stream| {
                     let _ = stream.set_nodelay(true);
                 });
