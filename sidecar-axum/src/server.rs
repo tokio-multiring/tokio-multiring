@@ -190,7 +190,9 @@ where
             drop(slot);
         };
         if shared.worker_local_connections {
-            tokio::task::spawn_worker_local(fut);
+            tokio::task::run_on_any_worker(move || {
+                tokio::task::spawn_worker_local(fut);
+            });
         } else {
             tokio::spawn(fut);
         }
