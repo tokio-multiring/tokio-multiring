@@ -220,6 +220,47 @@ fn run_suite(server: &RunningServer) {
     );
     assert_eq!(body, &big[15000..=50000]);
 
+    // Range GET on a small (inline-read) 4096-byte object
+    let small: Vec<u8> = (0..4096usize)
+        .map(|i| ((i * 31 + 2 * 7) & 0xff) as u8)
+        .collect();
+    let (st, _, body) = send_request(
+        &mut s,
+        "GET /photos/obj-2 HTTP/1.1\r\nhost: test\r\nrange: bytes=100-599\r\n\r\n",
+        b"",
+    );
+    assert_eq!(st, 206);
+    assert_eq!(body, &small[100..=599]);
+
+    // Overwrite a multi-part object (210 KiB) with a small single-part object (4 KiB),
+    // then overwrite back to a multi-part object, verifying exact data both times.
+    let small_replacement = vec![0xabu8; 4096];
+    let req = format!(
+        "PUT /photos/obj-5 HTTP/1.1\r\nhost: test\r\ncontent-length: {}\r\n\r\n",
+        small_replacement.len()
+    );
+    assert_eq!(send_request(&mut s, &req, &small_replacement).0, 200);
+    let (st, _, body) = send_request(
+        &mut s,
+        "GET /photos/obj-5 HTTP/1.1\r\nhost: test\r\n\r\n",
+        b"",
+    );
+    assert_eq!(st, 200);
+    assert_eq!(body, small_replacement);
+
+    let req = format!(
+        "PUT /photos/obj-5 HTTP/1.1\r\nhost: test\r\ncontent-length: {}\r\n\r\n",
+        big.len()
+    );
+    assert_eq!(send_request(&mut s, &req, &big).0, 200);
+    let (st, _, body) = send_request(
+        &mut s,
+        "GET /photos/obj-5 HTTP/1.1\r\nhost: test\r\n\r\n",
+        b"",
+    );
+    assert_eq!(st, 200);
+    assert_eq!(body, big);
+
     // Unsatisfiable range -> 416
     let (st, _, _) = send_request(
         &mut s,

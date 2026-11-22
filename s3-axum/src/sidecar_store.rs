@@ -32,6 +32,9 @@ static ZEROS: [u8; BLOCK] = [0; BLOCK];
 const OPEN_ATTEMPTS: usize = 8;
 const COMMIT_LOCKS: usize = 256;
 const ZERO_COPY_MIN: usize = 64 * 1024;
+/// Bytes read up front in `open_object` (4 KiB header + up to 12 KiB inline payload).
+/// Small objects (<= 12 KiB) complete in one disk read and one buffer acquisition.
+const INLINE_READ: usize = 16 * 1024;
 
 pub struct SidecarStore {
     sidecar: Sidecar,
@@ -47,6 +50,9 @@ pub struct SidecarStore {
 
 pub(crate) struct SidecarStored {
     files: Vec<Arc<OwnedFd>>,
+    /// For small single-part objects whose entire body was already fetched
+    /// alongside the 4 KiB header in `open_object`.
+    inline: Option<FixedBuf>,
     pub(crate) meta: Meta,
 }
 
@@ -383,13 +389,14 @@ impl SidecarStore {
         (result, buf)
     }
 
-    async fn read_header(
+    async fn read_header_with_limit(
         &self,
         file: &Arc<OwnedFd>,
         mut buf: FixedBuf,
+        limit: usize,
     ) -> (io::Result<Header>, FixedBuf) {
         buf.clear();
-        let (read, buf) = self.read_at(file, buf, 0, HEADER).await;
+        let (read, buf) = self.read_at(file, buf, 0, limit).await;
         let header = read.and_then(|_| {
             Header::decode(&buf, &self.geometry).ok_or_else(|| {
                 io::Error::new(
@@ -399,6 +406,14 @@ impl SidecarStore {
             })
         });
         (header, buf)
+    }
+
+    async fn read_header(
+        &self,
+        file: &Arc<OwnedFd>,
+        buf: FixedBuf,
+    ) -> (io::Result<Header>, FixedBuf) {
+        self.read_header_with_limit(file, buf, HEADER).await
     }
 
     async fn open_first(&self, object: &Object) -> Result<Arc<OwnedFd>, StoreError> {
@@ -425,14 +440,18 @@ impl SidecarStore {
     pub(crate) async fn open_object(&self, object: &Object) -> Result<SidecarStored, StoreError> {
         let first = object.first_drive(self.drives.len());
         let mut scratch = self.buffers.acquire().await;
+        let inline_limit = INLINE_READ.min(scratch.capacity());
         'attempt: for _ in 0..OPEN_ATTEMPTS {
             let file = self.open_first(object).await?;
-            let (header, returned) = self.read_header(&file, scratch).await;
+            let (header, returned) = self
+                .read_header_with_limit(&file, scratch, inline_limit)
+                .await;
             scratch = returned;
             let header = header?;
 
+            let parts = self.geometry.parts(header.size);
             let mut files = vec![file];
-            for part in 1..self.geometry.parts(header.size) {
+            for part in 1..parts {
                 let path = object.bucket.file(&part_name(header.id, part));
                 let flags = libc::O_RDONLY | libc::O_DIRECT;
                 match self
@@ -445,8 +464,17 @@ impl SidecarStore {
                     Err(error) => return Err(error.into()),
                 }
             }
+            let inline = if parts == 1
+                && header.size > 0
+                && scratch.len() >= HEADER + header.size as usize
+            {
+                Some(scratch)
+            } else {
+                None
+            };
             return Ok(SidecarStored {
                 files,
+                inline,
                 meta: Meta {
                     size: header.size,
                     modified: header.modified,
@@ -494,6 +522,20 @@ impl SidecarStore {
     }
 
     async fn current(&self, object: &Object, scratch: FixedBuf) -> (Option<Header>, FixedBuf) {
+        // An object with additional parts (> 1 part) has size > stripe_unit, so
+        // part 0 is always at least `HEADER + unit` bytes on disk. A single
+        // `statx` skips open + read + close for missing keys and all small
+        // single-part objects.
+        let drive = self.drive(object.first_drive(self.drives.len()), 0);
+        match self.sidecar.stat_at(drive, object.path()).await {
+            Ok(stat) if stat.size < (HEADER + self.geometry.unit()) as u64 => {
+                return (None, scratch);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return (None, scratch);
+            }
+            Ok(_) | Err(_) => {}
+        }
         let file = match self.open_first(object).await {
             Ok(file) => file,
             Err(StoreError::Api(_)) => return (None, scratch),
@@ -776,6 +818,31 @@ impl SidecarStore {
                         BodyError::Malformed(_) => StoreError::Api(ApiError::BAD_REQUEST),
                     });
                 }
+                // Fast path for small single-part objects (<= stripe_unit):
+                // receive payload at offset HEADER inside one buffer, prepend
+                // the 4 KiB header, and write header+data in a single contiguous
+                // io_uring O_DIRECT write at offset 0 (no hole at offset 0, one
+                // XFS extent allocation, one write SQE).
+                if let Some(len) = direct.remaining()
+                    && len <= self.geometry.unit() as u64
+                    && (HEADER + len as usize).next_multiple_of(BLOCK) <= self.buffers.buf_size()
+                    && !matches!(mode, PayloadMode::AwsChunked(_))
+                {
+                    let expected_sha256 = match mode {
+                        PayloadMode::ExpectedSha256(d) => Some(d),
+                        _ => None,
+                    };
+                    return match self
+                        .put_small_direct(&mut direct, &mut upload, len as usize, expected_sha256)
+                        .await
+                    {
+                        Ok(meta) => Ok(meta),
+                        Err(err) => {
+                            self.abort(upload).await;
+                            Err(err)
+                        }
+                    };
+                }
                 let res = match mode {
                     PayloadMode::Plain => self.receive_direct(&mut direct, &mut upload, None).await,
                     PayloadMode::ExpectedSha256(expected) => {
@@ -806,6 +873,107 @@ impl SidecarStore {
             }
         };
         Ok(self.finish(upload, scratch).await?)
+    }
+
+    /// Single-write fast path for small single-part objects (`<= stripe_unit`).
+    async fn put_small_direct(
+        &self,
+        direct: &mut SidecarDirectBody,
+        upload: &mut Upload,
+        len: usize,
+        expected_sha256: Option<[u8; 32]>,
+    ) -> Result<Meta, StoreError> {
+        let mut buf = self.buffers.acquire().await;
+        buf.clear();
+
+        let mut filled = 0usize;
+        while filled < len && !direct.is_ended() {
+            if !direct.has_pending() {
+                let seg = [tokio_sidecar::Segment {
+                    buf: 0,
+                    start: HEADER + filled,
+                    len: len - filled,
+                }];
+                let (res, mut bufs) = direct.recv_vectored(vec![buf], &seg).await;
+                buf = bufs.pop().expect("buffer returned");
+                filled += res.map_err(|e| match e {
+                    BodyError::Io(err) => StoreError::Io(err),
+                    BodyError::Malformed(_) => StoreError::Api(ApiError::BAD_REQUEST),
+                })?;
+            } else {
+                let dst = &mut buf.spare_capacity_mut()[HEADER + filled..HEADER + len];
+                let n = direct.read_into(dst).await.map_err(|e| match e {
+                    BodyError::Io(err) => StoreError::Io(err),
+                    BodyError::Malformed(_) => StoreError::Api(ApiError::BAD_REQUEST),
+                })?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+        }
+        if filled != len {
+            return Err(StoreError::Io(io::Error::from(
+                io::ErrorKind::UnexpectedEof,
+            )));
+        }
+
+        if let Some(expected) = expected_sha256 {
+            let actual: [u8; 32] =
+                Sha256::digest(&buf.spare_capacity_mut()[HEADER..HEADER + len]).into();
+            if actual.ct_eq(&expected).unwrap_u8() != 1 {
+                return Err(ApiError::PAYLOAD_MISMATCH.into());
+            }
+        }
+
+        upload.size = len as u64;
+        upload.ended = true;
+        let header = Header {
+            size: upload.size,
+            modified: now(),
+            id: upload.id,
+        };
+        let encoded = header.encode(&self.geometry);
+        let aligned_len = (HEADER + len).next_multiple_of(BLOCK);
+        {
+            let raw = buf.spare_capacity_mut();
+            raw[..HEADER].copy_from_slice(&encoded);
+            raw[HEADER + len..aligned_len].fill(0);
+        }
+        buf.grow(aligned_len);
+
+        let staged_first = upload.parts[0]
+            .as_ref()
+            .expect("an upload has a first part");
+        let (written, scratch) = self.write_at(&staged_first.file, buf, 0).await;
+        written?;
+        if aligned_len != HEADER + len {
+            self.sidecar
+                .truncate(staged_first.file.clone(), (HEADER + len) as u64)
+                .await?;
+        }
+        self.sidecar.fdatasync(staged_first.file.clone()).await?;
+
+        let _commit = self.commits[Self::lock_of(&upload.object)].lock().await;
+        let replaced = match self.drives.len() {
+            1 => None,
+            _ => self.current(&upload.object, scratch).await.0,
+        };
+        self.sidecar
+            .rename_at(
+                self.drive(upload.first, 0),
+                staged_first.path.clone(),
+                upload.object.path(),
+            )
+            .await?;
+        if let Some(replaced) = replaced {
+            self.remove_parts(&upload.object.bucket, upload.first, &replaced)
+                .await;
+        }
+        Ok(Meta {
+            size: header.size,
+            modified: header.modified,
+        })
     }
 
     async fn receive_direct(
@@ -1082,6 +1250,21 @@ impl DirectWrite for SidecarObjectWriter {
         sink: &'a mut BodySink<'a>,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            if self.range.is_empty() {
+                return Ok(());
+            }
+            // Fast path: small single-part object already fetched alongside its
+            // 4 KiB header in `open_object` — zero extra disk read, zero extra
+            // buffer acquire, and coalesced with HTTP response headers!
+            if let Some(buf) = self.stored.inline {
+                let seg = [tokio_sidecar::Segment {
+                    buf: 0,
+                    start: HEADER + self.range.start as usize,
+                    len: (self.range.end - self.range.start) as usize,
+                }];
+                let (sent, _bufs) = sink.send_vectored(vec![buf], &seg).await;
+                return sent;
+            }
             let geometry = self.store.geometry;
             let mut rounds = geometry.rounds(&self.range);
             if rounds.is_empty() {

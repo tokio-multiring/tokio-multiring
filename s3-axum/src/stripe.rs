@@ -55,6 +55,10 @@ impl Geometry {
         self.drives
     }
 
+    pub(crate) fn unit(&self) -> usize {
+        self.unit
+    }
+
     pub(crate) fn chunk(&self) -> usize {
         self.chunk
     }
