@@ -1,21 +1,32 @@
-# tokio-sidecar and sidecar-s3
+# tokio-sidecar, sidecar-s3, sidecar-axum and s3-axum
 
-Two crates in one workspace:
+Four crates in one workspace:
 
 - **`tokio-sidecar`** (repo root): an io_uring reactor that drives a tokio
   runtime in place of tokio's own I/O driver, one ring per worker. Workers
   sleep in their rings, tokio's sockets are watched by them, and the crate's
   own operations go straight onto them. Operation futures are `Send`; buffers
   and descriptors move into an operation and come back with its result.
-- **`sidecar-s3`** (`s3/`): an S3-style object server built on it, speaking
-  HTTP through the server half of ureq-proto. This is the point of the
-  project: show what ureq-proto's buffer-ownership API allows when the I/O
-  underneath is io_uring with registered buffers, zero-copy sends and polled
-  disks.
+- **`sidecar-s3`** (`s3/`): hand-rolled S3-style object server built on it,
+  speaking HTTP through the server half of ureq-proto. Kept as the zero-overhead
+  reference baseline.
+- **`sidecar-axum`** (`sidecar-axum/`): serves any real `axum::Router`
+  (`tower_service::Service<Request<Body>, Response = Response<Body>>`) over
+  `tokio-sidecar` and `ureq-proto` — no Hyper and no Axum fork. Standard Axum
+  extractors, responses, and Tower middleware work unmodified; handlers can opt
+  into `DirectBody` (`FromRequest`, transparent fallback to `axum::body::Body`
+  on Hyper) and `DirectResponse` / `DirectWrite` (`IntoResponse`) for registered
+  buffers, coalesced head+body vectored sends, and `send_zc_vectored`.
+- **`s3-axum`** (`s3-axum/`): unified Axum S3 app (one `axum::Router`,
+  middleware, `ListBuckets`/`ListObjectsV2`, optional AWS SigV4 + `aws-chunked`)
+  running on **both** `--runtime sidecar` (`tokio-sidecar` + `sidecar-axum`,
+  interrupt-driven `io_uring`, no IOPOLL threads) and `--runtime tokio`
+  (standard Tokio mio/epoll + `axum::serve`/Hyper + `spawn_blocking`). Both
+  backends share the exact same on-disk striped format and interoperate directly.
 
 The repository is local only: no remote, nothing published. Work in small,
-focused commits. The branch `io-driver` holds the move from a sidecar beside
-tokio's driver to being the driver; `main` is the state before it.
+focused commits. The branch `axum-s3` adds `sidecar-axum` and `s3-axum` on top
+of `io-driver`; `main` is the state before the reactor-driver move.
 
 ## Build and test
 
@@ -45,9 +56,9 @@ RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --offline --workspace 
 
 | Crate | Source | Why |
 |---|---|---|
-| tokio | path `../tokio-uring-wl/tokio`, branch `byo-io-driver` (local, not pushed) | the reactor seam (`runtime::reactor::Reactor`, `Builder::io_reactor`), worker-local tasks (`spawn_worker_local`, `run_on_each_worker`) and `Builder::on_before_steal` |
+| tokio | path `../tokio-uring-wl/tokio`, branch `byo-io-driver` (rebased onto `local-worker-v3` `c90d985b`; `[patch.crates-io]` unifies axum/hyper-util onto it) | the reactor seam (`runtime::reactor::Reactor`, `Builder::io_reactor`), upgraded worker-local tasks (`spawn_worker_local`, `run_on_each_worker`, `run_on_any_worker`, `worker_local_queue_interval`), and `Builder::on_before_steal` |
 | mio | path `../mio-shared-registration`, branch `shared-registration-v3`, as a `[patch]` | `Registry::register_shared`, which that tokio branch registers sockets through |
-| ureq-proto | `github.com/lthiery/ureq-proto`, branch `combined-0.7.1`, rev `29bb652` | server state machine with HTTP/1.0 framing and strict transfer-encoding (both open upstream as PRs) |
+| ureq-proto | `../ureq-proto-combined`, branch `axum-proto` (for `sidecar-axum`); `s3/` keeps `combined-0.7.1` rev `29bb652` | server state machine with HTTP/1.0 framing, strict transfer-encoding, any-final-status `Send100::reject`, and chunked finish capacity check |
 
 ## Layout
 
@@ -70,6 +81,17 @@ s3/src/name.rs   bucket rules, key -> file name, placement hash
 s3/src/join.rs   join_all, and Started (poll once now, finish later)
 s3/src/main.rs   the binary and its flags
 s3/examples/load.rs      HTTP load generator
+
+sidecar-axum/src/server.rs    HTTP/1.1 connection driver for axum Routers (worker-local via run_on_any_worker, idle_timeout)
+sidecar-axum/src/incoming.rs  SidecarIncoming (http_body::Body) and DirectBody (FromRequest fast path + Hyper fallback)
+sidecar-axum/src/outgoing.rs  DirectWrite / DirectResponse / BodySink (coalesced head+body send_vectored, send_zero_copy)
+sidecar-axum/src/conn.rs      buffered connection over Sidecar
+
+s3-axum/src/app.rs            unified Axum S3 Router, handlers, ListBuckets/ListObjectsV2, request-id/timing/SigV4 middleware
+s3-axum/src/sigv4.rs          AWS4-HMAC-SHA256 verification and streaming aws-chunked decoder (signed & unsigned, trailers)
+s3-axum/src/sidecar_store.rs  io_uring O_DIRECT store (inline small GET, single-write small PUT, statx overwrite fast path)
+s3-axum/src/tokio_store.rs    standard Tokio spawn_blocking store (same striped layout; buffered or --direct)
+s3-axum/src/main.rs           CLI launching --runtime sidecar|tokio
 ```
 
 ## Design decisions (settled with Louis; do not relitigate)
@@ -232,6 +254,19 @@ Reference numbers (single runs of 4 to 6 seconds, November 2026):
 nothing on large ones, at the cost of one spinning core per domain. One
 kernel SQ thread tops out near 450k 4 KiB reads per second however many
 workers share it.
+
+Unified Axum S3 (`s3-axum`, same `axum::Router` + middleware, **zero IOPOLL threads**, November 2026):
+
+| Case | `s3-axum` (`sidecar`) | `s3-axum` (`tokio --direct`) | `s3-axum` (`tokio` buffered) |
+|---|---|---|---|
+| GET 16 MiB over 100G, 2 workers, 16 conns | **11.75 GiB/s** (100G wire), p99 26.5 ms, **1.10 proc cores** | 3.05 GiB/s, p99 133 ms, 1.86 cores | 2.82 GiB/s, p99 146 ms, 1.86 cores |
+| GET 16 MiB over 100G, 1 worker, 16 conns | **8.80 GiB/s** (~74 Gbps), p99 32.5 ms, **0.85 proc cores** | 1.73 GiB/s, p99 318 ms, 0.94 cores | 1.73 GiB/s, p99 219 ms, 0.93 cores |
+| GET 16 MiB over 100G, 4 workers, 32 conns | **11.69 GiB/s** (100G wire), p99 95 ms, **1.36 proc cores** | 5.12 GiB/s, p99 145 ms, 3.70 cores | 4.32 GiB/s, p99 180 ms, 3.70 cores |
+| PUT 16 MiB over 100G, 4 workers, 32 conns | **4.98 GiB/s**, p99 158 ms, **2.00 proc cores** | 2.46 GiB/s, p99 659 ms, 2.86 cores | 2.23 GiB/s, p99 789 ms, 2.76 cores |
+| GET 4 KiB over 100G, 4 workers, 32 conns | **90.2k req/s**, p50 347 µs, p99 491 µs | 25.7k req/s, p99 2.07 ms | 33.9k req/s, p99 1.61 ms (page cache) |
+| PUT 4 KiB over 100G, 4 workers, 32 conns | **9.49k req/s**, p50 2.54 ms, p99 10.7 ms, 1.54 cores | — | — |
+| PUT 4 KiB over loopback, 4 workers, 32 conns | **10.0k req/s**, p50 2.58 ms, p99 8.80 ms, 2.52 cores | 1.73k req/s, p99 31.3 ms, 3.29 cores | 1.74k req/s, p99 30.7 ms, 3.14 cores |
+| GET 4 KiB over loopback, 4 workers, 32 conns | **84.9k req/s**, p50 371 µs, p99 508 µs, 3.72 cores | 25.5k req/s, p99 2.80 ms, 3.60 cores | 33.9k req/s, p99 1.60 ms (page cache) |
 
 ## What the server does not do
 
