@@ -14,7 +14,7 @@ http = "1"
 http-body = "1"
 http-body-util = "0.1"
 log = "0.4"
-tokio = { path = "../../tokio-uring-wl/tokio", features = ["rt-multi-thread", "sync", "time", "worker-local"] }
+tokio = { path = "../../tokio-io-reactor-wl/tokio", features = ["rt-multi-thread", "sync", "time", "worker-local"] }
 tokio-sidecar = { path = ".." }
 tower-service = "0.3"
 ureq-proto = { path = "../../ureq-proto-combined", default-features = false, features = ["server"] }
@@ -22,5 +22,5 @@ ureq-proto = { path = "../../ureq-proto-combined", default-features = false, fea
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["json", "query", "matched-path"] }
 futures-util = "0.3"
-tokio = { path = "../../tokio-uring-wl/tokio", features = ["macros", "rt-multi-thread", "sync", "time", "worker-local"] }
+tokio = { path = "../../tokio-io-reactor-wl/tokio", features = ["macros", "rt-multi-thread", "sync", "time", "worker-local"] }
 tower = "0.5"

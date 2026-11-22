@@ -12,21 +12,17 @@ bytes = "1"
 io-uring = "0.7.15"
 libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
-# The reactor seam (`runtime::reactor`, `Builder::io_reactor`), worker-local
-# tasks (`run_on_each_worker`) and the `on_before_steal` hook are not in
-# upstream tokio; this is the `byo-io-driver` branch of the fork, which is
-# not pushed anywhere yet.
-tokio = { path = "../tokio-uring-wl/tokio", features = ["rt-multi-thread", "sync", "worker-local", "io-reactor"] }
+# The reactor seam (`runtime::reactor`, `Builder::io_reactor`) and worker-local
+# tasks (`run_on_each_worker`, `run_on_any_worker`) are on the `io-reactor-wl`
+# branch of the fork (using stock crates.io `mio`).
+tokio = { path = "../tokio-io-reactor-wl/tokio", features = ["rt-multi-thread", "sync", "worker-local", "io-reactor"] }
 
 [dev-dependencies]
 libc = "0.2"
-tokio = { path = "../tokio-uring-wl/tokio", features = ["macros", "net", "io-util", "time"] }
+tokio = { path = "../tokio-io-reactor-wl/tokio", features = ["macros", "net", "io-util", "time"] }
 
 [workspace]
 members = ["s3", "sidecar-axum", "s3-axum"]
 
-# That tokio branch registers sockets through `mio::Registry::register_shared`,
-# which is on the `shared-registration-v3` branch of the mio fork.
 [patch.crates-io]
-mio = { path = "../mio-shared-registration" }
-tokio = { path = "../tokio-uring-wl/tokio" }
+tokio = { path = "../tokio-io-reactor-wl/tokio" }

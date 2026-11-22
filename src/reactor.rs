@@ -1,9 +1,10 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::task::Waker;
 use std::time::Duration;
@@ -11,7 +12,7 @@ use std::time::Duration;
 use io_uring::{IoUring, cqueue, opcode, squeue, types};
 use tokio::io::{Interest, Ready};
 use tokio::runtime::Builder;
-use tokio::runtime::reactor::{ParkTimeouts, Reactor, Readiness, RegistrationToken};
+use tokio::runtime::reactor::{ParkMode, Reactor, Readiness, RegistrationToken, Timers};
 
 use crate::buffers::BufferPool;
 use crate::landing::{Arbiter, CellRef, Claim, TaskRef};
@@ -36,6 +37,18 @@ const WAKE: u64 = 0b10 << 30;
 const DISK: u64 = WAKE | 1;
 /// Submissions whose completion nobody waits for.
 const DETACHED: u64 = u64::MAX;
+
+/// High bit of a [`RegistrationToken`] marking a watch queued from a thread
+/// without a ring (resolved on the target worker via `remote_watches`).
+const REMOTE_WATCH_BIT: u64 = 1 << 63;
+/// Mask for the 15-bit worker index stored in bits 48..63 of a
+/// [`RegistrationToken`].
+const TOKEN_WORKER_MASK: u64 = (1 << 15) - 1;
+/// Mask for the 18-bit generation stored in bits 30..48 of a direct watch
+/// [`RegistrationToken`].
+const WATCH_GEN_MASK: u64 = (1 << 18) - 1;
+/// Mask for the 48-bit monotonic id of a remote watch [`RegistrationToken`].
+const REMOTE_ID_MASK: u64 = (1 << 48) - 1;
 
 /// Arbiters are allocated this many at a time.
 const CHUNK: usize = 64;
@@ -88,21 +101,13 @@ enum Remote {
     },
     Cancel(u64),
     Watch {
+        remote_id: u64,
         file: OwnedFd,
         events: u32,
         readiness: Readiness,
-        watch: Arc<WatchRef>,
     },
-    Unwatch(Arc<WatchRef>),
-}
-
-/// Names a file that the runtime registered: the worker whose ring watches
-/// it and the token of the watch there. This is what the runtime holds for
-/// the registration.
-struct WatchRef {
-    worker: usize,
-    /// Zero until the worker has taken the watch on.
-    token: AtomicU64,
+    Unwatch(u64),
+    UnwatchById(u64),
 }
 
 /// What other threads share with a worker: the arbiters, and the way in for
@@ -200,12 +205,11 @@ struct Inner {
     disk: Option<DiskConfig>,
     started: OnceLock<Started>,
     next_remote: AtomicUsize,
+    next_remote_watch: AtomicU64,
     /// One more than the index of the sleeping worker that wakes for the
     /// runtime's timers. Zero when no worker does, which is never the case
     /// while all of them sleep.
     timekeeper: AtomicUsize,
-    /// Set when a timer was set that the timekeeper may be sleeping past.
-    timer_moved: AtomicBool,
 }
 
 /// Names an in-flight operation: the worker whose ring runs it, its token
@@ -331,9 +335,10 @@ impl Sidecar {
     /// not use [`block_in_place`](tokio::task::block_in_place): a ring
     /// belongs to the thread its worker started on.
     ///
-    /// This takes the builder's `io_reactor` and `on_before_steal` slots,
-    /// the latter for [`before_steal`]. A sidecar drives one runtime:
-    /// building a second one from the same builder fails with
+    /// This takes the builder's `io_reactor` slot (flushing before stealing
+    /// runs through [`Reactor::before_steal`], leaving
+    /// [`Builder::on_before_steal`] free for callers). A sidecar drives one
+    /// runtime: building a second one from the same builder fails with
     /// [`io::ErrorKind::AlreadyExists`].
     pub fn install(builder: &mut Builder, config: Config) -> Sidecar {
         let inner = Arc::new_cyclic(|me| Inner {
@@ -343,16 +348,14 @@ impl Sidecar {
             disk: config.disk,
             started: OnceLock::new(),
             next_remote: AtomicUsize::new(0),
+            next_remote_watch: AtomicU64::new(1),
             timekeeper: AtomicUsize::new(0),
-            timer_moved: AtomicBool::new(false),
         });
         let reactor = inner.clone();
-        builder
-            .io_reactor(move |workers| {
-                reactor.start(workers)?;
-                Ok(reactor.clone() as Arc<dyn Reactor>)
-            })
-            .on_before_steal(before_steal);
+        builder.io_reactor(move |workers| {
+            reactor.start(workers)?;
+            Ok(reactor.clone() as Arc<dyn Reactor>)
+        });
         Sidecar { inner }
     }
 
@@ -466,6 +469,9 @@ impl Inner {
     /// Creates the rings of a runtime with this many workers.
     fn start(&self, workers: usize) -> io::Result<()> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        if workers as u64 > TOKEN_WORKER_MASK {
+            return Err(invalid("too many workers for sidecar watch tokens"));
+        }
         if self.started.get().is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -590,60 +596,81 @@ impl Reactor for Inner {
         let events = poll_events(interest);
         let readiness = Readiness::new();
 
-        let watch = match self.local() {
-            Some(worker) => Arc::new(WatchRef {
-                worker: worker.index,
-                token: AtomicU64::new(worker.watch(file, events, readiness.clone())),
-            }),
+        let token = match self.local() {
+            Some(worker) => {
+                let cqe_token = worker.watch(file, events, readiness.clone());
+                direct_watch_token(worker.index, cqe_token)
+            }
             None => {
                 let worker = self.next_worker();
-                let watch = Arc::new(WatchRef {
-                    worker,
-                    token: AtomicU64::new(0),
-                });
+                let remote_id =
+                    self.next_remote_watch.fetch_add(1, Ordering::Relaxed) & REMOTE_ID_MASK;
                 let mut pool = self.workers()[worker].pool();
                 if pool.closed {
                     return Err(io::Error::other("the runtime's I/O reactor has shut down"));
                 }
                 pool.queue.push(Remote::Watch {
+                    remote_id,
                     file,
                     events,
                     readiness: readiness.clone(),
-                    watch: watch.clone(),
                 });
                 drop(pool);
                 self.wake(worker);
-                watch
+                remote_watch_token(worker, remote_id)
             }
         };
-        Ok((readiness, Box::new(watch)))
+        Ok((readiness, token))
     }
 
-    fn deregister(&self, _readiness: &Readiness, token: &RegistrationToken) -> io::Result<()> {
-        let watch = token
-            .downcast_ref::<Arc<WatchRef>>()
-            .expect("a registration token of another reactor");
-        let assigned = watch.token.load(Ordering::Acquire);
-        match self.local() {
-            Some(worker) if worker.index == watch.worker && assigned != 0 => {
-                worker.unwatch(assigned);
+    fn deregister(&self, token: RegistrationToken) -> io::Result<()> {
+        let raw = token.0;
+        let worker_idx = ((raw >> 48) & TOKEN_WORKER_MASK) as usize;
+        if raw & REMOTE_WATCH_BIT == 0 {
+            let cqe_token = cqe_token_from_direct(raw);
+            match self.local() {
+                Some(worker) if worker.index == worker_idx => worker.unwatch(cqe_token),
+                _ => {
+                    let mut pool = self.workers()[worker_idx].pool();
+                    if !pool.closed {
+                        pool.queue.push(Remote::Unwatch(cqe_token));
+                        drop(pool);
+                        self.wake(worker_idx);
+                    }
+                }
             }
-            // Behind the request to watch it, if that is still queued.
-            _ => {
-                let mut pool = self.workers()[watch.worker].pool();
-                if !pool.closed {
-                    pool.queue.push(Remote::Unwatch(watch.clone()));
-                    drop(pool);
-                    self.wake(watch.worker);
+        } else {
+            let remote_id = raw & REMOTE_ID_MASK;
+            match self.local() {
+                Some(worker) if worker.index == worker_idx => {
+                    let existing = worker.remote_watches.borrow_mut().remove(&remote_id);
+                    if let Some(cqe_token) = existing {
+                        worker.unwatch(cqe_token);
+                    } else {
+                        let mut pool = self.workers()[worker_idx].pool();
+                        if !pool.closed {
+                            pool.queue.push(Remote::UnwatchById(remote_id));
+                            drop(pool);
+                            self.wake(worker_idx);
+                        }
+                    }
+                }
+                _ => {
+                    let mut pool = self.workers()[worker_idx].pool();
+                    if !pool.closed {
+                        pool.queue.push(Remote::UnwatchById(remote_id));
+                        drop(pool);
+                        self.wake(worker_idx);
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    fn park(&self, worker: usize, timeouts: ParkTimeouts) -> bool {
+    fn park(&self, worker: usize, mode: ParkMode, timers: &Timers<'_>) -> bool {
         match self.local() {
-            Some(local) if local.index == worker => local.park(timeouts),
+            Some(local) if local.index == worker => local.park(mode, timers),
             _ => panic!(
                 "worker {worker} went to sleep on a thread that does not own its ring: \
                  a sidecar needs a multi-threaded runtime"
@@ -657,9 +684,19 @@ impl Reactor for Inner {
     }
 
     fn unpark_for_timer(&self) {
-        self.timer_moved.store(true, Ordering::SeqCst);
         if let Some(worker) = self.timekeeper.load(Ordering::SeqCst).checked_sub(1) {
             self.wake(worker);
+        }
+    }
+
+    fn allow_block_in_place(&self) -> bool {
+        false
+    }
+
+    fn before_steal(&self, worker: usize) {
+        if let Some(local) = self.local() {
+            debug_assert_eq!(local.index, worker);
+            local.turn();
         }
     }
 
@@ -763,6 +800,9 @@ struct Worker {
     /// Leases for slots that are empty.
     free: RefCell<Vec<Lease>>,
     watches: RefCell<Watches>,
+    /// Maps remote watch ids (queued from non-worker threads) to their local
+    /// `cqe_token` in `watches`.
+    remote_watches: RefCell<HashMap<u64, u64>>,
     /// Completions whose future was busy with its waker when they came in:
     /// token, result and flags.
     deferred: RefCell<Vec<(u64, i32, u32)>>,
@@ -797,6 +837,7 @@ impl Worker {
             slots: RefCell::new(Vec::new()),
             free: RefCell::new(Vec::new()),
             watches: RefCell::new(Watches::default()),
+            remote_watches: RefCell::new(HashMap::new()),
             deferred: RefCell::new(Vec::new()),
             remote: RefCell::new(Vec::new()),
             completions: RefCell::new(Vec::new()),
@@ -1096,7 +1137,7 @@ impl Worker {
     fn unlist(&self, token: u64) -> Watch {
         let mut watches = self.watches.borrow_mut();
         let (generation, entry) = &mut watches.entries[key_of(token)];
-        *generation = generation.wrapping_add(1);
+        *generation = generation.wrapping_add(1) & (WATCH_GEN_MASK as u32);
         let watch = entry.take().expect("a watch that is in place");
         watches.vacant.push(key_of(token) as u32);
         watch
@@ -1246,15 +1287,21 @@ impl Worker {
                 }
                 Remote::Cancel(token) => self.cancel(token),
                 Remote::Watch {
+                    remote_id,
                     file,
                     events,
                     readiness,
-                    watch,
                 } => {
                     let token = self.watch(file, events, readiness);
-                    watch.token.store(token, Ordering::Release);
+                    self.remote_watches.borrow_mut().insert(remote_id, token);
                 }
-                Remote::Unwatch(watch) => self.unwatch(watch.token.load(Ordering::Acquire)),
+                Remote::Unwatch(token) => self.unwatch(token),
+                Remote::UnwatchById(remote_id) => {
+                    let existing = self.remote_watches.borrow_mut().remove(&remote_id);
+                    if let Some(token) = existing {
+                        self.unwatch(token);
+                    }
+                }
             }
         }
         self.remote.replace(remote);
@@ -1290,12 +1337,13 @@ impl Worker {
     }
 
     /// Puts the worker to sleep in its ring until a completion comes in,
-    /// another thread wakes it, or its time is up. With no time at all, the
-    /// worker is busy and only looks at its ring.
-    fn park(&self, timeouts: ParkTimeouts) {
-        if timeouts.driving == Some(Duration::ZERO) {
-            return self.look();
-        }
+    /// another thread wakes it, or its time is up. Under [`ParkMode::Poll`],
+    /// the worker is busy and only looks at its ring.
+    fn park(&self, mode: ParkMode, timers: &Timers<'_>) {
+        let limit = match mode {
+            ParkMode::Poll => return self.look(),
+            ParkMode::Park(limit) => limit,
+        };
         // Tasks that this woke have to run before the worker may sleep.
         let delivered = self.turn();
         if delivered || self.revisit.take() {
@@ -1309,23 +1357,27 @@ impl Worker {
                 .compare_exchange(AWAKE, ASLEEP, Ordering::SeqCst, Ordering::SeqCst);
         if asleep.is_ok() {
             // One sleeping worker wakes for the timers, the first to get
-            // there. The others sleep until something is there for them.
+            // there. Publish `timekeeper` with `SeqCst` *before* calling
+            // `timers.next_timeout()` so any concurrent timer insert either
+            // wakes us or is observed here.
             let sidecar = &*self.sidecar;
             let keeper = sidecar
                 .timekeeper
                 .compare_exchange(0, self.index + 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok();
-            match keeper {
-                // A timer was set since the runtime worked out how long
-                // this worker may sleep.
-                true if sidecar.timer_moved.swap(false, Ordering::SeqCst) => {}
-                true => self.wait(timeouts.driving),
-                false => self.wait(timeouts.waiting),
+            let timeout = if keeper {
+                match (limit, timers.next_timeout()) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                }
+            } else {
+                limit
+            };
+            if timeout != Some(Duration::ZERO) {
+                self.wait(timeout);
             }
             if keeper {
-                // In this order: a timer set in between finds either the
-                // flag down, to raise it, or this worker to wake.
-                sidecar.timer_moved.store(false, Ordering::SeqCst);
                 sidecar.timekeeper.store(0, Ordering::SeqCst);
             }
             shared.sleep.store(AWAKE, Ordering::SeqCst);
@@ -1499,6 +1551,26 @@ fn key_of(token: u64) -> usize {
 
 fn generation_of(token: u64) -> u32 {
     (token >> 32) as u32
+}
+
+fn direct_watch_token(worker: usize, cqe_token: u64) -> RegistrationToken {
+    let generation = u64::from(generation_of(cqe_token)) & WATCH_GEN_MASK;
+    let idx = cqe_token & INDEX;
+    RegistrationToken(((worker as u64 & TOKEN_WORKER_MASK) << 48) | (generation << 30) | idx)
+}
+
+fn cqe_token_from_direct(raw: u64) -> u64 {
+    let generation = ((raw >> 30) & WATCH_GEN_MASK) as u32;
+    let idx = (raw & INDEX) as u32;
+    token_of(generation, idx) | WATCH
+}
+
+fn remote_watch_token(worker: usize, remote_id: u64) -> RegistrationToken {
+    RegistrationToken(
+        REMOTE_WATCH_BIT
+            | ((worker as u64 & TOKEN_WORKER_MASK) << 48)
+            | (remote_id & REMOTE_ID_MASK),
+    )
 }
 
 /// The poll events that tell about `interest`. Errors and hang-ups are

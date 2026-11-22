@@ -22,7 +22,7 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 sidecar-axum = { path = "../sidecar-axum" }
 subtle = "2"
-tokio = { path = "../../tokio-uring-wl/tokio", features = ["fs", "io-uring", "io-util", "macros", "net", "rt-multi-thread", "sync", "time", "worker-local"] }
+tokio = { path = "../../tokio-io-reactor-wl/tokio", features = ["fs", "io-uring", "io-util", "macros", "net", "rt-multi-thread", "sync", "time", "worker-local"] }
 tokio-sidecar = { path = ".." }
 
 [dev-dependencies]
