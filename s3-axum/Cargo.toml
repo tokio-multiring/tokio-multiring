@@ -24,3 +24,7 @@ sidecar-axum = { path = "../sidecar-axum" }
 subtle = "2"
 tokio = { path = "../../tokio-uring-wl/tokio", features = ["fs", "io-uring", "io-util", "macros", "net", "rt-multi-thread", "sync", "time", "worker-local"] }
 tokio-sidecar = { path = ".." }
+
+[dev-dependencies]
+tower-service = "0.3"
+ureq-proto = { path = "../../ureq-proto-combined", default-features = false, features = ["server"] }
