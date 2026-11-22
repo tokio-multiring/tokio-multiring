@@ -30,6 +30,19 @@ use crate::outgoing::{BodySink, DirectBodySlot as OutgoingDirectSlot};
 /// a keep-alive connection can be reused. Past this, the connection closes.
 const DISCARD_LIMIT: usize = 64 * 1024;
 
+/// Minimum payload size for `IORING_OP_SEND_ZC` on standard `axum::body::Body`
+/// `Bytes` frames. Below this, copying in the kernel is cheaper than page
+/// pinning and the extra completion notification.
+const SEND_BYTES_ZC_THRESHOLD: usize = 64 * 1024;
+
+/// Maximum slice size per `IORING_OP_SEND_ZC` submission on standard `Bytes`
+/// frames, capping pinned unacknowledged memory per connection.
+const SEND_BYTES_ZC_CHUNK: usize = 1 << 20;
+
+/// Maximum slice size per copying `IORING_OP_SEND` submission (stays well
+/// within io_uring's 32-bit length field).
+const SEND_BYTES_MAX_CHUNK: usize = 1 << 30;
+
 const BAD_REQUEST: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
 const HEAD_TOO_LARGE: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\n\
@@ -503,6 +516,41 @@ async fn respond(
                 while let Some(frame) = body.frame().await {
                     let frame = frame.map_err(|e| Fatal::Io(io::Error::other(e)))?;
                     if let Ok(data) = frame.into_data() {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        let fits_output = conn.output()?.spare_capacity_mut().len() >= data.len();
+                        if !send_body.is_chunked() && !fits_output {
+                            conn.flush().await?;
+                            let use_zc = conn.zero_copy() && data.len() >= SEND_BYTES_ZC_THRESHOLD;
+                            let max_chunk = if use_zc {
+                                SEND_BYTES_ZC_CHUNK
+                            } else {
+                                SEND_BYTES_MAX_CHUNK
+                            };
+                            if data.len() <= max_chunk {
+                                send_body.consume_direct_write(data.len())?;
+                                if use_zc {
+                                    conn.send_bytes_zc(data).await?;
+                                } else {
+                                    conn.send_bytes(data).await?;
+                                }
+                            } else {
+                                let mut offset = 0;
+                                while offset < data.len() {
+                                    let end = (offset + max_chunk).min(data.len());
+                                    let chunk = data.slice(offset..end);
+                                    send_body.consume_direct_write(chunk.len())?;
+                                    if use_zc && chunk.len() >= SEND_BYTES_ZC_THRESHOLD {
+                                        conn.send_bytes_zc(chunk).await?;
+                                    } else {
+                                        conn.send_bytes(chunk).await?;
+                                    }
+                                    offset = end;
+                                }
+                            }
+                            continue;
+                        }
                         let mut rest = data.as_ref();
                         while !rest.is_empty() {
                             let output = conn.output()?;

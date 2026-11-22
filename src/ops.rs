@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use crate::buffers::FixedBuf;
@@ -444,6 +445,48 @@ impl Sidecar {
         }
     }
 
+    /// Sends the contents of `buf` on the socket `fd`, without copying into a
+    /// pool buffer first. Like [`send`](Self::send), the kernel keeps going
+    /// until everything is sent.
+    ///
+    /// At most `u32::MAX` bytes are sent in a single call.
+    pub fn send_bytes(
+        &self,
+        fd: Arc<OwnedFd>,
+        buf: Bytes,
+    ) -> impl Future<Output = io::Result<usize>> + Send + use<> {
+        let op = Op::new(self, Operation::SendBytes { fd, buf });
+        async move { op.await.result.map(|sent| sent as usize) }
+    }
+
+    /// Like [`send_bytes`](Self::send_bytes), without copying in the kernel
+    /// (`IORING_OP_SEND_ZC`).
+    ///
+    /// The `Bytes` handle is held by the reactor until the kernel confirms it
+    /// no longer refers to the backing memory. The returned [`Release`] future
+    /// resolves once that happens, reporting whether the kernel fell back to
+    /// copying.
+    pub fn send_bytes_zc(
+        &self,
+        fd: Arc<OwnedFd>,
+        buf: Bytes,
+    ) -> impl Future<Output = (io::Result<usize>, Release)> + Send + use<> {
+        let (reclaim, reclaimed) = oneshot::channel();
+        let op = Op::new(
+            self,
+            Operation::SendBytesZc {
+                fd,
+                buf,
+                copied: false,
+                reclaim,
+            },
+        );
+        async move {
+            let sent = op.await.result.map(|sent| sent as usize);
+            (sent, Release(reclaimed))
+        }
+    }
+
     /// Shuts down one or both directions of the socket `fd`. Shutting down
     /// writing tells the peer that nothing more is coming, while what it
     /// sends can still be received.
@@ -630,6 +673,32 @@ pub struct Reclaimed {
     /// Whether the kernel could not confirm that it sent without copying.
     /// It copies when the data's route calls for it, as loopback does.
     pub copied: bool,
+}
+
+/// Notification that the kernel has finished with the memory of a
+/// [`Sidecar::send_bytes_zc`] operation and its [`Bytes`] handle has been
+/// dropped.
+///
+/// Resolves to `true` if the kernel reported falling back to copying, or
+/// `false` otherwise. Dropping it does not free the buffer early: the reactor
+/// keeps it alive until the kernel lets go.
+pub struct Release(oneshot::Receiver<bool>);
+
+impl Release {
+    /// Returns the result if the kernel has already let go of the buffer.
+    pub fn try_take(&mut self) -> Option<bool> {
+        self.0.try_recv().ok()
+    }
+}
+
+impl Future for Release {
+    type Output = bool;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
+        Pin::new(&mut self.0)
+            .poll(cx)
+            .map(|res| res.unwrap_or(false))
+    }
 }
 
 /// A region of one of the buffers given to a vectored operation.

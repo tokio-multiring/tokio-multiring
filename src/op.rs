@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use io_uring::{opcode, squeue, types};
 use tokio::sync::oneshot;
 
@@ -64,6 +65,18 @@ pub(crate) enum Operation {
         buf: FixedBuf,
         /// Where in the contents to start.
         start: usize,
+    },
+    SendBytes {
+        fd: Arc<OwnedFd>,
+        buf: Bytes,
+    },
+    SendBytesZc {
+        fd: Arc<OwnedFd>,
+        buf: Bytes,
+        /// Whether the kernel reported copying the data after all.
+        copied: bool,
+        /// Fires once the kernel has let go of `buf`.
+        reclaim: oneshot::Sender<bool>,
     },
     SendMsg {
         fd: Arc<OwnedFd>,
@@ -198,6 +211,17 @@ impl Operation {
                     .flags(libc::MSG_NOSIGNAL | libc::MSG_WAITALL)
                     .build()
             }
+            Operation::SendBytes { fd, buf } => {
+                opcode::Send::new(types::Fd(fd.as_raw_fd()), buf.as_ptr(), io_len(buf.len()))
+                    .flags(libc::MSG_NOSIGNAL | libc::MSG_WAITALL)
+                    .build()
+            }
+            Operation::SendBytesZc { fd, buf, .. } => {
+                opcode::SendZc::new(types::Fd(fd.as_raw_fd()), buf.as_ptr(), io_len(buf.len()))
+                    .flags(libc::MSG_NOSIGNAL | libc::MSG_WAITALL)
+                    .zc_flags(SEND_ZC_REPORT_USAGE)
+                    .build()
+            }
             Operation::SendMsg { fd, message, .. } => {
                 opcode::SendMsg::new(types::Fd(fd.as_raw_fd()), &raw const *message.header)
                     .flags((libc::MSG_NOSIGNAL | libc::MSG_WAITALL) as u32)
@@ -325,13 +349,20 @@ impl Operation {
     /// Whether the kernel completes the operation a second time, when it
     /// lets go of the operation's buffers.
     pub(crate) fn completes_twice(&self) -> bool {
-        matches!(self, Operation::SendMsgZc { .. })
+        matches!(
+            self,
+            Operation::SendMsgZc { .. } | Operation::SendBytesZc { .. }
+        )
     }
 
     /// Records what the kernel said in the second completion.
     pub(crate) fn note_release(&mut self, notice: i32) {
-        if let Operation::SendMsgZc { copied, .. } = self {
-            *copied = notice as u32 & NOTIF_USAGE_ZC_COPIED != 0;
+        let is_copied = notice as u32 & NOTIF_USAGE_ZC_COPIED != 0;
+        match self {
+            Operation::SendMsgZc { copied, .. } | Operation::SendBytesZc { copied, .. } => {
+                *copied = is_copied;
+            }
+            _ => {}
         }
     }
 
@@ -339,15 +370,26 @@ impl Operation {
     /// future is going to collect. Runs foreign code: buffers go back to
     /// their pool or on to whoever waits for them.
     pub(crate) fn release(self) {
-        if let Operation::SendMsgZc {
-            bufs,
-            copied,
-            reclaim,
-            ..
-        } = self
-        {
-            // With nobody waiting, the buffers return to their pool.
-            let _ = reclaim.send(Reclaimed { bufs, copied });
+        match self {
+            Operation::SendMsgZc {
+                bufs,
+                copied,
+                reclaim,
+                ..
+            } => {
+                // With nobody waiting, the buffers return to their pool.
+                let _ = reclaim.send(Reclaimed { bufs, copied });
+            }
+            Operation::SendBytesZc {
+                buf,
+                copied,
+                reclaim,
+                ..
+            } => {
+                drop(buf);
+                let _ = reclaim.send(copied);
+            }
+            _ => {}
         }
     }
 

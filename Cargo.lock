@@ -382,6 +382,8 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-sidecar",
+ "tower-service",
+ "ureq-proto 0.7.1",
 ]
 
 [[package]]
@@ -566,6 +568,7 @@ dependencies = [
 name = "tokio-sidecar"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "io-uring",
  "libc",
  "socket2",

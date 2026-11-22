@@ -583,3 +583,35 @@ fn dropped_recv_is_cancelled() {
             .expect("buffer never came back");
     });
 }
+
+#[test]
+fn send_bytes_and_send_bytes_zc_transfer_large_payloads() {
+    const TOTAL: usize = 2 * 1024 * 1024 + 137;
+    let payload = bytes::Bytes::from((0..TOTAL).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+
+    for use_zc in [false, true] {
+        let (ours, mut theirs) = tcp_pair();
+        let expected = payload.clone();
+        let reader = std::thread::spawn(move || {
+            let mut received = vec![0u8; TOTAL];
+            theirs.read_exact(&mut received).unwrap();
+            assert_eq!(received, expected.as_ref());
+        });
+
+        let (runtime, sidecar) = runtime(Config::default());
+        let data = payload.clone();
+        runtime.block_on(async move {
+            if use_zc {
+                let (sent, release) = sidecar.send_bytes_zc(ours, data).await;
+                assert_eq!(sent.unwrap(), TOTAL);
+                let copied = release.await;
+                // Loopback reports copied = true.
+                assert!(copied);
+            } else {
+                let sent = sidecar.send_bytes(ours, data).await.unwrap();
+                assert_eq!(sent, TOTAL);
+            }
+        });
+        reader.join().unwrap();
+    }
+}

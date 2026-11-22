@@ -526,3 +526,61 @@ fn idle_timeout_closes_quiet_connection() {
     let n = s.read(&mut buf).unwrap();
     assert_eq!(n, 0, "idle connection should be closed by server");
 }
+
+#[test]
+fn large_standard_body_direct_and_zc_paths() {
+    let big: bytes::Bytes = (0..2_500_000usize)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>()
+        .into();
+    let big_single = big.clone();
+    let big_stream = big.clone();
+
+    let make_router = move || {
+        let b1 = big_single.clone();
+        let b2 = big_stream.clone();
+        Router::new()
+            .route("/single", get(move || async move { b1.clone() }))
+            .route(
+                "/streamed",
+                get(move || async move {
+                    // Stream several 256 KiB Bytes chunks with an explicit Content-Length.
+                    let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = (0..b2.len())
+                        .step_by(256 * 1024)
+                        .map(|off| Ok(b2.slice(off..(off + 256 * 1024).min(b2.len()))))
+                        .collect();
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_LENGTH, b2.len())
+                        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                        .unwrap()
+                }),
+            )
+            .route("/small", get(|| async { "ok" }))
+    };
+
+    for zc in [ZeroCopy::Never, ZeroCopy::Always] {
+        let h = Harness::start(make_router(), zc, None);
+        let mut s = h.connect();
+
+        s.write_all(b"GET /single HTTP/1.1\r\nhost: test\r\n\r\n")
+            .unwrap();
+        let (status, _, body) = read_response(&mut s);
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), big.len());
+        assert_eq!(body, big.as_ref());
+
+        // Same keep-alive connection: streamed multi-chunk > 2 MiB + small follow-up.
+        s.write_all(b"GET /streamed HTTP/1.1\r\nhost: test\r\n\r\n")
+            .unwrap();
+        let (status, _, body) = read_response(&mut s);
+        assert_eq!(status, 200);
+        assert_eq!(body, big.as_ref());
+
+        s.write_all(b"GET /small HTTP/1.1\r\nhost: test\r\n\r\n")
+            .unwrap();
+        let (status, _, body) = read_response(&mut s);
+        assert_eq!(status, 200);
+        assert_eq!(body, b"ok");
+    }
+}

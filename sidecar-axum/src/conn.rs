@@ -1,16 +1,21 @@
 //! One client connection: buffered input and output over a socket driven by
 //! a [`Sidecar`].
 
+use std::collections::VecDeque;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio_sidecar::{FixedBuf, Reclaim, Segment, Sidecar};
+use bytes::Bytes;
+use tokio_sidecar::{FixedBuf, Reclaim, Release, Segment, Sidecar};
 
 /// How long a connection being closed is kept open for the client to finish
 /// sending.
 const LINGER: Duration = Duration::from_secs(2);
+
+/// Maximum unacknowledged zero-copy `Bytes` chunks in flight per connection.
+const MAX_INFLIGHT_ZC: usize = 4;
 
 /// What a call to [`Conn::fill`] found.
 pub(crate) enum Filled {
@@ -31,6 +36,9 @@ pub(crate) struct Conn {
     output: Option<FixedBuf>,
     /// Whether downloads on this connection are sent without copying.
     zero_copy: bool,
+    /// Unacknowledged zero-copy `Bytes` sends on this connection, bounded to
+    /// [`MAX_INFLIGHT_ZC`] to keep pinned memory per connection small.
+    in_flight_zc: VecDeque<Release>,
 }
 
 fn lost() -> io::Error {
@@ -52,6 +60,7 @@ impl Conn {
             consumed: 0,
             output: Some(output),
             zero_copy,
+            in_flight_zc: VecDeque::new(),
         }
     }
 
@@ -211,6 +220,46 @@ impl Conn {
             Err(error) => Err(error),
         };
         (result, reclaim)
+    }
+
+    /// Sends `buf` directly via io_uring without copying into the per-connection
+    /// output buffer. The output buffer must be flushed first.
+    pub(crate) async fn send_bytes(&mut self, buf: Bytes) -> io::Result<()> {
+        debug_assert!(!self.has_output());
+        let expected = buf.len();
+        match self.sidecar.send_bytes(self.fd.clone(), buf).await {
+            Ok(sent) if sent == expected => Ok(()),
+            Ok(_) => Err(io::ErrorKind::WriteZero.into()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Sends `buf` via `IORING_OP_SEND_ZC`, bounding unacknowledged chunks in
+    /// flight on this connection to [`MAX_INFLIGHT_ZC`]. The output buffer must
+    /// be flushed first.
+    pub(crate) async fn send_bytes_zc(&mut self, buf: Bytes) -> io::Result<()> {
+        debug_assert!(!self.has_output());
+        while self
+            .in_flight_zc
+            .front_mut()
+            .and_then(Release::try_take)
+            .is_some()
+        {
+            self.in_flight_zc.pop_front();
+        }
+        if self.in_flight_zc.len() >= MAX_INFLIGHT_ZC
+            && let Some(oldest) = self.in_flight_zc.pop_front()
+        {
+            oldest.await;
+        }
+        let expected = buf.len();
+        let (sent, release) = self.sidecar.send_bytes_zc(self.fd.clone(), buf).await;
+        self.in_flight_zc.push_back(release);
+        match sent {
+            Ok(sent) if sent == expected => Ok(()),
+            Ok(_) => Err(io::ErrorKind::WriteZero.into()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Closes the connection cleanly so the client can read the last response.

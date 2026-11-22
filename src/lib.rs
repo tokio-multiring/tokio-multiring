@@ -39,6 +39,6 @@ mod reactor;
 
 pub use buffers::{BufferPool, FixedBuf};
 pub use net::{TcpListener, TcpStream};
-pub use ops::{FileStat, Reclaim, Reclaimed, Segment};
+pub use ops::{FileStat, Reclaim, Reclaimed, Release, Segment};
 pub use plan::{Domain, Hyperthreads, Plan};
 pub use reactor::{Config, DiskConfig, Sidecar, before_steal};
