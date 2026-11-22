@@ -4,15 +4,18 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use axum::serve::ListenerExt;
-use s3_axum::{AppOptions, AuthConfig, Backend, SidecarStore, TokioStore, router_with_options};
+use s3_axum::{
+    AppOptions, AuthConfig, Backend, SidecarStore, TokioStore, TokioUringStore, router_with_options,
+};
 use sidecar_axum::{Config as HttpConfig, Server, ZeroCopy};
 use tokio_sidecar::{BufferPool, DiskConfig, Domain, Hyperthreads, Plan, Sidecar};
 
 const USAGE: &str = "\
-usage: s3-axum --runtime sidecar|tokio --root DIR [--root DIR ...] [options]
+usage: s3-axum --runtime sidecar|tokio|tokio-uring --root DIR [--root DIR ...] [options]
 
-  --runtime MODE        sidecar (io_uring + sidecar-axum/ureq-proto) or
-                        tokio   (standard Tokio mio/epoll + axum::serve/Hyper) [sidecar]
+  --runtime MODE        sidecar     (tokio-sidecar io_uring + sidecar-axum/ureq-proto)
+                        tokio       (standard Tokio mio/epoll + axum::serve + spawn_blocking)
+                        tokio-uring (mainline Tokio io-uring fs + axum::serve/Hyper) [sidecar]
   --root DIR            directory the buckets live in (repeatable for striping)
   --stripe-unit BYTES   stripe unit size, multiple of 4096    [131072]
   --window N            read-ahead / write-behind rounds      [4]
@@ -37,6 +40,7 @@ usage: s3-axum --runtime sidecar|tokio --root DIR [--root DIR ...] [options]
 enum RuntimeKind {
     Sidecar,
     Tokio,
+    TokioUring,
 }
 
 struct Options {
@@ -100,7 +104,12 @@ impl Options {
                     opts.runtime = match args.next().as_deref() {
                         Some("sidecar") => RuntimeKind::Sidecar,
                         Some("tokio") => RuntimeKind::Tokio,
-                        _ => return Err("--runtime must be `sidecar` or `tokio`".into()),
+                        Some("tokio-uring") => RuntimeKind::TokioUring,
+                        _ => {
+                            return Err(
+                                "--runtime must be `sidecar`, `tokio`, or `tokio-uring`".into()
+                            );
+                        }
                     };
                 }
                 "--root" => {
@@ -289,6 +298,25 @@ fn run(opts: Options) -> std::io::Result<()> {
                     } else {
                         "spawn_blocking buffered"
                     },
+                );
+                axum::serve(listener, app).await
+            })
+        }
+        RuntimeKind::TokioUring => {
+            listener.set_nonblocking(true)?;
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.enable_all().enable_io_uring();
+            let runtime = plan.build(&mut builder)?;
+
+            runtime.block_on(async {
+                let store = TokioUringStore::open(&opts.roots, opts.stripe_unit, opts.buffer_size)?;
+                let app = router_with_options(Backend::TokioUring(store), app_opts);
+                let listener = tokio::net::TcpListener::from_std(listener)?.tap_io(|stream| {
+                    let _ = stream.set_nodelay(true);
+                });
+                log::info!(
+                    "s3-axum [tokio-uring] serving {roots_display:?} on http://{address} \
+                     ({workers} workers in {domains} domains, mainline tokio::fs io_uring)"
                 );
                 axum::serve(listener, app).await
             })

@@ -19,10 +19,12 @@ Four crates in one workspace:
   buffers, coalesced head+body vectored sends, and `send_zc_vectored`.
 - **`s3-axum`** (`s3-axum/`): unified Axum S3 app (one `axum::Router`,
   middleware, `ListBuckets`/`ListObjectsV2`, optional AWS SigV4 + `aws-chunked`)
-  running on **both** `--runtime sidecar` (`tokio-sidecar` + `sidecar-axum`,
-  interrupt-driven `io_uring`, no IOPOLL threads) and `--runtime tokio`
-  (standard Tokio mio/epoll + `axum::serve`/Hyper + `spawn_blocking`). Both
-  backends share the exact same on-disk striped format and interoperate directly.
+  running on **three** runtimes/backends: `--runtime sidecar` (`tokio-sidecar`
+  + `sidecar-axum`, interrupt-driven `io_uring`, no IOPOLL threads),
+  `--runtime tokio` (standard Tokio mio/epoll + `axum::serve`/Hyper +
+  `spawn_blocking`), and `--runtime tokio-uring` (mainline Tokio's experimental
+  `io-uring` `tokio::fs` + `axum::serve`/Hyper). All three share the exact same
+  on-disk striped format and interoperate directly.
 
 The repository is local only: no remote, nothing published. Work in small,
 focused commits. The branch `axum-s3` adds `sidecar-axum` and `s3-axum` on top
@@ -90,8 +92,9 @@ sidecar-axum/src/conn.rs      buffered connection over Sidecar
 s3-axum/src/app.rs            unified Axum S3 Router, handlers, ListBuckets/ListObjectsV2, request-id/timing/SigV4 middleware
 s3-axum/src/sigv4.rs          AWS4-HMAC-SHA256 verification and streaming aws-chunked decoder (signed & unsigned, trailers)
 s3-axum/src/sidecar_store.rs  io_uring O_DIRECT store (inline small GET, single-write small PUT, statx overwrite fast path)
-s3-axum/src/tokio_store.rs    standard Tokio spawn_blocking store (same striped layout; buffered or --direct)
-s3-axum/src/main.rs           CLI launching --runtime sidecar|tokio
+s3-axum/src/tokio_store.rs       standard Tokio spawn_blocking store (same striped layout; buffered or --direct)
+s3-axum/src/tokio_uring_store.rs mainline Tokio io-uring tokio::fs store (single shared ring behind epoll)
+s3-axum/src/main.rs              CLI launching --runtime sidecar|tokio|tokio-uring
 ```
 
 ## Design decisions (settled with Louis; do not relitigate)
@@ -257,16 +260,16 @@ workers share it.
 
 Unified Axum S3 (`s3-axum`, same `axum::Router` + middleware, **zero IOPOLL threads**, November 2026):
 
-| Case | `s3-axum` (`sidecar`) | `s3-axum` (`tokio --direct`) | `s3-axum` (`tokio` buffered) |
-|---|---|---|---|
-| GET 16 MiB over 100G, 2 workers, 16 conns | **11.75 GiB/s** (100G wire), p99 26.5 ms, **1.10 proc cores** | 3.05 GiB/s, p99 133 ms, 1.86 cores | 2.82 GiB/s, p99 146 ms, 1.86 cores |
-| GET 16 MiB over 100G, 1 worker, 16 conns | **8.80 GiB/s** (~74 Gbps), p99 32.5 ms, **0.85 proc cores** | 1.73 GiB/s, p99 318 ms, 0.94 cores | 1.73 GiB/s, p99 219 ms, 0.93 cores |
-| GET 16 MiB over 100G, 4 workers, 32 conns | **11.69 GiB/s** (100G wire), p99 95 ms, **1.36 proc cores** | 5.12 GiB/s, p99 145 ms, 3.70 cores | 4.32 GiB/s, p99 180 ms, 3.70 cores |
-| PUT 16 MiB over 100G, 4 workers, 32 conns | **4.98 GiB/s**, p99 158 ms, **2.00 proc cores** | 2.46 GiB/s, p99 659 ms, 2.86 cores | 2.23 GiB/s, p99 789 ms, 2.76 cores |
-| GET 4 KiB over 100G, 4 workers, 32 conns | **90.2k req/s**, p50 347 µs, p99 491 µs | 25.7k req/s, p99 2.07 ms | 33.9k req/s, p99 1.61 ms (page cache) |
-| PUT 4 KiB over 100G, 4 workers, 32 conns | **9.49k req/s**, p50 2.54 ms, p99 10.7 ms, 1.54 cores | — | — |
-| PUT 4 KiB over loopback, 4 workers, 32 conns | **10.0k req/s**, p50 2.58 ms, p99 8.80 ms, 2.52 cores | 1.73k req/s, p99 31.3 ms, 3.29 cores | 1.74k req/s, p99 30.7 ms, 3.14 cores |
-| GET 4 KiB over loopback, 4 workers, 32 conns | **84.9k req/s**, p50 371 µs, p99 508 µs, 3.72 cores | 25.5k req/s, p99 2.80 ms, 3.60 cores | 33.9k req/s, p99 1.60 ms (page cache) |
+| Case | `s3-axum` (`sidecar`) | `s3-axum` (`tokio-uring`) | `s3-axum` (`tokio --direct`) | `s3-axum` (`tokio` buffered) |
+|---|---|---|---|---|
+| GET 16 MiB over 100G, 2w, 16c | **11.75 GiB/s** (100G wire), p99 26.5 ms, **1.10c** | 2.14 GiB/s, p99 150 ms, 1.75c | 3.05 GiB/s, p99 133 ms, 1.86c | 2.82 GiB/s, p99 146 ms, 1.86c |
+| GET 16 MiB over 100G, 1w, 16c | **8.80 GiB/s** (~74 Gbps), p99 32.5 ms, **0.85c** | 1.60 GiB/s, p99 197 ms, 0.93c | 1.73 GiB/s, p99 318 ms, 0.94c | 1.73 GiB/s, p99 219 ms, 0.93c |
+| GET 16 MiB over 100G, 4w, 32c | **11.69 GiB/s** (100G wire), p99 95 ms, **1.36c** | 3.08 GiB/s, p99 243 ms, 3.09c | 5.12 GiB/s, p99 145 ms, 3.70c | 4.32 GiB/s, p99 180 ms, 3.70c |
+| PUT 16 MiB over 100G, 4w, 32c | **4.98 GiB/s**, p99 158 ms, **2.00c** | 3.15 GiB/s, p99 411 ms, 2.89c | 2.46 GiB/s, p99 659 ms, 2.86c | 2.23 GiB/s, p99 789 ms, 2.76c |
+| GET 4 KiB over 100G, 4w, 32c | **90.2k req/s**, p50 347 µs, p99 491 µs | 34.4k req/s, p99 1.38 ms (page cache) | 25.7k req/s, p99 2.07 ms | 33.9k req/s, p99 1.61 ms (page cache) |
+| PUT 4 KiB over 100G, 4w, 32c | **9.49k req/s**, p50 2.54 ms, p99 10.7 ms, 1.54c | 7.84k req/s, p50 3.91 ms, p99 6.72 ms, 1.06c | — | — |
+| PUT 4 KiB over loopback, 4w, 32c | **10.6k req/s**, p50 2.25 ms, p99 9.67 ms, 2.71c | 7.25k req/s, p50 4.04 ms, p99 10.3 ms, 2.37c | 1.73k req/s, p99 31.3 ms, 3.29c | 1.74k req/s, p99 30.7 ms, 3.14c |
+| GET 4 KiB over loopback, 4w, 32c | **82.3–84.9k req/s**, p50 371 µs, p99 508 µs | 33.3k req/s, p99 1.52 ms (page cache) | 25.5k req/s, p99 2.80 ms | 33.9k req/s, p99 1.60 ms (page cache) |
 
 ## What the server does not do
 

@@ -7,7 +7,8 @@ use std::time::Duration;
 use axum::serve::ListenerExt;
 use hmac::{Hmac, Mac};
 use s3_axum::{
-    AppOptions, AuthConfig, Backend, SidecarStore, TokioStore, router, router_with_options,
+    AppOptions, AuthConfig, Backend, SidecarStore, TokioStore, TokioUringStore, router,
+    router_with_options,
 };
 use sha2::{Digest, Sha256};
 use sidecar_axum::{Config as HttpConfig, Server, ZeroCopy};
@@ -82,6 +83,29 @@ impl RunningServer {
         rt.block_on(async move {
             let store = TokioStore::open(&roots, 16 * 1024, 64 * 1024, direct).unwrap();
             let app = router(Backend::Tokio(store));
+            let listener = tokio::net::TcpListener::from_std(listener)
+                .unwrap()
+                .tap_io(|s| {
+                    let _ = s.set_nodelay(true);
+                });
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+        });
+        Self { addr, _rt: rt }
+    }
+
+    fn start_tokio_uring(roots: &[PathBuf]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut builder = Builder::new_multi_thread();
+        builder.worker_threads(2).enable_all().enable_io_uring();
+        let rt = builder.build().unwrap();
+        let roots = roots.to_vec();
+        rt.block_on(async move {
+            let store = TokioUringStore::open(&roots, 16 * 1024, 64 * 1024).unwrap();
+            let app = router(Backend::TokioUring(store));
             let listener = tokio::net::TcpListener::from_std(listener)
                 .unwrap()
                 .tap_io(|s| {
@@ -362,6 +386,15 @@ fn tokio_runtime_buffered_suite() {
 fn tokio_runtime_direct_suite() {
     let roots = scratch_roots("tokio-direct", 2);
     let server = RunningServer::start_tokio(&roots, true);
+    run_suite(&server);
+    drop(server);
+    cleanup(&roots);
+}
+
+#[test]
+fn tokio_uring_runtime_suite() {
+    let roots = scratch_roots("tokio-uring", 2);
+    let server = RunningServer::start_tokio_uring(&roots);
     run_suite(&server);
     drop(server);
     cleanup(&roots);

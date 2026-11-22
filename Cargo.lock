@@ -541,9 +541,11 @@ name = "tokio"
 version = "1.54.1"
 dependencies = [
  "bytes",
+ "io-uring",
  "libc",
  "mio",
  "pin-project-lite",
+ "slab",
  "socket2",
  "tokio-macros",
  "windows-sys",

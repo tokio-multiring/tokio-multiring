@@ -25,6 +25,7 @@ use crate::sidecar_store::{SidecarStore, SidecarStored};
 use crate::sigv4::{self, AuthConfig, PayloadMode};
 use crate::stripe::Meta;
 use crate::tokio_store::{TokioStore, TokioStored};
+use crate::tokio_uring_store::{TokioUringStore, TokioUringStored};
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static X_AMZ_REQUEST_ID: HeaderName = HeaderName::from_static("x-amz-request-id");
@@ -35,6 +36,7 @@ static X_S3_RUNTIME: HeaderName = HeaderName::from_static("x-s3-runtime");
 pub enum Backend {
     Sidecar(Arc<SidecarStore>),
     Tokio(Arc<TokioStore>),
+    TokioUring(Arc<TokioUringStore>),
 }
 
 impl Backend {
@@ -42,6 +44,7 @@ impl Backend {
         match self {
             Backend::Sidecar(_) => HeaderValue::from_static("sidecar"),
             Backend::Tokio(_) => HeaderValue::from_static("tokio"),
+            Backend::TokioUring(_) => HeaderValue::from_static("tokio-uring"),
         }
     }
 }
@@ -240,6 +243,7 @@ async fn list_buckets(State(backend): State<Backend>, uri: Uri) -> Result<Respon
     let buckets = match &backend {
         Backend::Sidecar(s) => s.list_buckets().await?,
         Backend::Tokio(s) => s.list_buckets().await?,
+        Backend::TokioUring(s) => s.list_buckets().await?,
     };
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -291,6 +295,7 @@ async fn list_objects(
     let page = match &backend {
         Backend::Sidecar(s) => s.list_objects(&bucket, prefix, after, max_keys).await?,
         Backend::Tokio(s) => s.list_objects(&bucket, prefix, after, max_keys).await?,
+        Backend::TokioUring(s) => s.list_objects(&bucket, prefix, after, max_keys).await?,
     };
 
     let mut xml = format!(
@@ -329,6 +334,7 @@ async fn create_bucket(State(backend): State<Backend>, uri: Uri) -> Result<Respo
     match &backend {
         Backend::Sidecar(s) => s.create_bucket(&bucket).await?,
         Backend::Tokio(s) => s.create_bucket(&bucket).await?,
+        Backend::TokioUring(s) => s.create_bucket(&bucket).await?,
     }
     Ok(empty_response(StatusCode::OK))
 }
@@ -338,6 +344,7 @@ async fn head_bucket(State(backend): State<Backend>, uri: Uri) -> Result<Respons
     match &backend {
         Backend::Sidecar(s) => s.head_bucket(&bucket).await?,
         Backend::Tokio(s) => s.head_bucket(&bucket).await?,
+        Backend::TokioUring(s) => s.head_bucket(&bucket).await?,
     }
     Ok(empty_response(StatusCode::OK))
 }
@@ -347,6 +354,7 @@ async fn delete_bucket(State(backend): State<Backend>, uri: Uri) -> Result<Respo
     match &backend {
         Backend::Sidecar(s) => s.delete_bucket(&bucket).await?,
         Backend::Tokio(s) => s.delete_bucket(&bucket).await?,
+        Backend::TokioUring(s) => s.delete_bucket(&bucket).await?,
     }
     Ok(empty_response(StatusCode::NO_CONTENT))
 }
@@ -366,6 +374,7 @@ async fn put_object(
     let meta = match &backend {
         Backend::Sidecar(s) => s.put_object(&object, body, mode).await?,
         Backend::Tokio(s) => s.put_object(&object, body, mode).await?,
+        Backend::TokioUring(s) => s.put_object(&object, body, mode).await?,
     };
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -385,6 +394,7 @@ async fn head_object(
     let meta = match &backend {
         Backend::Sidecar(s) => s.head_object(&object).await?,
         Backend::Tokio(s) => s.head_object(&object).await?,
+        Backend::TokioUring(s) => s.head_object(&object).await?,
     };
     Ok(build_object_response(
         meta,
@@ -418,6 +428,15 @@ async fn get_object(
                 ObjectPayload::Tokio(s.clone(), stored),
             ))
         }
+        Backend::TokioUring(s) => {
+            let stored = s.open_object(&object).await?;
+            let meta = stored.meta;
+            Ok(build_object_response(
+                meta,
+                headers.get(header::RANGE),
+                ObjectPayload::TokioUring(s.clone(), stored),
+            ))
+        }
     }
 }
 
@@ -426,6 +445,7 @@ async fn delete_object(State(backend): State<Backend>, uri: Uri) -> Result<Respo
     match &backend {
         Backend::Sidecar(s) => s.delete_object(&object).await?,
         Backend::Tokio(s) => s.delete_object(&object).await?,
+        Backend::TokioUring(s) => s.delete_object(&object).await?,
     }
     Ok(empty_response(StatusCode::NO_CONTENT))
 }
@@ -434,6 +454,7 @@ enum ObjectPayload {
     HeadOnly,
     Sidecar(Arc<SidecarStore>, SidecarStored),
     Tokio(Arc<TokioStore>, TokioStored),
+    TokioUring(Arc<TokioUringStore>, TokioUringStored),
 }
 
 fn build_object_response(
@@ -471,6 +492,10 @@ fn build_object_response(
             DirectResponse::new(head, store.writer(stored, range)).into_response()
         }
         ObjectPayload::Tokio(store, stored) => {
+            let body = store.stream_body(stored, range);
+            builder.body(body).expect("valid stream response")
+        }
+        ObjectPayload::TokioUring(store, stored) => {
             let body = store.stream_body(stored, range);
             builder.body(body).expect("valid stream response")
         }
