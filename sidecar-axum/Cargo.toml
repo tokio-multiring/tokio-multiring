@@ -1,0 +1,26 @@
+[package]
+name = "sidecar-axum"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Serve axum Routers over tokio-sidecar (io_uring) and ureq-proto"
+license = "MIT"
+publish = false
+
+[dependencies]
+axum = { version = "0.8", default-features = false }
+bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+log = "0.4"
+tokio = { path = "../../tokio-uring-wl/tokio", features = ["rt-multi-thread", "sync", "time", "worker-local"] }
+tokio-sidecar = { path = ".." }
+tower-service = "0.3"
+ureq-proto = { path = "../../ureq-proto-combined", default-features = false, features = ["server"] }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["json", "query", "matched-path"] }
+futures-util = "0.3"
+tokio = { path = "../../tokio-uring-wl/tokio", features = ["macros", "rt-multi-thread", "sync", "time", "worker-local"] }
+tower = "0.5"

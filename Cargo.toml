@@ -22,7 +22,7 @@ libc = "0.2"
 tokio = { path = "../tokio-uring-wl/tokio", features = ["macros", "net", "io-util", "time"] }
 
 [workspace]
-members = ["s3"]
+members = ["s3", "sidecar-axum"]
 
 # That tokio branch registers sockets through `mio::Registry::register_shared`,
 # which is on the `shared-registration-v3` branch of the mio fork.
