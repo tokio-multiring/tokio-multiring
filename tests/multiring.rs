@@ -18,9 +18,8 @@ fn runtime(config: Config) -> (tokio::runtime::Runtime, MultiRing) {
     (builder.build().unwrap(), multiring)
 }
 
-/// A runtime whose rings are flushed only when a worker goes to sleep or
-/// the runtime has it look at its ring.
-fn runtime_without_hook(config: Config) -> (tokio::runtime::Runtime, MultiRing) {
+/// An application callback must not replace the reactor's own flush hook.
+fn runtime_with_application_hook(config: Config) -> (tokio::runtime::Runtime, MultiRing) {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(4).enable_time();
     let multiring = MultiRing::install(&mut builder, config);
@@ -55,9 +54,9 @@ fn nop_on_a_worker() {
 }
 
 #[test]
-fn works_without_the_hook() {
+fn application_hook_does_not_replace_reactor_hook() {
     let (reader, mut writer) = socket_pair();
-    let (runtime, multiring) = runtime_without_hook(Config::default());
+    let (runtime, multiring) = runtime_with_application_hook(Config::default());
     runtime.block_on(async {
         let read = tokio::spawn(async move {
             multiring.nop().await.unwrap();
@@ -76,9 +75,8 @@ fn works_without_the_hook() {
     });
 }
 
-/// Without the hook an operation only reaches the kernel as its worker goes
-/// to sleep, and one that completes there and then has woken a task. The
-/// worker has to run it before it sleeps: nothing else is going to wake it.
+/// A completed operation wakes its task. The worker must run that task
+/// before sleeping, even with an application before-steal callback installed.
 #[test]
 fn a_worker_does_not_sleep_on_what_it_just_woke() {
     let mut builder = tokio::runtime::Builder::new_multi_thread();

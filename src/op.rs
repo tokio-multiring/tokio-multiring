@@ -415,6 +415,11 @@ pub(crate) struct Completion {
 }
 
 impl Completion {
+    /// Returns an operation that was never submitted to the kernel.
+    pub(crate) fn cancelled(operation: Operation) -> Self {
+        Self::new(-libc::ECANCELED, operation)
+    }
+
     pub(crate) fn new(result: i32, mut operation: Operation) -> Self {
         let new_fd = match &mut operation {
             Operation::Accept { accepted, .. } => Some(accepted),
@@ -478,8 +483,13 @@ impl Future for Op {
                 let ticket = this
                     .multiring
                     .submit(operation, TaskRef::new(&this.landing));
-                this.progress = Progress::InFlight(ticket);
-                Poll::Pending
+                match ticket {
+                    Ok(ticket) => {
+                        this.progress = Progress::InFlight(ticket);
+                        Poll::Pending
+                    }
+                    Err(operation) => Poll::Ready(Completion::cancelled(operation)),
+                }
             }
             Progress::InFlight(ticket) => {
                 // SAFETY: this future owns the landing.

@@ -297,3 +297,53 @@ fn disk_rings_need_the_runtimes_plan() {
         .unwrap();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
+
+/// Worker teardown must reap even uncancellable IOPOLL requests before
+/// releasing their buffers. Submit locally, then stop before awaiting them.
+#[test]
+fn shutdown_drains_polled_operations() {
+    use std::future::{Future, poll_fn};
+    use std::task::{Context, Poll, Waker};
+    let (fd, offset) = scratch(6);
+    let pool = BufferPool::new(BUF_SIZE, 8).unwrap();
+    let (runtime, multiring) = setup(&pool);
+    let writes = runtime.block_on({
+        let multiring = multiring.clone();
+        let pool = pool.clone();
+        async move {
+            tokio::spawn(async move {
+                let mut writes = Vec::new();
+                for index in 0..8 {
+                    let mut buffer = pool.acquire().await;
+                    buffer.extend_from_slice(&[0x66; BUF_SIZE]);
+                    let mut write = Box::pin(multiring.write_polled_at(
+                        fd.clone(),
+                        buffer,
+                        offset + index * BUF_SIZE as u64,
+                    ));
+                    poll_fn(|cx| {
+                        assert!(write.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    writes.push(write);
+                }
+                writes
+            })
+            .await
+            .unwrap()
+        }
+    });
+    drop(runtime);
+    for mut write in writes {
+        let Poll::Ready((result, buffer)) =
+            write.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("polled write stranded by shutdown");
+        };
+        assert_eq!(result.unwrap(), BUF_SIZE);
+        drop(buffer);
+    }
+    assert_eq!(multiring.in_flight(), 0);
+    assert_eq!(pool.available(), 8);
+}

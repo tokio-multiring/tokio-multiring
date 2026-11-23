@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -335,6 +335,14 @@ impl MultiRing {
     /// not use [`block_in_place`](tokio::task::block_in_place): a ring
     /// belongs to the thread its worker started on.
     ///
+    /// Runtime shutdown cancels outstanding operations and waits for the
+    /// kernel's final completions before releasing their memory. Operations
+    /// that cannot be cancelled (including zero-copy buffer release) can
+    /// delay worker exit. Tokio's `shutdown_timeout` and `shutdown_background`
+    /// bound the caller's wait; the workers retain resources until safe to
+    /// reclaim them. Operations first polled after their worker stops fail
+    /// with `ECANCELED` and return their buffers normally.
+    ///
     /// This takes the builder's `io_reactor` slot (flushing before stealing
     /// runs through [`Reactor::before_steal`], leaving
     /// [`Builder::on_before_steal`] free for callers). A multiring drives one
@@ -384,49 +392,44 @@ impl MultiRing {
     /// Hands `operation` to a ring: the current worker's if this thread has
     /// one, otherwise the next in rotation. The result is written to `task`,
     /// whose waker must already be set.
-    pub(crate) fn submit(&self, operation: Operation, task: TaskRef) -> Ticket {
+    pub(crate) fn submit(&self, operation: Operation, task: TaskRef) -> Result<Ticket, Operation> {
         match self.inner.local() {
             Some(worker) => {
                 let lease = worker.lease();
                 // SAFETY: `self` keeps the pool alive.
                 let generation = unsafe { lease.cell.get() }.arm();
                 let token = worker.start(lease, generation, task, operation);
-                Ticket {
+                Ok(Ticket {
                     worker: worker.index,
                     token,
                     cell: lease.cell,
-                }
+                })
             }
             None => {
                 let worker = self.inner.next_worker();
                 let shared = &self.inner.workers()[worker];
 
                 let mut pool = shared.pool();
+                if pool.closed {
+                    return Err(operation);
+                }
                 let lease = pool.lease();
                 // SAFETY: `self` keeps the pool alive.
                 let generation = unsafe { lease.cell.get() }.arm();
-                // With the worker gone the operation is dropped, and its
-                // future stays pending.
-                let orphan = if pool.closed {
-                    Some(operation)
-                } else {
-                    pool.queue.push(Remote::Submit {
-                        lease,
-                        generation,
-                        task,
-                        operation,
-                    });
-                    None
-                };
+                pool.queue.push(Remote::Submit {
+                    lease,
+                    generation,
+                    task,
+                    operation,
+                });
                 drop(pool);
-                drop(orphan);
                 self.inner.wake(worker);
 
-                Ticket {
+                Ok(Ticket {
                     worker,
                     token: token_of(generation, lease.index),
                     cell: lease.cell,
-                }
+                })
             }
         }
     }
@@ -725,9 +728,9 @@ impl Reactor for Inner {
 
 /// Flushes the current worker's ring: submits what its tasks have queued and
 /// delivers the completions that are ready. [`MultiRing::install`] has the
-/// runtime call it whenever a worker has run out of local work. A runtime
-/// that needs [`Builder::on_before_steal`] for something else has to call
-/// it from its own callback.
+/// runtime call it whenever a worker has run out of local work through
+/// [`Reactor::before_steal`], independently of the application's
+/// [`Builder::on_before_steal`] callback.
 ///
 /// The hook runs when a worker has emptied its local queue, so everything
 /// the worker's tasks queued since the last flush goes to the kernel in one
@@ -819,9 +822,11 @@ struct Worker {
     revisit: Cell<bool>,
     /// Looks at the ring since completions were last taken in.
     looks: Cell<u32>,
-    /// Where the read that wakes the worker puts what it read. Leaked: the
-    /// kernel may write to it after the ring is closed.
-    woken: NonNull<[u8; 8]>,
+    /// Stops rearming watches while shutdown drains their final CQEs.
+    stopping: Cell<bool>,
+    wake_pending: Cell<bool>,
+    /// Stable storage kept alive until the wake read's final CQE.
+    woken: Box<UnsafeCell<[u8; 8]>>,
     multiring: Arc<Inner>,
     index: usize,
 }
@@ -848,7 +853,9 @@ impl Worker {
             reports: RefCell::new(Vec::new()),
             revisit: Cell::new(false),
             looks: Cell::new(0),
-            woken: NonNull::from(Box::leak(Box::new([0; 8]))),
+            stopping: Cell::new(false),
+            wake_pending: Cell::new(false),
+            woken: Box::new(UnsafeCell::new([0; 8])),
             multiring,
             index,
         });
@@ -864,8 +871,9 @@ impl Worker {
 
     /// Queues the read that a write to the worker's eventfd completes.
     fn listen_for_wake(&self) {
+        self.wake_pending.set(true);
         let wake = types::Fd(self.shared().wake.as_raw_fd());
-        let entry = opcode::Read::new(wake, self.woken.as_ptr().cast(), 8)
+        let entry = opcode::Read::new(wake, self.woken.get().cast(), 8)
             .build()
             .user_data(WAKE);
         if let Err(error) = self.push(&entry) {
@@ -1489,8 +1497,13 @@ impl Worker {
         for (token, result, flags) in completions.drain(..) {
             match token {
                 DETACHED => {}
-                WAKE => self.listen_for_wake(),
-                DISK if cqueue::more(flags) => {}
+                WAKE => {
+                    self.wake_pending.set(false);
+                    if !self.stopping.get() {
+                        self.listen_for_wake();
+                    }
+                }
+                DISK if self.stopping.get() || cqueue::more(flags) => {}
                 DISK => self.listen_for_disk(),
                 _ if token & KIND == WATCH => {
                     self.watched(token, result, flags);
@@ -1520,26 +1533,108 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        // A kernel error or a foreign waker panic must not unwind through
+        // fields whose memory the kernel can still access.
+        struct AbortOnUnwind(bool);
+        impl Drop for AbortOnUnwind {
+            fn drop(&mut self) {
+                if self.0 && std::thread::panicking() {
+                    std::process::abort();
+                }
+            }
+        }
+        let mut guard = AbortOnUnwind(true);
+        self.stopping.set(true);
         let unsent = {
             let mut pool = self.shared().pool();
             pool.closed = true;
             std::mem::take(&mut pool.queue)
         };
-        // Nothing reports on the files any more. Whoever waits on one gets
-        // an error instead of waiting forever.
-        for remote in &unsent {
-            if let Remote::Watch { readiness, .. } = remote {
-                readiness.shutdown();
+        // CURRENT has already been cleared. Foreign wakers therefore cannot
+        // reenter this worker; new submissions see the closed queue.
+        for remote in unsent {
+            match remote {
+                Remote::Submit {
+                    lease,
+                    generation,
+                    task,
+                    operation,
+                } => {
+                    // This operation never reached the SQ, so it can be
+                    // returned immediately, after arbitration with its future.
+                    // SAFETY: the worker keeps the arbiter pool alive.
+                    let cell = unsafe { lease.cell.get() };
+                    loop {
+                        match cell.claim(generation) {
+                            Claim::Busy => std::thread::yield_now(),
+                            Claim::Abandoned => {
+                                operation.release();
+                                break;
+                            }
+                            Claim::Deliver => {
+                                let completion = Completion::cancelled(operation);
+                                // SAFETY: the claim keeps the future alive.
+                                let waker = unsafe { task.get().deliver(completion) };
+                                if let Some(waker) = waker {
+                                    waker.wake();
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    cell.retire(generation);
+                    self.release(lease);
+                }
+                Remote::Watch { readiness, .. } => readiness.shutdown(),
+                _ => {}
             }
         }
-        drop(unsent);
-        for (_, watch) in &self.watches.get_mut().entries {
-            watch.iter().for_each(|watch| watch.readiness.shutdown());
+        let readiness: Vec<_> = self
+            .watches
+            .get_mut()
+            .entries
+            .iter_mut()
+            .filter_map(|(_, watch)| watch.as_mut())
+            .map(|watch| {
+                watch.ended = true;
+                watch.readiness.clone()
+            })
+            .collect();
+        for readiness in readiness {
+            readiness.shutdown();
         }
-        // Closing the ring does not wait for in-flight operations to stop,
-        // so the kernel may write into their buffers after this point. They
-        // are leaked rather than freed.
-        std::mem::forget(std::mem::take(self.slots.get_mut()));
+
+        // Closing an io_uring fd is asynchronous. Keep every operation and
+        // the wake-read buffer alive until their final CQEs instead. Sync
+        // cancellation is retried after flushing/reaping, covering partial
+        // submissions and CQ overflow. Disk I/O and zero-copy notifications
+        // may not be cancellable: those must complete naturally.
+        while self.wake_pending.get() || self.shared().in_flight.load(Ordering::Relaxed) != 0 {
+            self.enter();
+            self.kick_disk();
+            let cancelled = self.ring.borrow().submitter().register_sync_cancel(
+                Some(types::Timespec::new().nsec(1_000_000)),
+                types::CancelBuilder::any(),
+            );
+            match cancelled {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::ENOENT | libc::EINTR | libc::ETIME | libc::EBUSY | libc::EAGAIN)
+                    ) => {}
+                Err(error) => {
+                    // Unwinding would free memory still owned by the kernel.
+                    eprintln!("cannot safely shut down io_uring: {error}");
+                    std::process::abort();
+                }
+            }
+            self.reap();
+            if self.wake_pending.get() || self.shared().in_flight.load(Ordering::Relaxed) != 0 {
+                self.wait(Some(Duration::from_millis(1)));
+            }
+        }
+        guard.0 = false;
     }
 }
 
