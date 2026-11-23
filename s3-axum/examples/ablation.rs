@@ -1,8 +1,9 @@
 //! Ablation benchmark isolating:
 //!   1. `hyper`          — standard Tokio (mio) + `axum::serve` (Hyper)
-//!   2. `tokio-ureq`     — standard Tokio (mio) + `ureq-proto` over `tokio::net::TcpStream` (just drop Hyper!)
-//!   3. `multiring-body`   — `tokio-multiring` (`io_uring`) + `multiring-axum` (`ureq-proto`), standard `axum::body::Body`
-//!   4. `multiring-direct` — `tokio-multiring` (`io_uring`) + `multiring-axum` (`ureq-proto`), `DirectWrite` + `send_zc`
+//!   2. `hyper-multiring` — same Hyper server and Tokio sockets, multiring reactor
+//!   3. `tokio-ureq`     — standard Tokio (mio) + `ureq-proto` over `tokio::net::TcpStream` (just drop Hyper!)
+//!   4. `multiring-body`   — `tokio-multiring` (`io_uring`) + `multiring-axum` (`ureq-proto`), standard `axum::body::Body`
+//!   5. `multiring-direct` — `tokio-multiring` (`io_uring`) + `multiring-axum` (`ureq-proto`), `DirectWrite` + `send_zc`
 //!
 //! Supports both pure in-memory HTTP (`--mode mem`, serving static 4K/16M
 //! responses compatible with `s3/examples/load`) and real S3 (`--mode s3`,
@@ -35,11 +36,18 @@ use tokio_multiring::{BufferPool, Domain, FixedBuf, Hyperthreads, MultiRing, Pla
 use tower_service::Service;
 use ureq_proto::server::{RecvRequestResult, Reply, SendResponseResult};
 
-fn build_plan(domains_limit: usize) -> io::Result<Plan> {
+fn build_plan(domains_limit: usize, workers: Option<usize>) -> io::Result<Plan> {
     let detected = Plan::detect(Hyperthreads::Skip)?;
     let domains = detected.domains();
     let count = domains_limit.min(domains.len());
-    let selected: Vec<Domain> = domains[..count].to_vec();
+    let mut selected: Vec<Domain> = domains[..count].to_vec();
+    if let Some(mut left) = workers {
+        for domain in &mut selected {
+            domain.workers.truncate(left);
+            left = left.saturating_sub(domain.workers.len());
+        }
+        selected.retain(|domain| !domain.workers.is_empty());
+    }
     Plan::new(selected)
 }
 
@@ -373,6 +381,10 @@ fn main() -> io::Result<()> {
     let mut domains: usize = 2;
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut direct_disk = false;
+    let mut workers = None;
+    let mut window = 4;
+    let mut zero_copy = ZeroCopy::Never;
+    let mut worker_local = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -383,18 +395,50 @@ fn main() -> io::Result<()> {
             "--domains" => domains = args.next().unwrap().parse().unwrap(),
             "--root" => roots.push(PathBuf::from(args.next().unwrap())),
             "--direct" => direct_disk = true,
+            "--workers" => workers = Some(args.next().unwrap().parse().unwrap()),
+            "--window" => window = args.next().unwrap().parse().unwrap(),
+            "--worker-local" => worker_local = true,
+            "--zero-copy" => {
+                zero_copy = match args.next().as_deref() {
+                    Some("never") => ZeroCopy::Never,
+                    Some("remote") => ZeroCopy::Remote,
+                    Some("always") => ZeroCopy::Always,
+                    _ => {
+                        return Err(io::Error::other(
+                            "--zero-copy must be never, remote, or always",
+                        ));
+                    }
+                }
+            }
             other => panic!("unknown arg: {other}"),
         }
     }
 
-    let plan = build_plan(domains)?;
+    if mode != "mem" && mode != "s3" {
+        return Err(io::Error::other("--mode must be mem or s3"));
+    }
+    if window == 0 {
+        return Err(io::Error::other("--window must be positive"));
+    }
+    if !stack.starts_with("multiring-") && (worker_local || zero_copy != ZeroCopy::Never) {
+        return Err(io::Error::other(
+            "--worker-local and --zero-copy require multiring-body or multiring-direct",
+        ));
+    }
+    let plan = build_plan(domains, workers)?;
+    eprintln!(
+        "stack={stack} mode={mode} workers={} window={window} zero_copy={zero_copy:?} worker_local={worker_local}",
+        plan.worker_count()
+    );
     let listener = TcpListener::bind(&listen)?;
 
     match stack.as_str() {
-        "hyper" | "tokio-ureq" => {
+        "hyper" | "hyper-multiring" | "tokio-ureq" => {
             listener.set_nonblocking(true)?;
             let mut builder = tokio::runtime::Builder::new_multi_thread();
             builder.enable_all();
+            let _reactor = (stack == "hyper-multiring")
+                .then(|| MultiRing::install(&mut builder, Default::default()));
             let rt = plan.build(&mut builder)?;
             rt.block_on(async move {
                 let app = if mode == "mem" {
@@ -405,11 +449,12 @@ fn main() -> io::Result<()> {
                         use_direct: false,
                     })
                 } else {
-                    let store = TokioStore::open(&roots, 128 * 1024, 1 << 20, direct_disk, 4)?;
+                    let store = TokioStore::open(&roots, 128 * 1024, 1 << 20, direct_disk, window)?;
                     s3_router(Backend::Tokio(store))
                 };
                 let listener = tokio::net::TcpListener::from_std(listener)?;
-                if stack == "hyper" {
+                eprintln!("BENCH_READY");
+                if stack != "tokio-ureq" {
                     let listener = listener.tap_io(|s| {
                         let _ = s.set_nodelay(true);
                     });
@@ -421,6 +466,12 @@ fn main() -> io::Result<()> {
         }
         "multiring-body" | "multiring-direct" => {
             let pool = BufferPool::new(1 << 20, 256)?;
+            // Initialize outside measurement; every mem stack serves the same bytes.
+            if mode == "mem" {
+                for mut buf in pool.try_acquire_many(pool.count()).expect("unused pool") {
+                    buf.spare_capacity_mut().fill(0x42);
+                }
+            }
             let mut builder = tokio::runtime::Builder::new_multi_thread();
             builder.enable_time();
             let multiring = MultiRing::install(
@@ -441,22 +492,24 @@ fn main() -> io::Result<()> {
                     })
                 } else if stack == "multiring-body" {
                     // `multiring-axum` (ureq-proto + io_uring sockets) driving `TokioStore`!
-                    let store = TokioStore::open(&roots, 128 * 1024, 1 << 20, direct_disk, 4)?;
+                    let store = TokioStore::open(&roots, 128 * 1024, 1 << 20, direct_disk, window)?;
                     s3_router(Backend::Tokio(store))
                 } else {
-                    let store = MultiRingStore::open(multiring.clone(), &roots, 128 * 1024, 4)?;
+                    let store =
+                        MultiRingStore::open(multiring.clone(), &roots, 128 * 1024, window)?;
                     s3_router(Backend::MultiRing(store))
                 };
                 Server::new(
                     multiring,
                     HttpConfig {
                         connections: 1024,
-                        zero_copy: ZeroCopy::Remote,
-                        worker_local_connections: true,
+                        zero_copy,
+                        worker_local_connections: worker_local,
                         ..HttpConfig::default()
                     },
                 )?
                 .listen(listener, app);
+                eprintln!("BENCH_READY");
                 std::future::pending().await
             })
         }

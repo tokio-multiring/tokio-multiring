@@ -45,7 +45,7 @@ RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --offline --workspace 
   sandbox. Fetching a new dependency needs one `cargo fetch` without it.
 - `--cfg tokio_unstable` comes from `.cargo/config.toml`. rustdoc needs it in
   `RUSTDOCFLAGS` as shown.
-- All of the above are clean at HEAD: 129 tests across twelve test binaries.
+- Run all of the above before publishing changes.
 - Concurrency bugs here have shown up at rates near 1 in 100. Before calling
   such a change verified, loop the affected test binaries (they are in
   `target/{debug,release}/deps/`) at least 30 times in both profiles. A new
@@ -227,12 +227,14 @@ target/release/multiring-s3 --root /srv/sidecar-s3/d0 --root /srv/sidecar-s3/d1 
 
 ```sh
 # object load, from this machine or another (copy the binary over)
-ADDR=127.0.0.1:19000 MODE=put|get SIZE=16777216 COUNT=8 CONNS=32 SECONDS=5 \
+ADDR=127.0.0.1:19000 MODE=prepare|get|put|verify SIZE=16777216 COUNT=8 CONNS=32 SECONDS=10 WARMUP=2 \
     taskset -c 8-15,24-31 target/release/examples/load
 ```
 
-- `get` fetches objects named by connection and index, so run `put` first
-  with the **same** `CONNS` and `COUNT`.
+- `get` fetches objects named by connection and index, so run `prepare` first
+  with the **same** `SIZE`, `CONNS` and `COUNT`. `prepare` and `verify` visit
+  every key once; `get` and `put` are timed runs with untimed warm-up. GET
+  verifies payload bytes by default (`VERIFY=0` disables that client cost).
 - Pin the load generator away from the server's workers. Over loopback the
   client is the bottleneck above about 6 GiB/s.
 - For a 100G run the client goes on lourip (power it on from the lab
@@ -241,7 +243,8 @@ ADDR=127.0.0.1:19000 MODE=put|get SIZE=16777216 COUNT=8 CONNS=32 SECONDS=5 \
   overwrites it.** The demo namespaces now hold filesystems, so do not point
   it at them without reformatting afterwards.
 
-Reference numbers (single runs of 4 to 6 seconds, November 2026):
+Historical reference numbers (single runs of 4 to 6 seconds, November 2026;
+before baseline read-ahead/buffer reuse fixes, not current comparative results):
 
 | Case | Result |
 |---|---|
@@ -260,18 +263,18 @@ nothing on large ones, at the cost of one spinning core per domain. One
 kernel SQ thread tops out near 450k 4 KiB reads per second however many
 workers share it.
 
-Unified Axum S3 (`s3-axum`, same `axum::Router` + middleware, **zero IOPOLL threads**, November 2026):
+Unified Axum S3 (`s3-axum`, same `axum::Router` + middleware, **zero IOPOLL threads**, `bench/run.py` 5 interleaved reps, `WARMUP=2`, `SECONDS=6`, `VERIFY=1`, binary `GiB/s = mib_s / 1024`, November 2026):
 
 | Case | `s3-axum` (`multiring`) | `s3-axum` (`tokio-uring`) | `s3-axum` (`tokio --direct`) | `s3-axum` (`tokio` buffered) |
 |---|---|---|---|---|
-| GET 16 MiB over 100G, 2w, 16c | **11.75 GiB/s** (100G wire), p99 26.5 ms, **1.10c** | 2.14 GiB/s, p99 150 ms, 1.75c | 3.05 GiB/s, p99 133 ms, 1.86c | 2.82 GiB/s, p99 146 ms, 1.86c |
-| GET 16 MiB over 100G, 1w, 16c | **8.80 GiB/s** (~74 Gbps), p99 32.5 ms, **0.85c** | 1.60 GiB/s, p99 197 ms, 0.93c | 1.73 GiB/s, p99 318 ms, 0.94c | 1.73 GiB/s, p99 219 ms, 0.93c |
-| GET 16 MiB over 100G, 4w, 32c | **11.69 GiB/s** (100G wire), p99 95 ms, **1.36c** | 3.08 GiB/s, p99 243 ms, 3.09c | 5.12 GiB/s, p99 145 ms, 3.70c | 4.32 GiB/s, p99 180 ms, 3.70c |
-| PUT 16 MiB over 100G, 4w, 32c | **4.98 GiB/s**, p99 158 ms, **2.00c** | 3.15 GiB/s, p99 411 ms, 2.89c | 2.46 GiB/s, p99 659 ms, 2.86c | 2.23 GiB/s, p99 789 ms, 2.76c |
-| GET 4 KiB over 100G, 4w, 32c | **90.2k req/s**, p50 347 µs, p99 491 µs | 34.4k req/s, p99 1.38 ms (page cache) | 25.7k req/s, p99 2.07 ms | 33.9k req/s, p99 1.61 ms (page cache) |
-| PUT 4 KiB over 100G, 4w, 32c | **9.49k req/s**, p50 2.54 ms, p99 10.7 ms, 1.54c | 7.84k req/s, p50 3.91 ms, p99 6.72 ms, 1.06c | — | — |
-| PUT 4 KiB over loopback, 4w, 32c | **10.6k req/s**, p50 2.25 ms, p99 9.67 ms, 2.71c | 7.25k req/s, p50 4.04 ms, p99 10.3 ms, 2.37c | 1.73k req/s, p99 31.3 ms, 3.29c | 1.74k req/s, p99 30.7 ms, 3.14c |
-| GET 4 KiB over loopback, 4w, 32c | **82.3–84.9k req/s**, p50 371 µs, p99 508 µs | 33.3k req/s, p99 1.52 ms (page cache) | 25.5k req/s, p99 2.80 ms | 33.9k req/s, p99 1.60 ms (page cache) |
+| GET 16 MiB over 100G, 2w, 16c | **11.51 GiB/s** (100G wire), p99 28.1 ms, **1.41c** | 2.61 GiB/s, p99 113 ms, 1.83c | 2.37 GiB/s, p99 169 ms, 1.89c | 2.11 GiB/s, p99 210 ms, 1.86c |
+| GET 16 MiB over 100G, 1w, 16c | **8.45 GiB/s** (~73 Gbps), p99 35.4 ms, **0.99c** | 1.63 GiB/s, p99 189 ms, 0.99c | 1.32 GiB/s, p99 259 ms, 1.00c | 1.24 GiB/s, p99 330 ms, 0.99c |
+| GET 16 MiB over 100G, 4w, 32c | **11.48 GiB/s** (100G wire), p99 94.6 ms, **1.54c** | 3.44 GiB/s, p99 178 ms, 2.80c | 4.01 GiB/s, p99 223 ms, 3.36c | 3.35 GiB/s, p99 267 ms, 3.20c |
+| PUT 16 MiB over 100G, 4w, 32c | **5.46 GiB/s**, p99 160 ms, **3.17c** | 3.57 GiB/s, p99 227 ms, 3.81c | 3.35 GiB/s, p99 323 ms, 3.65c | 3.26 GiB/s, p99 318 ms, 3.73c |
+| GET 4 KiB over 100G, 4w, 32c | **91.7k req/s**, p50 346 µs, p99 454 µs | 33.2k req/s, p99 1.30 ms (page cache) | 42.9k req/s, p99 1.26 ms | 49.5k req/s, p99 1.09 ms (page cache) |
+| PUT 4 KiB over 100G, 4w, 32c | **11.0k req/s**, p50 2.33 ms, p99 8.07 ms, 2.82c | 7.87k req/s, p50 4.00 ms, p99 6.43 ms, 2.59c | 9.04k req/s, p50 3.27 ms, p99 8.17 ms, 2.98c | 8.89k req/s, p50 3.05 ms, p99 10.8 ms, 2.74c |
+| PUT 4 KiB over loopback, 4w, 32c | **11.1k req/s**, p50 2.31 ms, p99 8.00 ms, 2.84c | 7.92k req/s, p50 3.99 ms, p99 6.39 ms, 2.58c | 9.15k req/s, p50 3.21 ms, p99 8.25 ms, 3.01c | 8.82k req/s, p50 3.03 ms, p99 11.4 ms, 2.72c |
+| GET 4 KiB over loopback, 4w, 32c | **86.9k req/s**, p50 366 µs, p99 473 µs | 33.8k req/s, p99 1.29 ms (page cache) | 41.5k req/s, p99 1.31 ms | 49.2k req/s, p99 1.12 ms (page cache) |
 
 ## What the server does not do
 

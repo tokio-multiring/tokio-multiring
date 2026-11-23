@@ -1,0 +1,229 @@
+[
+  {
+    "name": "hyper",
+    "server": [
+      "target/release/examples/ablation",
+      "--stack",
+      "hyper",
+      "--mode",
+      "mem",
+      "--size",
+      "1048576",
+      "--workers",
+      "2",
+      "--domains",
+      "2",
+      "--listen",
+      "127.0.0.1:19123"
+    ],
+    "client": [
+      "target/release/examples/load"
+    ],
+    "ready_address": [
+      "127.0.0.1",
+      19123
+    ],
+    "client_env": {
+      "ADDR": "127.0.0.1:19123",
+      "MODE": "get",
+      "SIZE": "1048576",
+      "COUNT": "8",
+      "CONNS": "16",
+      "SECONDS": "10",
+      "WARMUP": "2",
+      "VERIFY": "1",
+      "PAYLOAD_BYTE": "66"
+    },
+    "ready_text": "BENCH_READY"
+  },
+  {
+    "name": "hyper-multiring",
+    "server": [
+      "target/release/examples/ablation",
+      "--stack",
+      "hyper-multiring",
+      "--mode",
+      "mem",
+      "--size",
+      "1048576",
+      "--workers",
+      "2",
+      "--domains",
+      "2",
+      "--listen",
+      "127.0.0.1:19123"
+    ],
+    "client": [
+      "target/release/examples/load"
+    ],
+    "ready_address": [
+      "127.0.0.1",
+      19123
+    ],
+    "client_env": {
+      "ADDR": "127.0.0.1:19123",
+      "MODE": "get",
+      "SIZE": "1048576",
+      "COUNT": "8",
+      "CONNS": "16",
+      "SECONDS": "10",
+      "WARMUP": "2",
+      "VERIFY": "1",
+      "PAYLOAD_BYTE": "66"
+    },
+    "ready_text": "BENCH_READY"
+  },
+  {
+    "name": "multiring-body-steal-copy",
+    "server": [
+      "target/release/examples/ablation",
+      "--stack",
+      "multiring-body",
+      "--mode",
+      "mem",
+      "--size",
+      "1048576",
+      "--workers",
+      "2",
+      "--domains",
+      "2",
+      "--listen",
+      "127.0.0.1:19123"
+    ],
+    "client": [
+      "target/release/examples/load"
+    ],
+    "ready_address": [
+      "127.0.0.1",
+      19123
+    ],
+    "client_env": {
+      "ADDR": "127.0.0.1:19123",
+      "MODE": "get",
+      "SIZE": "1048576",
+      "COUNT": "8",
+      "CONNS": "16",
+      "SECONDS": "10",
+      "WARMUP": "2",
+      "VERIFY": "1",
+      "PAYLOAD_BYTE": "66"
+    },
+    "ready_text": "BENCH_READY"
+  },
+  {
+    "name": "multiring-body-local-copy",
+    "server": [
+      "target/release/examples/ablation",
+      "--stack",
+      "multiring-body",
+      "--mode",
+      "mem",
+      "--size",
+      "1048576",
+      "--workers",
+      "2",
+      "--domains",
+      "2",
+      "--listen",
+      "127.0.0.1:19123",
+      "--worker-local"
+    ],
+    "client": [
+      "target/release/examples/load"
+    ],
+    "ready_address": [
+      "127.0.0.1",
+      19123
+    ],
+    "client_env": {
+      "ADDR": "127.0.0.1:19123",
+      "MODE": "get",
+      "SIZE": "1048576",
+      "COUNT": "8",
+      "CONNS": "16",
+      "SECONDS": "10",
+      "WARMUP": "2",
+      "VERIFY": "1",
+      "PAYLOAD_BYTE": "66"
+    },
+    "ready_text": "BENCH_READY"
+  },
+  {
+    "name": "multiring-direct-local-copy",
+    "server": [
+      "target/release/examples/ablation",
+      "--stack",
+      "multiring-direct",
+      "--mode",
+      "mem",
+      "--size",
+      "1048576",
+      "--workers",
+      "2",
+      "--domains",
+      "2",
+      "--listen",
+      "127.0.0.1:19123",
+      "--worker-local"
+    ],
+    "client": [
+      "target/release/examples/load"
+    ],
+    "ready_address": [
+      "127.0.0.1",
+      19123
+    ],
+    "client_env": {
+      "ADDR": "127.0.0.1:19123",
+      "MODE": "get",
+      "SIZE": "1048576",
+      "COUNT": "8",
+      "CONNS": "16",
+      "SECONDS": "10",
+      "WARMUP": "2",
+      "VERIFY": "1",
+      "PAYLOAD_BYTE": "66"
+    },
+    "ready_text": "BENCH_READY"
+  },
+  {
+    "name": "multiring-direct-local-zc",
+    "server": [
+      "target/release/examples/ablation",
+      "--stack",
+      "multiring-direct",
+      "--mode",
+      "mem",
+      "--size",
+      "1048576",
+      "--workers",
+      "2",
+      "--domains",
+      "2",
+      "--listen",
+      "127.0.0.1:19123",
+      "--worker-local",
+      "--zero-copy",
+      "always"
+    ],
+    "client": [
+      "target/release/examples/load"
+    ],
+    "ready_address": [
+      "127.0.0.1",
+      19123
+    ],
+    "client_env": {
+      "ADDR": "127.0.0.1:19123",
+      "MODE": "get",
+      "SIZE": "1048576",
+      "COUNT": "8",
+      "CONNS": "16",
+      "SECONDS": "10",
+      "WARMUP": "2",
+      "VERIFY": "1",
+      "PAYLOAD_BYTE": "66"
+    },
+    "ready_text": "BENCH_READY"
+  }
+]
