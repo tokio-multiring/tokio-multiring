@@ -25,18 +25,31 @@ fn sq_thread_cpus() -> Vec<String> {
     cpus
 }
 
-/// Six workers' disk rings are driven by two kernel threads, not six, each
-/// on the CPU its domain names.
+/// Multiple workers in each domain share one pinned kernel submission thread,
+/// on the CPU the domain names. Scales domain/worker count to fit smaller
+/// hosts (e.g. 4-vCPU CI runners) while keeping 2 domains x 3 workers when
+/// at least 8 CPUs are available.
 #[test]
 fn a_domain_shares_one_pinned_kernel_thread() {
     let detected = Plan::detect(Hyperthreads::Use).unwrap();
-    let mut cpus = detected
+    let all_cpus: Vec<u32> = detected
         .domains()
         .iter()
-        .flat_map(|domain| domain.workers.iter().chain(&domain.sq_thread).copied());
-    let domains: Vec<Domain> = (0..2)
+        .flat_map(|domain| domain.workers.iter().chain(&domain.sq_thread).copied())
+        .collect();
+    let (domain_count, workers_per_domain) = if all_cpus.len() >= 8 {
+        (2, 3)
+    } else if all_cpus.len() >= 6 {
+        (2, 2)
+    } else if all_cpus.len() >= 4 {
+        (1, 3)
+    } else {
+        panic!("need at least 4 CPUs, got {}", all_cpus.len());
+    };
+    let mut cpus = all_cpus.into_iter();
+    let domains: Vec<Domain> = (0..domain_count)
         .map(|_| Domain {
-            workers: cpus.by_ref().take(3).collect(),
+            workers: cpus.by_ref().take(workers_per_domain).collect(),
             sq_thread: cpus.next(),
         })
         .collect();

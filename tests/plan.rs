@@ -45,24 +45,41 @@ fn runtime(plan: &Plan) -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// Two domains over the first six CPUs this process may use, with the
-/// workers deliberately out of order.
-fn six_cpu_plan() -> Plan {
+/// Two domains over the first CPUs this process may use, with workers
+/// deliberately out of order and dedicated `sq_thread` CPUs set aside.
+/// Uses 6 CPUs (2 domains of 2 workers + 1 sq_thread) when available,
+/// falling back to 4 CPUs (2 domains of 1 worker + 1 sq_thread) on smaller
+/// hosts such as 4-vCPU CI runners.
+fn multi_domain_plan() -> (Plan, Vec<u32>) {
     let cpus = affinity();
-    Plan::new(vec![
-        domain(&[cpus[2], cpus[0]], Some(cpus[4])),
-        domain(&[cpus[5], cpus[1]], Some(cpus[3])),
-    ])
-    .unwrap()
+    if cpus.len() >= 6 {
+        let plan = Plan::new(vec![
+            domain(&[cpus[2], cpus[0]], Some(cpus[4])),
+            domain(&[cpus[5], cpus[1]], Some(cpus[3])),
+        ])
+        .unwrap();
+        (plan, vec![cpus[0], cpus[1], cpus[2], cpus[5]])
+    } else if cpus.len() >= 4 {
+        let plan = Plan::new(vec![
+            domain(&[cpus[2]], Some(cpus[0])),
+            domain(&[cpus[3]], Some(cpus[1])),
+        ])
+        .unwrap();
+        (plan, vec![cpus[2], cpus[3]])
+    } else {
+        panic!(
+            "need at least 4 CPUs for multi-domain plan tests, got {}",
+            cpus.len()
+        );
+    }
 }
 
 /// Blocking work is started the moment the runtime exists, so its threads
 /// race the workers to start. The workers must still get the seats.
 #[test]
 fn every_worker_gets_a_cpu_of_its_own() {
-    let plan = six_cpu_plan();
-    let cpus = affinity();
-    assert_eq!(plan.worker_count(), 4);
+    let (plan, expected_workers) = multi_domain_plan();
+    assert_eq!(plan.worker_count(), expected_workers.len());
 
     let runtime = runtime(&plan);
     let blocking: Vec<_> = (0..16)
@@ -81,11 +98,11 @@ fn every_worker_gets_a_cpu_of_its_own() {
             assert_eq!(worker.len(), 1, "worker may run on {worker:?}");
             assert!(pinned.insert(worker[0]), "two workers on CPU {}", worker[0]);
         }
-        let planned = BTreeSet::from([cpus[0], cpus[1], cpus[2], cpus[5]]);
+        let planned: BTreeSet<u32> = expected_workers.iter().copied().collect();
         assert_eq!(pinned, planned);
 
         for thread in blocking {
-            assert_eq!(thread.await.unwrap(), 4);
+            assert_eq!(thread.await.unwrap(), expected_workers.len());
         }
     });
 }
@@ -94,8 +111,8 @@ fn every_worker_gets_a_cpu_of_its_own() {
 /// submission threads, and off everything outside the plan.
 #[test]
 fn other_threads_stay_on_the_workers_cpus() {
-    let plan = six_cpu_plan();
-    let cpus = affinity();
+    let (plan, mut planned) = multi_domain_plan();
+    planned.sort_unstable();
     runtime(&plan).block_on(async {
         let blocking: Vec<_> = (0..8)
             .map(|_| tokio::task::spawn_blocking(affinity))
@@ -103,8 +120,6 @@ fn other_threads_stay_on_the_workers_cpus() {
         for thread in blocking {
             let mut allowed = thread.await.unwrap();
             allowed.sort_unstable();
-            let mut planned = vec![cpus[0], cpus[1], cpus[2], cpus[5]];
-            planned.sort_unstable();
             assert_eq!(allowed, planned);
         }
     });
