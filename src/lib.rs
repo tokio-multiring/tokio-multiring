@@ -27,7 +27,7 @@
 //! # }
 //! ```
 //!
-//! Requires the `byo-io-driver` tokio fork and `--cfg tokio_unstable`.
+//! Requires the `io-reactor-wl` tokio fork (`tokio-multiring/tokio`) and `--cfg tokio_unstable`.
 
 mod buffers;
 mod landing;

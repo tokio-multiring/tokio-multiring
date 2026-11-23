@@ -343,7 +343,7 @@ dependencies = [
  "tokio-multiring",
  "tower",
  "tower-service",
- "ureq-proto 0.7.1",
+ "ureq-proto",
 ]
 
 [[package]]
@@ -355,7 +355,7 @@ dependencies = [
  "log",
  "tokio",
  "tokio-multiring",
- "ureq-proto 0.7.1 (git+https://github.com/lthiery/ureq-proto?rev=29bb65256f6a3854d52ca6c00a552b0c1da34be3)",
+ "ureq-proto",
 ]
 
 [[package]]
@@ -415,7 +415,7 @@ dependencies = [
  "tokio",
  "tokio-multiring",
  "tower-service",
- "ureq-proto 0.7.1",
+ "ureq-proto",
 ]
 
 [[package]]
@@ -543,6 +543,7 @@ checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 [[package]]
 name = "tokio"
 version = "1.54.1"
+source = "git+https://github.com/tokio-multiring/tokio?branch=io-reactor-wl#b3b14beaacee77ac03397302d3b798f858f8ab71"
 dependencies = [
  "bytes",
  "io-uring",
@@ -619,17 +620,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 [[package]]
 name = "ureq-proto"
 version = "0.7.1"
-dependencies = [
- "base64",
- "http",
- "httparse",
- "log",
-]
-
-[[package]]
-name = "ureq-proto"
-version = "0.7.1"
-source = "git+https://github.com/lthiery/ureq-proto?rev=29bb65256f6a3854d52ca6c00a552b0c1da34be3#29bb65256f6a3854d52ca6c00a552b0c1da34be3"
+source = "git+https://github.com/lthiery/ureq-proto?branch=axum-proto#5eb5df021823c91ab244b5d9c709db70af518763"
 dependencies = [
  "base64",
  "http",

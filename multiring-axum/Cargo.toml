@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Serve axum Routers over tokio-multiring (io_uring) and ureq-proto"
+repository = "https://github.com/tokio-multiring/tokio-multiring"
 license = "MIT"
 publish = false
 
@@ -14,13 +15,13 @@ http = "1"
 http-body = "1"
 http-body-util = "0.1"
 log = "0.4"
-tokio = { path = "../../tokio-io-reactor-wl/tokio", features = ["rt-multi-thread", "sync", "time", "worker-local"] }
+tokio = { git = "https://github.com/tokio-multiring/tokio", branch = "io-reactor-wl", features = ["rt-multi-thread", "sync", "time", "worker-local"] }
 tokio-multiring = { path = ".." }
 tower-service = "0.3"
-ureq-proto = { path = "../../ureq-proto-combined", default-features = false, features = ["server"] }
+ureq-proto = { git = "https://github.com/lthiery/ureq-proto", branch = "axum-proto", default-features = false, features = ["server"] }
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["json", "query", "matched-path"] }
 futures-util = "0.3"
-tokio = { path = "../../tokio-io-reactor-wl/tokio", features = ["macros", "rt-multi-thread", "sync", "time", "worker-local"] }
+tokio = { git = "https://github.com/tokio-multiring/tokio", branch = "io-reactor-wl", features = ["macros", "rt-multi-thread", "sync", "time", "worker-local"] }
 tower = "0.5"

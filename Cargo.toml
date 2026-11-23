@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Per-worker io_uring reactor driving a multi-threaded tokio runtime"
+repository = "https://github.com/tokio-multiring/tokio-multiring"
 license = "MIT"
 publish = false
 
@@ -15,14 +16,14 @@ socket2 = { version = "0.6", features = ["all"] }
 # The reactor seam (`runtime::reactor`, `Builder::io_reactor`) and worker-local
 # tasks (`run_on_each_worker`, `run_on_any_worker`) are on the `io-reactor-wl`
 # branch of the fork (using stock crates.io `mio`).
-tokio = { path = "../tokio-io-reactor-wl/tokio", features = ["rt-multi-thread", "sync", "worker-local", "io-reactor"] }
+tokio = { git = "https://github.com/tokio-multiring/tokio", branch = "io-reactor-wl", features = ["rt-multi-thread", "sync", "worker-local", "io-reactor"] }
 
 [dev-dependencies]
 libc = "0.2"
-tokio = { path = "../tokio-io-reactor-wl/tokio", features = ["macros", "net", "io-util", "time"] }
+tokio = { git = "https://github.com/tokio-multiring/tokio", branch = "io-reactor-wl", features = ["macros", "net", "io-util", "time"] }
 
 [workspace]
 members = ["s3", "multiring-axum", "s3-axum"]
 
 [patch.crates-io]
-tokio = { path = "../tokio-io-reactor-wl/tokio" }
+tokio = { git = "https://github.com/tokio-multiring/tokio", branch = "io-reactor-wl" }

@@ -26,9 +26,9 @@ Four crates in one workspace:
   `io-uring` `tokio::fs` + `axum::serve`/Hyper). All three share the exact same
   on-disk striped format and interoperate directly.
 
-The repository is local only: no remote, nothing published. Work in small,
-focused commits. The branch `axum-s3` adds `multiring-axum` and `s3-axum` on top
-of `io-driver`; `main` is the state before the reactor-driver move.
+The repository lives at `https://github.com/tokio-multiring/tokio-multiring`
+(`main` branch). Work in small, focused commits. The old pre-reactor-driver
+history is kept locally on `legacy/sidecar-beside` and `io-driver`.
 
 ## Build and test
 
@@ -58,8 +58,8 @@ RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --offline --workspace 
 
 | Crate | Source | Why |
 |---|---|---|
-| tokio | path `../tokio-io-reactor-wl/tokio`, branch `io-reactor-wl` (`io-reactor` merged with `local-worker-v3` `ff2d7368`; `[patch.crates-io]` unifies axum/hyper-util onto it) | the reactor seam (`runtime::reactor::Reactor`, `Builder::io_reactor`) and upgraded worker-local tasks (`spawn_worker_local`, `run_on_each_worker`, `run_on_any_worker`, `worker_local_queue_interval`); uses stock crates.io `mio` |
-| ureq-proto | `../ureq-proto-combined`, branch `axum-proto` (for `multiring-axum`); `s3/` keeps `combined-0.7.1` rev `29bb652` | server state machine with HTTP/1.0 framing, strict transfer-encoding, any-final-status `Send100::reject`, and chunked finish capacity check |
+| tokio | `https://github.com/tokio-multiring/tokio`, branch `io-reactor-wl` (`io-reactor` merged with `local-worker-v3` `ff2d7368`; `[patch.crates-io]` unifies axum/hyper-util onto it) | the reactor seam (`runtime::reactor::Reactor`, `Builder::io_reactor`) and upgraded worker-local tasks (`spawn_worker_local`, `run_on_each_worker`, `run_on_any_worker`, `worker_local_queue_interval`); uses stock crates.io `mio` |
+| ureq-proto | `https://github.com/lthiery/ureq-proto`, branch `axum-proto` (`algesten/ureq-proto` `main` + open PRs #60 and #61) | server state machine with HTTP/1.0 framing, strict transfer-encoding, any-final-status `Send100::reject`, and chunked finish capacity check |
 
 ## Layout
 

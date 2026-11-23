@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "An S3-style object server on tokio-multiring and ureq-proto"
+repository = "https://github.com/tokio-multiring/tokio-multiring"
 license = "MIT"
 publish = false
 
@@ -11,8 +12,8 @@ publish = false
 http = "1"
 libc = "0.2"
 log = "0.4"
-tokio = { path = "../../tokio-io-reactor-wl/tokio", features = ["macros", "rt-multi-thread", "sync", "time", "worker-local"] }
+tokio = { git = "https://github.com/tokio-multiring/tokio", branch = "io-reactor-wl", features = ["macros", "rt-multi-thread", "sync", "time", "worker-local"] }
 tokio-multiring = { path = ".." }
-# The server half of ureq-proto, from the fork branch that carries the
-# HTTP/1.0 response framing and strict transfer-encoding changes.
-ureq-proto = { git = "https://github.com/lthiery/ureq-proto", rev = "29bb65256f6a3854d52ca6c00a552b0c1da34be3", default-features = false, features = ["server"] }
+# The server half of ureq-proto, carrying the two open upstream PRs (#60, #61)
+# on top of algesten/ureq-proto main.
+ureq-proto = { git = "https://github.com/lthiery/ureq-proto", branch = "axum-proto", default-features = false, features = ["server"] }
