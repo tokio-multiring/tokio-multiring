@@ -21,7 +21,7 @@ jobs:
     name: Format, Clippy & Docs
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -44,7 +44,7 @@ jobs:
     name: Test Suite
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -57,8 +57,29 @@ jobs:
           findmnt -T .
           ulimit -a
 
+      - name: Mount polled scratch filesystem (null_blk)
+        run: |
+          if ! sudo modprobe null_blk nr_devices=1 gb=1 bs=4096 queue_mode=2 memory_backed=1 poll_queues=2; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)"
+            sudo modprobe null_blk nr_devices=1 gb=1 bs=4096 queue_mode=2 memory_backed=1 poll_queues=2
+          fi
+          echo "nullb0 io_poll=$(cat /sys/block/nullb0/queue/io_poll)"
+          sudo mkfs.ext4 -q /dev/nullb0
+          mkdir -p target/tmp
+          sudo mount /dev/nullb0 target/tmp
+          sudo chown "$USER:$USER" target/tmp
+
       - name: Run workspace tests
         run: |
           sudo prlimit --pid=$$ --memlock=unlimited
           ulimit -l
           cargo test --workspace --no-fail-fast
+
+      - name: Unmount polled scratch filesystem
+        if: always()
+        run: |
+          if mountpoint -q target/tmp; then
+            sudo umount target/tmp
+          fi
+          sudo modprobe -r null_blk || true
