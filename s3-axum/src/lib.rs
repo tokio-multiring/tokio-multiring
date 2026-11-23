@@ -3,6 +3,7 @@
 
 mod app;
 mod date;
+mod download;
 mod error;
 mod join;
 mod multiring_store;
@@ -11,6 +12,7 @@ mod sigv4;
 mod stripe;
 mod tokio_store;
 mod tokio_uring_store;
+mod upload;
 
 pub use app::{AppOptions, Backend, router, router_with_options};
 pub use multiring_store::MultiRingStore;

@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Query, Request, State};
+use axum::extract::{FromRequest, Query, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
@@ -364,13 +364,28 @@ async fn put_object(
     uri: Uri,
     headers: HeaderMap,
     extensions: http::Extensions,
-    body: DirectBody,
+    request: Request,
 ) -> Result<Response, StoreError> {
     let object = parse_object(&uri)?;
     let mode = extensions
         .get::<PayloadMode>()
         .cloned()
         .unwrap_or_else(|| sigv4::detect_unauthenticated_mode(&headers));
+    // The HTTP transport and storage backend are independent in the ablation.
+    // Baseline stores consume standard frames even when served by multiring.
+    let body = match &backend {
+        Backend::MultiRing(_) => DirectBody::from_request(request, &backend)
+            .await
+            .expect("DirectBody extraction is infallible"),
+        _ => {
+            let body = request.into_body();
+            if http_body::Body::is_end_stream(&body) {
+                DirectBody::Empty
+            } else {
+                DirectBody::Fallback(body)
+            }
+        }
+    };
     let meta = match &backend {
         Backend::MultiRing(s) => s.put_object(&object, body, mode).await?,
         Backend::Tokio(s) => s.put_object(&object, body, mode).await?,

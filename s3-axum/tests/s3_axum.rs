@@ -39,6 +39,14 @@ struct RunningServer {
 
 impl RunningServer {
     fn start_multiring(roots: &[PathBuf], zero_copy: ZeroCopy) -> Self {
+        Self::start_multiring_backend(roots, zero_copy, false)
+    }
+
+    fn start_multiring_with_tokio_store(roots: &[PathBuf]) -> Self {
+        Self::start_multiring_backend(roots, ZeroCopy::Never, true)
+    }
+
+    fn start_multiring_backend(roots: &[PathBuf], zero_copy: ZeroCopy, tokio_store: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let pool = BufferPool::without_huge_pages(64 * 1024, 32).unwrap();
@@ -54,8 +62,14 @@ impl RunningServer {
         let rt = builder.build().unwrap();
         let roots = roots.to_vec();
         rt.block_on(async move {
-            let store = MultiRingStore::open(multiring.clone(), &roots, 16 * 1024, 2).unwrap();
-            let app = router(Backend::MultiRing(store));
+            let backend = if tokio_store {
+                Backend::Tokio(TokioStore::open(&roots, 16 * 1024, 64 * 1024, false, 4).unwrap())
+            } else {
+                Backend::MultiRing(
+                    MultiRingStore::open(multiring.clone(), &roots, 16 * 1024, 2).unwrap(),
+                )
+            };
+            let app = router(backend);
             let server = Server::new(
                 multiring,
                 HttpConfig {
@@ -81,7 +95,7 @@ impl RunningServer {
         let rt = builder.build().unwrap();
         let roots = roots.to_vec();
         rt.block_on(async move {
-            let store = TokioStore::open(&roots, 16 * 1024, 64 * 1024, direct).unwrap();
+            let store = TokioStore::open(&roots, 16 * 1024, 64 * 1024, direct, 4).unwrap();
             let app = router(Backend::Tokio(store));
             let listener = tokio::net::TcpListener::from_std(listener)
                 .unwrap()
@@ -104,7 +118,7 @@ impl RunningServer {
         let rt = builder.build().unwrap();
         let roots = roots.to_vec();
         rt.block_on(async move {
-            let store = TokioUringStore::open(&roots, 16 * 1024, 64 * 1024).unwrap();
+            let store = TokioUringStore::open(&roots, 16 * 1024, 64 * 1024, 4).unwrap();
             let app = router(Backend::TokioUring(store));
             let listener = tokio::net::TcpListener::from_std(listener)
                 .unwrap()
@@ -198,7 +212,7 @@ fn run_suite(server: &RunningServer) {
     assert_eq!(st, 200);
 
     // PUT & GET objects of empty, small, and awkward multi-stripe sizes
-    for (idx, size) in [0usize, 17, 4096, 16_384, 16_385, 210_003]
+    for (idx, size) in [0usize, 17, 4096, 16_384, 16_385, 210_003, 2_100_003]
         .into_iter()
         .enumerate()
     {
@@ -227,6 +241,18 @@ fn run_suite(server: &RunningServer) {
                 .contains(&format!("content-length: {size}"))
         );
     }
+
+    // Span more than four read-ahead rounds, starting and ending inside stripes.
+    let (st, _, body) = send_request(
+        &mut s,
+        "GET /photos/obj-6 HTTP/1.1\r\nhost: test\r\nrange: bytes=15001-1900001\r\n\r\n",
+        b"",
+    );
+    assert_eq!(st, 206);
+    let expected: Vec<u8> = (15001..=1900001usize)
+        .map(|i| ((i * 31 + 6 * 7) & 0xff) as u8)
+        .collect();
+    assert_eq!(body, expected);
 
     // Range GET on the 210_003 byte object
     let big: Vec<u8> = (0..210_003usize)
@@ -341,14 +367,14 @@ fn run_suite(server: &RunningServer) {
     );
     assert_eq!(st, 200);
     let xml = String::from_utf8(body).unwrap();
-    assert!(xml.contains("<KeyCount>3</KeyCount>"), "{xml}");
+    assert!(xml.contains("<KeyCount>4</KeyCount>"), "{xml}");
     assert!(xml.contains("<IsTruncated>false</IsTruncated>"), "{xml}");
     assert!(xml.contains("<Key>obj-3</Key>"), "{xml}");
     assert!(xml.contains("<Key>obj-5</Key>"), "{xml}");
 
     // Delete objects and bucket
     for name in [
-        "obj-0", "obj-1", "obj-2", "obj-3", "obj-4", "obj-5", "chunked",
+        "obj-0", "obj-1", "obj-2", "obj-3", "obj-4", "obj-5", "obj-6", "chunked",
     ] {
         let req = format!("DELETE /photos/{name} HTTP/1.1\r\nhost: test\r\n\r\n");
         let (st, _, _) = send_request(&mut s, &req, b"");
@@ -685,7 +711,7 @@ fn sigv4_and_aws_chunked_on_both_runtimes() {
     let auth_tk = auth.clone();
     let roots_clone = roots_tk.clone();
     rt_tk.block_on(async move {
-        let store = TokioStore::open(&roots_clone, 16 * 1024, 64 * 1024, false).unwrap();
+        let store = TokioStore::open(&roots_clone, 16 * 1024, 64 * 1024, false, 4).unwrap();
         let app = router_with_options(
             Backend::Tokio(store),
             AppOptions {
@@ -705,4 +731,84 @@ fn sigv4_and_aws_chunked_on_both_runtimes() {
     run_sigv4_suite(addr, &auth);
     drop(rt_tk);
     cleanup(&roots_tk);
+}
+
+#[test]
+fn tokio_failed_uploads_drain_and_preserve_existing_object() {
+    for backend in ["buffered", "direct", "uring"] {
+        let roots = scratch_roots("failed-upload", 2);
+        let server = match backend {
+            "buffered" => RunningServer::start_tokio(&roots, false),
+            "direct" => RunningServer::start_tokio(&roots, true),
+            _ => RunningServer::start_tokio_uring(&roots),
+        };
+        let mut conn = server.connect();
+        assert_eq!(
+            send_request(
+                &mut conn,
+                "PUT /photos HTTP/1.1\r\nhost: test\r\ncontent-length: 0\r\n\r\n",
+                b""
+            )
+            .0,
+            200
+        );
+        assert_eq!(
+            send_request(
+                &mut conn,
+                "PUT /photos/key HTTP/1.1\r\nhost: test\r\ncontent-length: 3\r\n\r\n",
+                b"old"
+            )
+            .0,
+            200
+        );
+        // Supply more than the four-round window, then end a declared longer
+        // upload. Its body error must drain queued writes before unlinking.
+        let mut interrupted = server.connect();
+        interrupted
+            .write_all(b"PUT /photos/key HTTP/1.1\r\nhost: test\r\ncontent-length: 2100000\r\n\r\n")
+            .unwrap();
+        interrupted.write_all(&vec![0x5a; 1_100_003]).unwrap();
+        interrupted.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        interrupted.read_to_end(&mut response).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let temporary = roots
+                .iter()
+                .flat_map(|root| std::fs::read_dir(root.join("photos")).unwrap())
+                .any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .as_encoded_bytes()
+                        .starts_with(b".upload-")
+                });
+            if !temporary {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{backend}: abandoned upload files remain"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (status, _, body) = send_request(
+            &mut conn,
+            "GET /photos/key HTTP/1.1\r\nhost: test\r\n\r\n",
+            b"",
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body, b"old");
+        drop(server);
+        cleanup(&roots);
+    }
+}
+
+#[test]
+fn multiring_http_tokio_store_suite() {
+    let roots = scratch_roots("multiring-http-tokio-store", 2);
+    let server = RunningServer::start_multiring_with_tokio_store(&roots);
+    run_suite(&server);
+    drop(server);
+    cleanup(&roots);
 }

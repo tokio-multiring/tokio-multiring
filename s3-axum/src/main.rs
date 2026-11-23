@@ -19,7 +19,7 @@ usage: s3-axum --runtime multiring|tokio|tokio-uring --root DIR [--root DIR ...]
                         tokio-uring (mainline Tokio io-uring fs + axum::serve/Hyper) [multiring]
   --root DIR            directory the buckets live in (repeatable for striping)
   --stripe-unit BYTES   stripe unit size, multiple of 4096      [131072]
-  --window N            read-ahead / write-behind rounds        [4]
+  --window N            GET read-ahead / PUT write-behind rounds [4]
   --listen ADDR         address to listen on                    [127.0.0.1:9000]
   --connections N       concurrent connections (multiring)      [1024]
   --buffers N           registered buffers (multiring)          [256]
@@ -285,8 +285,13 @@ fn run(opts: Options) -> std::io::Result<()> {
             let runtime = plan.build(&mut builder)?;
 
             runtime.block_on(async {
-                let store =
-                    TokioStore::open(&opts.roots, opts.stripe_unit, opts.buffer_size, opts.direct)?;
+                let store = TokioStore::open(
+                    &opts.roots,
+                    opts.stripe_unit,
+                    opts.buffer_size,
+                    opts.direct,
+                    opts.window,
+                )?;
                 let app = router_with_options(Backend::Tokio(store), app_opts);
                 let listener = tokio::net::TcpListener::from_std(listener)?.tap_io(|stream| {
                     let _ = stream.set_nodelay(true);
@@ -310,7 +315,12 @@ fn run(opts: Options) -> std::io::Result<()> {
             let runtime = plan.build(&mut builder)?;
 
             runtime.block_on(async {
-                let store = TokioUringStore::open(&opts.roots, opts.stripe_unit, opts.buffer_size)?;
+                let store = TokioUringStore::open(
+                    &opts.roots,
+                    opts.stripe_unit,
+                    opts.buffer_size,
+                    opts.window,
+                )?;
                 let app = router_with_options(Backend::TokioUring(store), app_opts);
                 let listener = tokio::net::TcpListener::from_std(listener)?.tap_io(|stream| {
                     let _ = stream.set_nodelay(true);

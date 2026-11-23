@@ -11,31 +11,31 @@ use std::io;
 use std::ops::Range;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
-use bytes::{Bytes, BytesMut};
-use futures_core::Stream;
+use bytes::Bytes;
 use http_body_util::BodyExt;
 use multiring_axum::DirectBody;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
-use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::task::spawn_blocking;
 
+use crate::download::{BufferCache, ReadAhead};
 use crate::error::{ApiError, StoreError};
 use crate::join::join_all;
 use crate::name::{Bucket, Object, PART_PREFIX, UPLOAD_PREFIX, decode_key};
 use crate::sigv4::{AwsChunkedDecoder, PayloadMode};
 use crate::stripe::{BLOCK, Geometry, HEADER, Header, ListPage, ListedBucket, ListedObject, Meta};
+use crate::upload::WriteBehind;
 
 const OPEN_ATTEMPTS: usize = 8;
 const COMMIT_LOCKS: usize = 256;
+const INLINE_READ: usize = 16 * 1024;
 
 /// Page-aligned heap buffer so `--direct` works cleanly with `O_DIRECT`.
 struct AlignedBuf {
@@ -69,6 +69,12 @@ impl AlignedBuf {
     }
 }
 
+impl AsRef<[u8]> for AlignedBuf {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
         let layout = Layout::from_size_align(self.len, BLOCK).expect("valid block layout");
@@ -81,6 +87,7 @@ pub struct TokioStore {
     roots: Vec<PathBuf>,
     geometry: Geometry,
     direct: bool,
+    window: usize,
     run: u64,
     next_upload: AtomicU64,
     commits: Box<[Mutex<()>]>,
@@ -88,6 +95,7 @@ pub struct TokioStore {
 
 pub(crate) struct TokioStored {
     files: Vec<Arc<File>>,
+    inline: Option<Bytes>,
     pub(crate) meta: Meta,
 }
 
@@ -137,8 +145,12 @@ impl TokioStore {
         unit: usize,
         chunk: usize,
         direct: bool,
+        window: usize,
     ) -> io::Result<Arc<Self>> {
         let invalid = |msg| io::Error::new(io::ErrorKind::InvalidInput, msg);
+        if window == 0 {
+            return Err(invalid("window must be at least 1"));
+        }
         let geometry = Geometry::new(roots.len(), unit, chunk).ok_or_else(|| {
             invalid("invalid geometry: need roots, 4096-aligned unit, and chunk multiple of unit")
         })?;
@@ -166,6 +178,7 @@ impl TokioStore {
             roots: roots.to_vec(),
             geometry,
             direct,
+            window,
             run: random()?,
             next_upload: AtomicU64::new(0),
             commits: (0..COMMIT_LOCKS).map(|_| Mutex::new(())).collect(),
@@ -447,7 +460,19 @@ impl TokioStore {
                     }
                     Err(e) => return Err(e.into()),
                 };
-                let header = Self::read_header_sync(&file, &geometry)?;
+                let mut buf = AlignedBuf::new(INLINE_READ);
+                let n = file.read_at(buf.as_mut_slice(), 0)?;
+                let header = Header::decode(&buf.as_slice()[..n], &geometry).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid object header")
+                })?;
+                let inline = if geometry.parts(header.size) == 1
+                    && header.size > 0
+                    && header.size <= (n.saturating_sub(HEADER)) as u64
+                {
+                    Some(Bytes::from_owner(buf).slice(HEADER..HEADER + header.size as usize))
+                } else {
+                    None
+                };
                 let mut files = vec![file];
                 for part in 1..geometry.parts(header.size) {
                     let path = roots[(first + part) % roots.len()]
@@ -464,6 +489,7 @@ impl TokioStore {
                 }
                 return Ok(TokioStored {
                     files,
+                    inline,
                     meta: Meta {
                         size: header.size,
                         modified: header.modified,
@@ -567,25 +593,27 @@ impl TokioStore {
         .await;
     }
 
-    async fn write_round(
+    async fn start_round(
         &self,
         upload: &mut Upload,
         filled: usize,
         bufs: Vec<AlignedBuf>,
-    ) -> io::Result<()> {
+    ) -> io::Result<tokio::task::JoinHandle<io::Result<Vec<AlignedBuf>>>> {
         assert!(!upload.ended, "a short round ends the upload");
         let round = upload.size / self.geometry.round_len() as u64;
         let chunk = self.geometry.chunk() as u64;
         let direct = self.direct;
 
+        for part in 0..self.geometry.parts(filled as u64) {
+            if upload.parts[part].is_none() {
+                upload.parts[part] = Some(self.stage(upload, part).await?);
+            }
+        }
         let mut tasks = Vec::new();
         for (part, mut buf) in bufs.into_iter().enumerate() {
             let len = self.geometry.part_len(filled as u64, part) as usize;
             if len == 0 {
                 break;
-            }
-            if upload.parts[part].is_none() {
-                upload.parts[part] = Some(self.stage(upload, part).await?);
             }
             let staged = upload.parts[part].as_mut().expect("staged above");
             let write_len = if direct {
@@ -599,16 +627,20 @@ impl TokioStore {
             let file = staged.file.clone();
             let offset = round * chunk + if part == 0 { HEADER as u64 } else { 0 };
             tasks.push(spawn_blocking(move || {
-                file.write_all_at(&buf.as_slice()[..write_len], offset)
+                file.write_all_at(&buf.as_slice()[..write_len], offset)?;
+                Ok::<_, io::Error>(buf)
             }));
         }
         upload.size += filled as u64;
         upload.ended = filled < self.geometry.round_len();
 
-        for res in join_all(tasks).await {
-            join_io(res)?;
-        }
-        Ok(())
+        Ok(tokio::spawn(async move {
+            join_all(tasks)
+                .await
+                .into_iter()
+                .map(join_io)
+                .collect::<io::Result<_>>()
+        }))
     }
 
     pub(crate) async fn put_object(
@@ -626,6 +658,22 @@ impl TokioStore {
             size: 0,
             ended: false,
         };
+        let small_len = match &body {
+            DirectBody::Empty => Some(0),
+            DirectBody::Fallback(body) => http_body::Body::size_hint(body).exact(),
+            DirectBody::Direct(_) => None,
+        };
+        if let Some(len) = small_len
+            && len <= self.geometry.unit() as u64
+            && !matches!(mode, PayloadMode::AwsChunked(_))
+        {
+            let body = match body {
+                DirectBody::Empty => Body::empty(),
+                DirectBody::Fallback(body) => body,
+                DirectBody::Direct(_) => unreachable!("only ordinary bodies have a size hint"),
+            };
+            return self.put_small(upload, body, len as usize, mode).await;
+        }
         upload.parts[0] = match self.stage(&upload, 0).await {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(ApiError::NO_SUCH_BUCKET.into());
@@ -633,134 +681,128 @@ impl TokioStore {
             other => Some(other?),
         };
 
-        let geometry = self.geometry;
-        let round_len = geometry.round_len();
+        let mut writes = WriteBehind::new(self.window);
+        let received: Result<(), StoreError> = async {
+            let geometry = self.geometry;
+            let round_len = geometry.round_len();
 
-        let expected_sha256 = match &mode {
-            PayloadMode::ExpectedSha256(d) => Some(*d),
-            _ => None,
-        };
-        let mut hasher = expected_sha256.map(|_| Sha256::new());
-        let mut decoder = match mode {
-            PayloadMode::AwsChunked(spec) => Some(AwsChunkedDecoder::new(spec)),
-            _ => None,
-        };
+            let expected_sha256 = match &mode {
+                PayloadMode::ExpectedSha256(d) => Some(*d),
+                _ => None,
+            };
+            let mut hasher = expected_sha256.map(|_| Sha256::new());
+            let mut decoder = match mode {
+                PayloadMode::AwsChunked(spec) => Some(AwsChunkedDecoder::new(spec)),
+                _ => None,
+            };
 
-        match body {
-            DirectBody::Empty => {
-                if decoder.is_some() {
-                    self.abort(upload).await;
-                    return Err(ApiError::BAD_REQUEST.into());
+            match body {
+                DirectBody::Empty => {
+                    if decoder.is_some() {
+                        return Err(ApiError::BAD_REQUEST.into());
+                    }
                 }
-            }
-            DirectBody::Fallback(mut body) => {
-                let mut bufs: Vec<AlignedBuf> = (0..geometry.drives())
-                    .map(|_| AlignedBuf::new(geometry.chunk()))
-                    .collect();
-                let mut filled = 0usize;
-                while let Some(frame) = body.frame().await {
-                    let frame = match frame {
-                        Ok(f) => f,
-                        Err(e) => {
-                            self.abort(upload).await;
-                            return Err(StoreError::Io(io::Error::other(e)));
-                        }
-                    };
-                    let Ok(data) = frame.into_data() else {
-                        continue;
-                    };
-                    let mut slice = data.as_ref();
-                    if let Some(ref mut dec) = decoder {
-                        while !slice.is_empty() && !dec.is_done() {
-                            let room = geometry.fill(filled..round_len);
-                            let next = room.first().expect("round is not full");
-                            let output =
-                                &mut bufs[next.buf].as_mut_slice()[next.start..][..next.len];
-                            let (used, produced) = match dec.decode(slice, output) {
-                                Ok(pair) => pair,
-                                Err(err) => {
-                                    self.abort(upload).await;
-                                    return Err(err.into());
-                                }
-                            };
-                            slice = &slice[used..];
-                            filled += produced;
-                            if filled == round_len {
-                                let to_write = std::mem::replace(
-                                    &mut bufs,
-                                    (0..geometry.drives())
-                                        .map(|_| AlignedBuf::new(geometry.chunk()))
-                                        .collect(),
-                                );
-                                if let Err(e) =
-                                    self.write_round(&mut upload, filled, to_write).await
-                                {
-                                    self.abort(upload).await;
-                                    return Err(e.into());
-                                }
-                                filled = 0;
+                DirectBody::Fallback(mut body) => {
+                    let mut bufs: Vec<AlignedBuf> = (0..geometry.drives())
+                        .map(|_| AlignedBuf::new(geometry.chunk()))
+                        .collect();
+                    let mut filled = 0usize;
+                    while let Some(frame) = body.frame().await {
+                        let frame = match frame {
+                            Ok(f) => f,
+                            Err(e) => {
+                                return Err(StoreError::Io(io::Error::other(e)));
                             }
-                        }
-                    } else {
-                        if let Some(ref mut h) = hasher {
-                            h.update(slice);
-                        }
-                        while !slice.is_empty() {
-                            let take = slice.len().min(round_len - filled);
-                            let segments = geometry.fill(filled..filled + take);
-                            let mut offset = 0;
-                            for seg in segments {
-                                bufs[seg.buf].as_mut_slice()[seg.start..][..seg.len]
-                                    .copy_from_slice(&slice[offset..offset + seg.len]);
-                                offset += seg.len;
-                            }
-                            filled += take;
-                            slice = &slice[take..];
-                            if filled == round_len {
-                                let to_write = std::mem::replace(
-                                    &mut bufs,
-                                    (0..geometry.drives())
-                                        .map(|_| AlignedBuf::new(geometry.chunk()))
-                                        .collect(),
-                                );
-                                if let Err(e) =
-                                    self.write_round(&mut upload, filled, to_write).await
-                                {
-                                    self.abort(upload).await;
-                                    return Err(e.into());
+                        };
+                        let Ok(data) = frame.into_data() else {
+                            continue;
+                        };
+                        let mut slice = data.as_ref();
+                        if let Some(ref mut dec) = decoder {
+                            while !slice.is_empty() && !dec.is_done() {
+                                let room = geometry.fill(filled..round_len);
+                                let next = room.first().expect("round is not full");
+                                let output =
+                                    &mut bufs[next.buf].as_mut_slice()[next.start..][..next.len];
+                                let (used, produced) = match dec.decode(slice, output) {
+                                    Ok(pair) => pair,
+                                    Err(err) => {
+                                        return Err(err.into());
+                                    }
+                                };
+                                slice = &slice[used..];
+                                filled += produced;
+                                if filled == round_len {
+                                    writes.push(self.start_round(&mut upload, filled, bufs).await?);
+                                    bufs = writes
+                                        .next(|| {
+                                            (0..geometry.drives())
+                                                .map(|_| AlignedBuf::new(geometry.chunk()))
+                                                .collect()
+                                        })
+                                        .await?;
+                                    filled = 0;
                                 }
-                                filled = 0;
+                            }
+                        } else {
+                            if let Some(ref mut h) = hasher {
+                                h.update(slice);
+                            }
+                            while !slice.is_empty() {
+                                let take = slice.len().min(round_len - filled);
+                                let segments = geometry.fill(filled..filled + take);
+                                let mut offset = 0;
+                                for seg in segments {
+                                    bufs[seg.buf].as_mut_slice()[seg.start..][..seg.len]
+                                        .copy_from_slice(&slice[offset..offset + seg.len]);
+                                    offset += seg.len;
+                                }
+                                filled += take;
+                                slice = &slice[take..];
+                                if filled == round_len {
+                                    writes.push(self.start_round(&mut upload, filled, bufs).await?);
+                                    bufs = writes
+                                        .next(|| {
+                                            (0..geometry.drives())
+                                                .map(|_| AlignedBuf::new(geometry.chunk()))
+                                                .collect()
+                                        })
+                                        .await?;
+                                    filled = 0;
+                                }
                             }
                         }
                     }
+                    if filled > 0 {
+                        writes.push(self.start_round(&mut upload, filled, bufs).await?);
+                    }
                 }
-                if filled > 0
-                    && let Err(e) = self.write_round(&mut upload, filled, bufs).await
-                {
-                    self.abort(upload).await;
-                    return Err(e.into());
+                DirectBody::Direct(_) => {
+                    return Err(StoreError::Io(io::Error::other(
+                        "TokioStore received DirectBody::Direct unexpectedly",
+                    )));
                 }
             }
-            DirectBody::Direct(_) => {
-                self.abort(upload).await;
-                return Err(StoreError::Io(io::Error::other(
-                    "TokioStore received DirectBody::Direct unexpectedly",
-                )));
-            }
-        }
 
-        if let Some(dec) = decoder
-            && let Err(err) = dec.finish()
-        {
-            self.abort(upload).await;
-            return Err(err.into());
-        }
-        if let (Some(expected), Some(h)) = (expected_sha256, hasher) {
-            let actual: [u8; 32] = h.finalize().into();
-            if actual.ct_eq(&expected).unwrap_u8() != 1 {
-                self.abort(upload).await;
-                return Err(ApiError::PAYLOAD_MISMATCH.into());
+            if let Some(dec) = decoder
+                && let Err(err) = dec.finish()
+            {
+                return Err(err.into());
             }
+            if let (Some(expected), Some(h)) = (expected_sha256, hasher) {
+                let actual: [u8; 32] = h.finalize().into();
+                if actual.ct_eq(&expected).unwrap_u8() != 1 {
+                    return Err(ApiError::PAYLOAD_MISMATCH.into());
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+        let drained = writes.finish().await;
+        if let Err(error) = received.and(drained.map_err(StoreError::from)) {
+            self.abort(upload).await;
+            return Err(error);
         }
 
         match self.publish(&upload).await {
@@ -770,6 +812,78 @@ impl TokioStore {
                 Err(e.into())
             }
         }
+    }
+
+    /// Receives a known small payload alongside its final header, then writes
+    /// both in one operation. O_DIRECT padding is truncated before syncing.
+    async fn put_small(
+        &self,
+        mut upload: Upload,
+        mut body: Body,
+        len: usize,
+        mode: PayloadMode,
+    ) -> Result<Meta, StoreError> {
+        let total = HEADER + len;
+        let mut buf = AlignedBuf::new(total.next_multiple_of(BLOCK));
+        let mut filled = 0;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| StoreError::Io(io::Error::other(e)))?;
+            if let Ok(bytes) = frame.into_data() {
+                if bytes.len() > len - filled {
+                    return Err(ApiError::BAD_REQUEST.into());
+                }
+                buf.as_mut_slice()[HEADER + filled..HEADER + filled + bytes.len()]
+                    .copy_from_slice(&bytes);
+                filled += bytes.len();
+            }
+        }
+        if filled != len {
+            return Err(ApiError::BAD_REQUEST.into());
+        }
+        if let PayloadMode::ExpectedSha256(expected) = mode {
+            let actual: [u8; 32] = Sha256::digest(&buf.as_slice()[HEADER..total]).into();
+            if actual.ct_eq(&expected).unwrap_u8() != 1 {
+                return Err(ApiError::PAYLOAD_MISMATCH.into());
+            }
+        }
+        let header = Header {
+            size: len as u64,
+            modified: now(),
+            id: upload.id,
+        };
+        buf.as_mut_slice()[..HEADER].copy_from_slice(&header.encode(&self.geometry));
+        upload.size = len as u64;
+        upload.parts[0] = match self.stage(&upload, 0).await {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(ApiError::NO_SUCH_BUCKET.into());
+            }
+            other => Some(other?),
+        };
+        let file = upload.parts[0].as_ref().expect("staged above").file.clone();
+        let direct = self.direct;
+        let written = join_io(
+            spawn_blocking(move || {
+                let write_len = if direct { buf.len } else { total };
+                file.write_all_at(&buf.as_slice()[..write_len], 0)?;
+                if write_len != total {
+                    file.set_len(total as u64)?;
+                }
+                file.sync_data()
+            })
+            .await,
+        );
+        if let Err(error) = written {
+            self.abort(upload).await;
+            return Err(error.into());
+        }
+        if let Err(error) = self.commit(&upload).await {
+            self.abort(upload).await;
+            return Err(error.into());
+        }
+        Ok(Meta {
+            size: header.size,
+            modified: header.modified,
+        })
     }
 
     async fn publish(&self, upload: &Upload) -> io::Result<Meta> {
@@ -821,6 +935,17 @@ impl TokioStore {
             join_io(res)?;
         }
 
+        self.commit(upload).await?;
+
+        Ok(Meta {
+            size: header.size,
+            modified: header.modified,
+        })
+    }
+
+    /// Commits a fully written and synced upload under the per-key lock.
+    async fn commit(&self, upload: &Upload) -> io::Result<()> {
+        let geometry = self.geometry;
         let _commit = self.commits[Self::lock_of(&upload.object)].lock().await;
         let first_staged = upload.parts[0].as_ref().expect("first part exists");
         let old_first = first_staged.path.clone();
@@ -857,99 +982,81 @@ impl TokioStore {
             .await,
         )?;
 
-        Ok(Meta {
-            size: header.size,
-            modified: header.modified,
-        })
+        Ok(())
     }
 
     pub(crate) fn stream_body(&self, stored: TokioStored, range: Range<u64>) -> Body {
-        let rounds = self.geometry.rounds(&range);
-        if rounds.is_empty() {
+        if range.is_empty() {
             return Body::empty();
         }
-        Body::from_stream(TokioObjectStream {
-            geometry: self.geometry,
-            files: Arc::new(stored.files),
-            range,
-            rounds,
-            in_flight: None,
-        })
-    }
-}
-
-struct TokioObjectStream {
-    geometry: Geometry,
-    files: Arc<Vec<Arc<File>>>,
-    range: Range<u64>,
-    rounds: Range<u64>,
-    in_flight: Option<JoinHandle<io::Result<Bytes>>>,
-}
-
-impl Stream for TokioObjectStream {
-    type Item = io::Result<Bytes>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = &mut *self;
-        if this.in_flight.is_none() {
-            let Some(round) = this.rounds.next() else {
-                return Poll::Ready(None);
-            };
-            let plan = this.geometry.plan(round, &this.range);
-            let files = this.files.clone();
-            this.in_flight = Some(tokio::spawn(async move {
-                let mut tasks = Vec::with_capacity(plan.reads.len());
-                for (part, read) in plan.reads.iter().copied().enumerate() {
-                    let Some(read) = read else {
-                        tasks.push(None);
-                        continue;
-                    };
-                    let file = files[part].clone();
-                    let offset = read.offset + if part == 0 { HEADER as u64 } else { 0 };
-                    tasks.push(Some(spawn_blocking(move || -> io::Result<AlignedBuf> {
-                        let mut buf = AlignedBuf::new(read.limit);
-                        let mut done = 0;
-                        while done < read.needed {
-                            let n = file
-                                .read_at(&mut buf.as_mut_slice()[done..], offset + done as u64)?;
-                            if n == 0 {
-                                return Err(io::ErrorKind::UnexpectedEof.into());
+        if let Some(inline) = stored.inline {
+            return Body::from(inline.slice(range.start as usize..range.end as usize));
+        }
+        let geometry = self.geometry;
+        let files = Arc::new(stored.files);
+        let cache = BufferCache::new(self.window.saturating_mul(files.len()));
+        Body::from_stream(ReadAhead::new(
+            geometry.rounds(&range),
+            self.window,
+            move |round| {
+                let plan = geometry.plan(round, &range);
+                let files = files.clone();
+                let cache = cache.clone();
+                tokio::spawn(async move {
+                    let tasks = plan
+                        .reads
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .map(|(part, read)| {
+                            let file = files.get(part).cloned();
+                            let cache = cache.clone();
+                            async move {
+                                let Some(read) = read else { return Ok(None) };
+                                let file = file.expect("read part has a file");
+                                let offset =
+                                    read.offset + if part == 0 { HEADER as u64 } else { 0 };
+                                let buf = join_io(
+                                    spawn_blocking(move || -> io::Result<_> {
+                                        let mut buf = cache.take(|| AlignedBuf::new(read.limit));
+                                        if buf.len < read.limit {
+                                            *buf = AlignedBuf::new(read.limit);
+                                        }
+                                        let mut done = 0;
+                                        while done < read.needed {
+                                            let n = file.read_at(
+                                                &mut buf.as_mut_slice()[done..read.limit],
+                                                offset + done as u64,
+                                            )?;
+                                            if n == 0 {
+                                                return Err(io::ErrorKind::UnexpectedEof.into());
+                                            }
+                                            done += n;
+                                        }
+                                        Ok(buf)
+                                    })
+                                    .await,
+                                )?;
+                                Ok::<_, io::Error>(Some(Bytes::from_owner(buf)))
                             }
-                            done += n;
-                        }
-                        Ok(buf)
-                    })));
-                }
-
-                let mut part_bufs: Vec<Option<AlignedBuf>> = Vec::with_capacity(tasks.len());
-                for task in tasks {
-                    match task {
-                        Some(handle) => part_bufs.push(Some(join_io(handle.await)?)),
-                        None => part_bufs.push(None),
-                    }
-                }
-
-                let mut out = BytesMut::with_capacity(plan.len);
-                for seg in &plan.segments {
-                    let buf = part_bufs[seg.buf]
-                        .as_ref()
-                        .expect("segment refers to read part");
-                    out.extend_from_slice(&buf.as_slice()[seg.start..seg.start + seg.len]);
-                }
-                Ok(out.freeze())
-            }));
-        }
-
-        let handle = this.in_flight.as_mut().expect("spawned above");
-        match Pin::new(handle).poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(res) => {
-                this.in_flight = None;
-                match res {
-                    Ok(item) => Poll::Ready(Some(item)),
-                    Err(e) => Poll::Ready(Some(Err(io::Error::other(e)))),
-                }
-            }
-        }
+                        })
+                        .collect();
+                    let parts = join_all(tasks)
+                        .await
+                        .into_iter()
+                        .collect::<io::Result<Vec<_>>>()?;
+                    Ok(plan
+                        .segments
+                        .iter()
+                        .map(|seg| {
+                            parts[seg.buf]
+                                .as_ref()
+                                .expect("segment has read data")
+                                .slice(seg.start..seg.start + seg.len)
+                        })
+                        .collect())
+                })
+            },
+        ))
     }
 }

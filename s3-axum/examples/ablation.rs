@@ -405,7 +405,7 @@ fn main() -> io::Result<()> {
                         use_direct: false,
                     })
                 } else {
-                    let store = TokioStore::open(&roots, 128 * 1024, 1 << 20, direct_disk)?;
+                    let store = TokioStore::open(&roots, 128 * 1024, 1 << 20, direct_disk, 4)?;
                     s3_router(Backend::Tokio(store))
                 };
                 let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -441,7 +441,7 @@ fn main() -> io::Result<()> {
                     })
                 } else if stack == "multiring-body" {
                     // `multiring-axum` (ureq-proto + io_uring sockets) driving `TokioStore`!
-                    let store = TokioStore::open(&roots, 128 * 1024, 1 << 20, direct_disk)?;
+                    let store = TokioStore::open(&roots, 128 * 1024, 1 << 20, direct_disk, 4)?;
                     s3_router(Backend::Tokio(store))
                 } else {
                     let store = MultiRingStore::open(multiring.clone(), &roots, 128 * 1024, 4)?;
