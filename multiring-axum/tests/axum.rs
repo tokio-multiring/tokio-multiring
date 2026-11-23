@@ -26,6 +26,15 @@ struct Harness {
 
 impl Harness {
     fn start(router: Router, zero_copy: ZeroCopy, pool: Option<BufferPool>) -> Self {
+        Self::start_with_connections(router, zero_copy, pool, 32)
+    }
+
+    fn start_with_connections(
+        router: Router,
+        zero_copy: ZeroCopy,
+        pool: Option<BufferPool>,
+        connections: usize,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let mut builder = Builder::new_multi_thread();
@@ -42,7 +51,7 @@ impl Harness {
             let server = Server::new(
                 multiring,
                 Config {
-                    connections: 32,
+                    connections,
                     head_buffer: 4096,
                     zero_copy,
                     worker_local_connections: true,
@@ -593,4 +602,688 @@ fn large_standard_body_direct_and_zc_paths() {
         assert_eq!(status, 200);
         assert_eq!(body, b"ok");
     }
+}
+
+async fn echo_direct_body(body: DirectBody) -> String {
+    let bytes = match body {
+        DirectBody::Direct(mut direct) => {
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 64];
+            loop {
+                let count = direct.read_into(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            bytes
+        }
+        DirectBody::Fallback(body) => axum::body::to_bytes(body, 1024).await.unwrap().to_vec(),
+        DirectBody::Empty => Vec::new(),
+    };
+    String::from_utf8(bytes).unwrap()
+}
+
+#[test]
+fn direct_extractor_respects_replaced_request_body() {
+    async fn replace(req: axum::extract::Request, next: Next) -> axum::response::Response {
+        let (parts, _) = req.into_parts();
+        next.run(axum::extract::Request::from_parts(
+            parts,
+            Body::from("replacement"),
+        ))
+        .await
+    }
+    let router = Router::new()
+        .route("/", post(echo_direct_body))
+        .layer(middleware::from_fn(replace));
+    let harness = Harness::start(router, ZeroCopy::Never, None);
+    let mut stream = harness.connect();
+    stream
+        .write_all(b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 8\r\n\r\noriginal")
+        .unwrap();
+    let (status, _, body) = read_response(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"replacement");
+}
+
+#[test]
+fn direct_extractor_respects_wrapped_request_body() {
+    async fn uppercase(req: axum::extract::Request, next: Next) -> axum::response::Response {
+        use http_body_util::BodyExt;
+        let (parts, body) = req.into_parts();
+        let body =
+            body.map_frame(|frame| frame.map_data(|bytes| Bytes::from(bytes.to_ascii_uppercase())));
+        next.run(axum::extract::Request::from_parts(parts, Body::new(body)))
+            .await
+    }
+    let router = Router::new()
+        .route("/", post(echo_direct_body))
+        .layer(middleware::from_fn(uppercase));
+    let harness = Harness::start(router, ZeroCopy::Never, None);
+    let mut stream = harness.connect();
+    stream
+        .write_all(b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 8\r\n\r\noriginal")
+        .unwrap();
+    let (status, _, body) = read_response(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"ORIGINAL");
+}
+
+#[test]
+fn streaming_request_body_can_be_returned_as_response() {
+    let router = Router::new()
+        .route("/", post(|body: Body| async move { body }))
+        .route("/next", get(|| async { "next" }));
+    let harness = Harness::start(router, ZeroCopy::Never, None);
+    let mut stream = harness.connect();
+    stream
+        .write_all(b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 8\r\n\r\noriginal")
+        .unwrap();
+    let (status, _, body) = read_response(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"original");
+    stream
+        .write_all(b"GET /next HTTP/1.1\r\nhost: test\r\n\r\n")
+        .unwrap();
+    let (status, _, body) = read_response(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"next");
+}
+
+struct TextWriter(&'static [u8]);
+
+impl DirectWrite for TextWriter {
+    fn write_to<'a>(
+        self: Box<Self>,
+        sink: &'a mut BodySink<'a>,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
+        Box::pin(async move { sink.write_bytes(self.0).await })
+    }
+}
+
+fn text_response() -> axum::response::Response {
+    DirectResponse::new(
+        Response::builder()
+            .header(header::CONTENT_LENGTH, 8)
+            .body(())
+            .unwrap(),
+        TextWriter(b"original"),
+    )
+    .into_response()
+}
+
+#[test]
+fn direct_response_respects_body_replacement() {
+    async fn replace(req: axum::extract::Request, next: Next) -> axum::response::Response {
+        let mut response = next.run(req).await;
+        *response.body_mut() = Body::empty();
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+        response
+    }
+    let router = Router::new()
+        .route("/", get(|| async { text_response() }))
+        .layer(middleware::from_fn(replace));
+    let harness = Harness::start(router, ZeroCopy::Never, None);
+    let mut stream = harness.connect();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n")
+        .unwrap();
+    let (status, _, body) = read_response(&mut stream);
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+}
+
+#[test]
+fn direct_response_respects_body_wrapper() {
+    async fn uppercase(req: axum::extract::Request, next: Next) -> axum::response::Response {
+        use http_body_util::BodyExt;
+        next.run(req).await.map(|body| {
+            Body::new(
+                body.map_frame(|frame| {
+                    frame.map_data(|bytes| Bytes::from(bytes.to_ascii_uppercase()))
+                }),
+            )
+        })
+    }
+    let router = Router::new()
+        .route("/", get(|| async { text_response() }))
+        .layer(middleware::from_fn(uppercase));
+    let harness = Harness::start(router, ZeroCopy::Never, None);
+    let mut stream = harness.connect();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n")
+        .unwrap();
+    let (status, _, body) = read_response(&mut stream);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"ORIGINAL");
+}
+
+fn read_head(stream: &mut TcpStream) -> String {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        assert_eq!(read_some(stream, &mut byte), 1);
+        head.push(byte[0]);
+    }
+    String::from_utf8(head).unwrap()
+}
+
+#[test]
+fn streaming_prefix_and_expect_continue_precede_upload() {
+    use futures_util::StreamExt;
+    let router = Router::new()
+        .route(
+            "/",
+            post(|body: Body| async move {
+                let prefix =
+                    stream::once(async { Ok::<_, axum::Error>(Bytes::from_static(b"prefix:")) });
+                Body::from_stream(prefix.chain(body.into_data_stream()))
+            }),
+        )
+        .route("/next", get(|| async { "next" }));
+    let harness = Harness::start(router, ZeroCopy::Never, None);
+    let mut stream = harness.connect();
+    stream
+        .write_all(
+            b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 8\r\nexpect: 100-continue\r\n\r\n",
+        )
+        .unwrap();
+    assert!(read_head(&mut stream).starts_with("HTTP/1.1 100 "));
+    assert!(read_head(&mut stream).starts_with("HTTP/1.1 200 "));
+    let mut prefix = [0; 12];
+    stream.read_exact(&mut prefix).unwrap();
+    assert_eq!(&prefix, b"7\r\nprefix:\r\n");
+    // The response has already streamed data before the request body arrives.
+    stream.write_all(b"original").unwrap();
+    let mut rest = Vec::new();
+    while !rest.ends_with(b"0\r\n\r\n") {
+        let mut byte = [0];
+        assert_eq!(read_some(&mut stream, &mut byte), 1);
+        rest.push(byte[0]);
+    }
+    assert_eq!(rest, b"8\r\noriginal\r\n0\r\n\r\n");
+    stream
+        .write_all(b"GET /next HTTP/1.1\r\nhost: test\r\n\r\n")
+        .unwrap();
+    assert_eq!(read_response(&mut stream).2, b"next");
+}
+
+#[test]
+fn ignored_request_body_does_not_delay_final_response() {
+    let router = Router::new()
+        .route("/", post(|| async { StatusCode::PAYLOAD_TOO_LARGE }))
+        .route("/next", get(|| async { "next" }));
+    let harness = Harness::start(router, ZeroCopy::Never, None);
+    let mut stream = harness.connect();
+    stream
+        .write_all(b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 8\r\n\r\n")
+        .unwrap();
+    assert_eq!(read_response(&mut stream).0, 413);
+    // The ignored input is drained only after the final response is available.
+    stream
+        .write_all(b"originalGET /next HTTP/1.1\r\nhost: test\r\n\r\n")
+        .unwrap();
+    assert_eq!(read_response(&mut stream).2, b"next");
+}
+
+#[test]
+fn direct_extraction_follows_body_when_middleware_swaps_requests() {
+    type Waiting = (Body, tokio::sync::oneshot::Sender<Body>);
+    let waiting = Arc::new(tokio::sync::Mutex::new(None::<Waiting>));
+    let router = Router::new()
+        .route("/", post(echo_direct_body))
+        .layer(middleware::from_fn({
+            let waiting = waiting.clone();
+            move |req: axum::extract::Request, next: Next| {
+                let waiting = waiting.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let mut guard = waiting.lock().await;
+                    let body = if let Some((other, sender)) = guard.take() {
+                        sender
+                            .send(body)
+                            .unwrap_or_else(|_| panic!("other request went away"));
+                        drop(guard);
+                        other
+                    } else {
+                        let (sender, receiver) = tokio::sync::oneshot::channel();
+                        *guard = Some((body, sender));
+                        drop(guard);
+                        receiver.await.unwrap()
+                    };
+                    next.run(axum::extract::Request::from_parts(parts, body))
+                        .await
+                }
+            }
+        }));
+    let harness = Harness::start(router, ZeroCopy::Never, None);
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            let mut s = harness.connect();
+            s.write_all(b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 5\r\n\r\nfirst")
+                .unwrap();
+            assert_eq!(read_response(&mut s).2, b"second");
+        });
+        let second = scope.spawn(|| {
+            let mut s = harness.connect();
+            s.write_all(b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 6\r\n\r\nsecond")
+                .unwrap();
+            assert_eq!(read_response(&mut s).2, b"first");
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+    });
+}
+
+#[test]
+fn direct_response_works_as_a_standard_body_without_a_runtime() {
+    let mut body = std::pin::pin!(axum::body::to_bytes(text_response().into_body(), 1024));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let std::task::Poll::Ready(bytes) = body.as_mut().poll(&mut cx) else {
+        panic!("an immediately ready producer should finish without a runtime");
+    };
+    assert_eq!(bytes.unwrap(), "original");
+}
+
+#[tokio::test]
+async fn direct_response_fallback_is_bounded_and_cancelled_on_drop() {
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct Writer {
+        sent: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+    impl DirectWrite for Writer {
+        fn write_to<'a>(
+            self: Box<Self>,
+            sink: &'a mut BodySink<'a>,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                assert!(!sink.zero_copy());
+                for _ in 0..1024 {
+                    sink.write_bytes(&[7; 16 * 1024]).await?;
+                    self.sent.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            })
+        }
+    }
+    let sent = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut body = DirectResponse::new(
+        Response::new(()),
+        Writer {
+            sent: sent.clone(),
+            dropped: dropped.clone(),
+        },
+    )
+    .into_response()
+    .into_body();
+    assert_eq!(
+        body.frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap()
+            .len(),
+        16 * 1024
+    );
+    // No producer task runs independently: two chunks were queued while the
+    // first poll made progress, and without polling the Body nothing advances.
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(sent.load(Ordering::SeqCst), 2);
+    drop(body);
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "cancellation must drop the producer synchronously"
+    );
+}
+
+#[test]
+fn retained_idle_body_can_read_after_response() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let router = Router::new()
+        .route(
+            "/",
+            post({
+                let release = release.clone();
+                move |body: Body| {
+                    let release = release.clone();
+                    let result_tx = result_tx.clone();
+                    async move {
+                        tokio::spawn(async move {
+                            release.notified().await;
+                            let bytes = axum::body::to_bytes(body, 100).await.unwrap();
+                            result_tx.send(bytes).unwrap();
+                        });
+                        "accepted"
+                    }
+                }
+            }),
+        )
+        .route("/next", get(|| async { "next" }));
+    let harness = Harness::start_with_connections(router, ZeroCopy::Never, None, 1);
+    let mut stream = harness.connect();
+    stream
+        .write_all(b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 8\r\n\r\noriginal")
+        .unwrap();
+    assert_eq!(read_response(&mut stream).2, b"accepted");
+    release.notify_one();
+    assert_eq!(
+        result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "original"
+    );
+    stream
+        .write_all(b"GET /next HTTP/1.1\r\nhost: test\r\n\r\n")
+        .unwrap();
+    assert_eq!(read_response(&mut stream).2, b"next");
+}
+
+#[test]
+fn cancelled_retained_read_returns_head_buffers_before_reuse() {
+    use http_body_util::BodyExt;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let router = Router::new()
+        .route(
+            "/",
+            post({
+                let release = release.clone();
+                move |mut body: Body| {
+                    let release = release.clone();
+                    async move {
+                        let (started, ready) = tokio::sync::oneshot::channel();
+                        tokio::spawn(async move {
+                            let mut read = Box::pin(body.frame());
+                            std::future::poll_fn(|cx| {
+                                assert!(read.as_mut().poll(cx).is_pending());
+                                std::task::Poll::Ready(())
+                            })
+                            .await;
+                            started.send(()).unwrap();
+                            release.notified().await;
+                            drop(read);
+                            drop(body);
+                        });
+                        ready.await.unwrap();
+                        "accepted"
+                    }
+                }
+            }),
+        )
+        .route("/next", get(|| async { "next" }));
+    let harness = Harness::start_with_connections(router, ZeroCopy::Never, None, 1);
+    let mut first = harness.connect();
+    first
+        .write_all(b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 8\r\n\r\n")
+        .unwrap();
+    assert_eq!(read_response(&mut first).2, b"accepted");
+    let mut next = harness.connect();
+    next.write_all(b"GET /next HTTP/1.1\r\nhost: test\r\n\r\n")
+        .unwrap();
+    next.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let error = next
+        .read(&mut [0; 1])
+        .expect_err("retained input still owns the connection slot");
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    release.notify_one();
+    next.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(read_response(&mut next).2, b"next");
+}
+
+#[test]
+fn cancelled_direct_receive_poisoned_connection_is_not_reused() {
+    use std::task::Poll;
+    let pool = BufferPool::new(4096, 1).unwrap();
+    let handler_pool = pool.clone();
+    let router = Router::new()
+        .route(
+            "/",
+            post(move |body: DirectBody| {
+                let pool = handler_pool.clone();
+                async move {
+                    let DirectBody::Direct(mut body) = body else {
+                        panic!("native direct body expected")
+                    };
+                    let buf = pool.acquire().await;
+                    let segments = [Segment {
+                        buf: 0,
+                        start: 0,
+                        len: 8,
+                    }];
+                    let mut read = Box::pin(body.recv_vectored(vec![buf], &segments));
+                    std::future::poll_fn(|cx| {
+                        assert!(read.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    drop(read);
+                    drop(body);
+                    "cancelled"
+                }
+            }),
+        )
+        .route("/next", get(|| async { "next" }));
+    let harness = Harness::start_with_connections(router, ZeroCopy::Never, Some(pool), 1);
+    let mut first = harness.connect();
+    first
+        .write_all(b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 8\r\n\r\n")
+        .unwrap();
+    assert_eq!(read_response(&mut first).2, b"cancelled");
+    first
+        .write_all(b"originalGET /next HTTP/1.1\r\nhost: test\r\n\r\n")
+        .unwrap();
+    assert_eq!(
+        read_some(&mut first, &mut [0; 1]),
+        0,
+        "stale request framing must not be reused"
+    );
+    drop(first);
+    let mut next = harness.connect();
+    next.write_all(b"GET /next HTTP/1.1\r\nhost: test\r\n\r\n")
+        .unwrap();
+    assert_eq!(read_response(&mut next).2, b"next");
+}
+
+#[test]
+fn closing_response_reports_eof_before_waiting_for_retained_body() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let router = Router::new().route(
+        "/",
+        post({
+            let release = release.clone();
+            move |body: Body| {
+                let release = release.clone();
+                let result_tx = result_tx.clone();
+                async move {
+                    tokio::spawn(async move {
+                        release.notified().await;
+                        result_tx
+                            .send(axum::body::to_bytes(body, 100).await.unwrap())
+                            .unwrap();
+                    });
+                    "accepted"
+                }
+            }
+        }),
+    );
+    let harness = Harness::start(router, ZeroCopy::Never, None);
+    let mut stream = harness.connect();
+    stream.write_all(b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 8\r\nconnection: close\r\n\r\noriginal").unwrap();
+    assert_eq!(read_response(&mut stream).2, b"accepted");
+    assert_eq!(read_some(&mut stream, &mut [0; 1]), 0);
+    release.notify_one();
+    assert_eq!(
+        result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "original"
+    );
+}
+
+#[test]
+fn caught_direct_send_cancellation_closes_without_serving_pipeline() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CancelWriter {
+        pool: BufferPool,
+        zc: bool,
+    }
+    impl DirectWrite for CancelWriter {
+        fn write_to<'a>(
+            self: Box<Self>,
+            sink: &'a mut BodySink<'a>,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                sink.flush().await?;
+                let mut buf = self.pool.acquire().await;
+                buf.extend_from_slice(b"original");
+                let segments = [Segment {
+                    buf: 0,
+                    start: 0,
+                    len: 8,
+                }];
+                async fn cancel<F: Future>(future: F) {
+                    let mut future = Box::pin(future);
+                    std::future::poll_fn(|cx| {
+                        assert!(future.as_mut().poll(cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    drop(future);
+                }
+                if self.zc {
+                    cancel(sink.send_zero_copy(vec![buf], &segments)).await;
+                } else {
+                    cancel(sink.send_vectored(vec![buf], &segments)).await;
+                }
+                // Deliberately catch cancellation, as a timeout/select user can.
+                Ok(())
+            })
+        }
+    }
+    for zc in [false, true] {
+        let pool = BufferPool::without_huge_pages(4096, 4).unwrap();
+        let writer_pool = pool.clone();
+        let next_calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route(
+                "/",
+                get(move || {
+                    let pool = writer_pool.clone();
+                    async move {
+                        DirectResponse::new(
+                            Response::builder()
+                                .header(header::CONTENT_LENGTH, 8)
+                                .body(())
+                                .unwrap(),
+                            CancelWriter { pool, zc },
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/next",
+                get({
+                    let next_calls = next_calls.clone();
+                    move || {
+                        next_calls.fetch_add(1, Ordering::SeqCst);
+                        async { "must not run" }
+                    }
+                }),
+            );
+        let harness = Harness::start(router, ZeroCopy::Always, Some(pool));
+        let mut stream = harness.connect();
+        stream
+            .write_all(
+                b"GET / HTTP/1.1\r\nhost: test\r\n\r\nGET /next HTTP/1.1\r\nhost: test\r\n\r\n",
+            )
+            .unwrap();
+        let mut response = Vec::new();
+        if let Err(error) = stream.read_to_end(&mut response) {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
+        assert_eq!(next_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn cancelled_continue_wait_still_finishes_interim_before_final_response() {
+    let router = Router::new().route(
+        "/",
+        post(|body: DirectBody| async move {
+            let DirectBody::Direct(mut body) = body else {
+                panic!("direct body expected")
+            };
+            let mut accepting = Box::pin(body.accept_100());
+            std::future::poll_fn(|cx| {
+                assert!(accepting.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(accepting);
+            drop(body);
+            StatusCode::PAYLOAD_TOO_LARGE
+        }),
+    );
+    let harness = Harness::start(router, ZeroCopy::Never, None);
+    let mut stream = harness.connect();
+    stream.write_all(b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 100000\r\nexpect: 100-continue\r\n\r\n").unwrap();
+    assert!(read_head(&mut stream).starts_with("HTTP/1.1 100 "));
+    assert_eq!(read_response(&mut stream).0, 413);
+    assert_eq!(read_some(&mut stream, &mut [0; 1]), 0);
+}
+
+#[test]
+fn terminal_request_error_closes_even_if_failed_body_is_retained() {
+    use http_body_util::BodyExt;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let router = Router::new()
+        .route(
+            "/",
+            post({
+                let release = release.clone();
+                move |mut body: Body| {
+                    let release = release.clone();
+                    async move {
+                        let (failed, failure) = tokio::sync::oneshot::channel();
+                        tokio::spawn(async move {
+                            assert!(body.frame().await.unwrap().is_err());
+                            failed.send(()).unwrap();
+                            release.notified().await;
+                            drop(body);
+                        });
+                        failure.await.unwrap();
+                        StatusCode::BAD_REQUEST
+                    }
+                }
+            }),
+        )
+        .route("/next", get(|| async { "next" }));
+    let harness = Harness::start_with_connections(router, ZeroCopy::Never, None, 1);
+    let mut stream = harness.connect();
+    stream
+        .write_all(b"POST / HTTP/1.1\r\nhost: test\r\ntransfer-encoding: chunked\r\n\r\nZ\r\n")
+        .unwrap();
+    assert_eq!(read_response(&mut stream).0, 400);
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    assert_eq!(read_some(&mut stream, &mut [0; 1]), 0);
+    let mut next = harness.connect();
+    next.write_all(b"GET /next HTTP/1.1\r\nhost: test\r\n\r\n")
+        .unwrap();
+    assert_eq!(read_response(&mut next).2, b"next");
+    release.notify_one();
 }

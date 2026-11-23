@@ -1,0 +1,318 @@
+use super::scenario::Scenario;
+
+#[test]
+fn read_content_length_body() {
+    // Create a scenario with a POST request with content-length
+    let scenario = Scenario::builder()
+        .post("/path")
+        .request_body(b"hello world", false)
+        .build();
+
+    // Get a Reply in the RecvBody state
+    let mut reply = scenario.to_recv_body();
+
+    // Read the request body
+    let mut output = vec![0; 1024];
+    let (input_used, output_used) = reply.read(b"hello world", &mut output).unwrap();
+
+    // Verify the results
+    assert_eq!(input_used, 11);
+    assert_eq!(output_used, 11);
+    assert_eq!(&output[..output_used], b"hello world");
+
+    // Verify the body is fully received
+    assert!(reply.is_ended());
+}
+
+#[test]
+fn read_chunked_body() {
+    // Create a scenario with a POST request with chunked encoding
+    let scenario = Scenario::builder()
+        .post("/path")
+        .request_body(b"hello world", true)
+        .build();
+
+    // Get a Reply in the RecvBody state
+    let mut reply = scenario.to_recv_body();
+
+    // Read the chunked request body
+    let mut output = vec![0; 1024];
+    let chunked_input = b"b\r\nhello world\r\n0\r\n\r\n";
+    let (input_used, output_used) = reply.read(chunked_input, &mut output).unwrap();
+
+    // Verify the results
+    assert_eq!(input_used, 21);
+    assert_eq!(output_used, 11);
+    assert_eq!(&output[..output_used], b"hello world");
+
+    // Verify the body is fully received
+    assert!(reply.is_ended());
+}
+
+#[test]
+fn read_chunked_body_in_parts() {
+    // Create a scenario with a POST request with chunked encoding
+    let scenario = Scenario::builder()
+        .post("/path")
+        .request_body(b"hello world", true)
+        .build();
+
+    // Get a Reply in the RecvBody state
+    let mut reply = scenario.to_recv_body();
+
+    // Enable stopping on chunk boundaries
+    reply.stop_on_chunk_boundary(true);
+
+    // Read the first chunk
+    let mut output = vec![0; 1024];
+    let chunk1 = b"5\r\nhello\r\n";
+    let (input_used1, output_used1) = reply.read(chunk1, &mut output).unwrap();
+
+    // Verify the first chunk
+    assert_eq!(input_used1, 10);
+    assert_eq!(output_used1, 5);
+    assert_eq!(&output[..output_used1], b"hello");
+    assert!(reply.is_on_chunk_boundary());
+    assert!(!reply.is_ended());
+
+    // Read the second chunk
+    let chunk2 = b"6\r\n world\r\n";
+    let (input_used2, output_used2) = reply.read(chunk2, &mut output[output_used1..]).unwrap();
+
+    // Verify the second chunk
+    assert_eq!(input_used2, 11);
+    assert_eq!(output_used2, 6);
+    assert_eq!(
+        &output[output_used1..output_used1 + output_used2],
+        b" world"
+    );
+    assert!(reply.is_on_chunk_boundary());
+    assert!(!reply.is_ended());
+
+    // Read the end marker
+    let end_marker = b"0\r\n\r\n";
+    let (input_used3, output_used3) = reply
+        .read(end_marker, &mut output[output_used1 + output_used2..])
+        .unwrap();
+
+    // Verify the end marker
+    assert_eq!(input_used3, 5);
+    assert_eq!(output_used3, 0);
+    assert!(reply.is_ended());
+}
+
+#[test]
+fn proceed_to_provide_response() {
+    // Create a scenario with a POST request with content-length
+    let scenario = Scenario::builder()
+        .post("/path")
+        .request_body(b"hello", false)
+        .build();
+
+    // Get a Reply in the RecvBody state
+    let mut reply = scenario.to_recv_body();
+
+    // Read the request body
+    let mut output = vec![0; 1024];
+    reply.read(b"hello", &mut output).unwrap();
+
+    // Verify the body is fully received
+    assert!(reply.is_ended());
+
+    // Proceed to ProvideResponse
+    let reply = reply.proceed().unwrap();
+
+    // Verify the state transition
+    assert!(reply.inner().state.reader.is_some());
+}
+
+#[test]
+#[should_panic]
+fn proceed_before_body_ended() {
+    // Create a scenario with a POST request with content-length
+    let scenario = Scenario::builder()
+        .post("/path")
+        .request_body(b"hello world", false)
+        .build();
+
+    // Get a Reply in the RecvBody state
+    let mut reply = scenario.to_recv_body();
+
+    // Read only part of the request body
+    let mut output = vec![0; 1024];
+    reply.read(b"hello", &mut output).unwrap();
+
+    // Verify the body is not fully received
+    assert!(!reply.is_ended());
+
+    // This should panic because the body is not fully received
+    let _ = reply.proceed();
+}
+
+#[test]
+fn read_after_end() {
+    // Create a scenario with a POST request with content-length
+    let scenario = Scenario::builder()
+        .post("/path")
+        .request_body(b"hello", false)
+        .build();
+
+    // Get a Reply in the RecvBody state
+    let mut reply = scenario.to_recv_body();
+
+    // Read the request body
+    let mut output = vec![0; 1024];
+    reply.read(b"hello", &mut output).unwrap();
+
+    // Verify the body is fully received
+    assert!(reply.is_ended());
+
+    // Try to read more after the body is fully received
+    let (input_used, output_used) = reply.read(b"more data", &mut output).unwrap();
+
+    // Should not consume any input or produce any output
+    assert_eq!(input_used, 0);
+    assert_eq!(output_used, 0);
+}
+
+#[test]
+fn consume_direct_read() {
+    let scenario = Scenario::builder()
+        .post("/")
+        .request_body(b"hello", false)
+        .build();
+    let mut reply = scenario.to_recv_body();
+    assert_eq!(reply.remaining(), Some(5));
+    reply.consume_direct_read(0).unwrap();
+    assert_eq!(
+        reply.consume_direct_read(6),
+        Err(crate::Error::BodyLargerThanContentLength)
+    );
+    assert_eq!(reply.remaining(), Some(5));
+    reply.consume_direct_read(2).unwrap();
+    assert_eq!(reply.remaining(), Some(3));
+    assert!(!reply.is_ended());
+    assert_eq!(reply.read(b"lloNEXT", &mut [0; 8]).unwrap(), (3, 3));
+    assert_eq!(reply.remaining(), Some(0));
+    reply.consume_direct_read(0).unwrap();
+    assert_eq!(
+        reply.consume_direct_read(1),
+        Err(crate::Error::BodyLargerThanContentLength)
+    );
+    assert!(reply.is_ended());
+    reply.proceed().unwrap();
+}
+
+#[test]
+fn direct_read_after_buffered_read() {
+    let scenario = Scenario::builder()
+        .post("/")
+        .request_body(b"hello", false)
+        .build();
+    let mut reply = scenario.to_recv_body();
+    reply.read(b"he", &mut [0; 2]).unwrap();
+    reply.consume_direct_read(3).unwrap();
+    assert!(reply.is_ended());
+    reply.proceed().unwrap();
+}
+
+#[test]
+fn direct_read_rejects_chunked() {
+    let scenario = Scenario::builder()
+        .post("/")
+        .request_body(b"hello", true)
+        .build();
+    let mut reply = scenario.to_recv_body();
+    assert_eq!(reply.remaining(), None);
+    assert_eq!(
+        reply.consume_direct_read(0),
+        Err(crate::Error::BodyIsChunked)
+    );
+    assert_eq!(
+        reply.consume_direct_read(5),
+        Err(crate::Error::BodyIsChunked)
+    );
+    assert!(!reply.is_ended());
+}
+
+#[test]
+fn abandon_unread_body() {
+    for chunked in [false, true] {
+        for expect in [false, true] {
+            for partial in [false, true] {
+                let mut builder = Scenario::builder()
+                    .post("/")
+                    .request_body(b"hello", chunked);
+                if expect {
+                    builder = builder.header("expect", "100-continue");
+                }
+                let scenario = builder.build();
+                let mut reply = scenario.to_recv_body();
+                if partial {
+                    let input: &[u8] = if chunked { b"5\r\nhe" } else { b"he" };
+                    reply.read(input, &mut [0; 16]).unwrap();
+                }
+                let reply = reply.abandon();
+                // A sent 100 Continue must not impose reject()'s status restriction.
+                let mut reply = reply
+                    .provide(
+                        http::Response::builder()
+                            .status(200)
+                            .header("content-length", "0")
+                            .body(())
+                            .unwrap(),
+                    )
+                    .unwrap();
+                reply.write(&mut [0; 1024]).unwrap();
+                let crate::server::SendResponseResult::Cleanup(reply) = reply.proceed() else {
+                    panic!()
+                };
+                assert!(reply.must_close_connection());
+                assert!(
+                    reply
+                        .inner()
+                        .close_reason
+                        .contains(&crate::CloseReason::UnreadRequestBody)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn abandon_completed_body_allows_reuse() {
+    let scenario = Scenario::builder()
+        .post("/")
+        .request_body(b"hi", false)
+        .build();
+    let mut reply = scenario.to_recv_body();
+    reply.read(b"hi", &mut [0; 2]).unwrap();
+    let reply = reply.abandon();
+    assert!(reply.inner().close_reason.is_empty());
+}
+
+#[test]
+fn abandon_with_every_close_reason() {
+    // HTTP/1.0 without keep-alive, client close, unread body and server close.
+    let scenario = Scenario::builder()
+        .request(
+            http::Request::post("/")
+                .version(http::Version::HTTP_10)
+                .body(())
+                .unwrap(),
+        )
+        .header("connection", "close")
+        .request_body(b"hello", false)
+        .build();
+    let reply = scenario.to_recv_body().abandon();
+    let reply = reply
+        .provide(
+            http::Response::builder()
+                .status(413)
+                .header("connection", "close")
+                .body(())
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(reply.inner().close_reason.len(), 4);
+}

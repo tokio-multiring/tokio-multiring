@@ -26,4 +26,8 @@ tokio = { git = "https://github.com/tokio-multiring/tokio", branch = "io-reactor
 members = ["s3", "multiring-axum", "s3-axum"]
 
 [patch.crates-io]
+axum-core = { path = "vendor/axum-core" }
 tokio = { git = "https://github.com/tokio-multiring/tokio", branch = "io-reactor-wl" }
+
+[patch."https://github.com/lthiery/ureq-proto"]
+ureq-proto = { path = "vendor/ureq-proto" }

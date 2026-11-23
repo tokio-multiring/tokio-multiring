@@ -6,12 +6,13 @@
 //! zero-copy I/O can additionally opt into:
 //!
 //! - [`DirectBody`]: an Axum [`FromRequest`](axum::extract::FromRequest)
-//!   extractor for zero-copy `recv_vectored` into [`tokio_multiring::FixedBuf`]s
+//!   extractor for direct `recv_vectored` into [`tokio_multiring::FixedBuf`]s
 //!   and explicit `Expect: 100-continue` approval (with transparent fallback to
 //!   [`axum::body::Body`] when running on Hyper / `axum::serve`).
 //! - [`DirectResponse`] / [`direct_response`] / [`DirectWrite`]: an Axum
 //!   [`IntoResponse`](axum::response::IntoResponse) hook that writes straight
-//!   to [`BodySink`] with vectored / zero-copy `send_zc` sends.
+//!   to [`BodySink`] with vectored / zero-copy `send_zc` sends. Body-transforming
+//!   middleware and other HTTP servers use a bounded standard-body fallback.
 
 mod conn;
 mod incoming;

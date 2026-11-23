@@ -6,7 +6,9 @@ use std::future::poll_fn;
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -16,15 +18,12 @@ use http_body_util::BodyExt;
 use tokio::sync::Semaphore;
 use tokio_multiring::{BufferPool, MultiRing};
 use tower_service::Service;
-use ureq_proto::server::state::{ProvideResponse, RecvBody};
-use ureq_proto::server::{RecvRequestResult, Reply, SendResponseResult};
+use ureq_proto::server::state::ProvideResponse;
+use ureq_proto::server::{Reply, RequestBody, SendResponseResult};
 
 use crate::conn::{Conn, Filled};
-use crate::incoming::{
-    ActiveConn, BodyError, ConnSlot, DirectBodySlot as IncomingDirectSlot, IncomingReply,
-    MultiRingIncoming, read_body_into,
-};
-use crate::outgoing::{BodySink, DirectBodySlot as OutgoingDirectSlot};
+use crate::incoming::{ActiveConn, BodyError, ConnSlot, MultiRingIncoming, read_body_into};
+use crate::outgoing::{BodySink, DirectResponseBody};
 
 /// The most bytes of an unread request body that are drained and discarded so
 /// a keep-alive connection can be reused. Past this, the connection closes.
@@ -190,17 +189,17 @@ where
                 .is_ok_and(|peer| !peer.ip().to_canonical().is_loopback()),
         };
 
-        let buf = || {
-            shared
-                .heads
-                .try_acquire()
-                .expect("a connection slot guarantees two head buffers")
-        };
+        // Cancellation completes asynchronously: a closed connection's receive
+        // may still own a head buffer after its connection permit is returned.
+        // Acquire both atomically and apply bounded backpressure until reclaimed.
+        let mut heads = shared.heads.acquire_many(2).await;
+        let output = heads.pop().expect("acquired two buffers");
+        let input = heads.pop().expect("acquired two buffers");
         let conn = Conn::new(
             shared.multiring.clone(),
             socket.into(),
-            buf(),
-            buf(),
+            input,
+            output,
             zero_copy,
         );
         let svc = service.clone();
@@ -271,23 +270,18 @@ fn has_connection_close(headers: &http::HeaderMap) -> bool {
         .any(|option| option.trim().eq_ignore_ascii_case("close"))
 }
 
-enum Discarded {
-    All(Reply<ProvideResponse>),
-    Abandoned(Reply<ProvideResponse>),
-}
-
-async fn discard(conn: &mut Conn, mut body: Reply<RecvBody>) -> Result<Discarded, Fatal> {
+async fn discard(active: &mut ActiveConn) -> Result<bool, Fatal> {
     let mut scratch = [0u8; 1024];
     let mut discarded = 0usize;
     while discarded <= DISCARD_LIMIT {
-        match read_body_into(conn, &mut body, &mut scratch).await {
-            Ok(0) => return Ok(Discarded::All(body.proceed()?)),
+        match read_body_into(&mut active.conn, &mut active.body, &mut scratch).await {
+            Ok(0) => return Ok(true),
             Ok(produced) => discarded += produced,
             Err(BodyError::Io(err)) => return Err(Fatal::Io(err)),
-            Err(BodyError::Malformed(_)) => break,
+            Err(BodyError::Malformed(_)) => return Ok(false),
         }
     }
-    Ok(Discarded::Abandoned(body.abandon()))
+    Ok(false)
 }
 
 /// Runs one HTTP/1.1 exchange. Returns `Ok(Some(conn))` when the connection
@@ -340,114 +334,97 @@ where
     };
 
     let client_wants_close = wants_close(&head);
-    let next = reply.proceed().expect("a parsed request can proceed");
+    let (incoming, reply) = reply.split().expect("a parsed request can split");
+    if !incoming.is_ended() {
+        return run_with_body(conn, head, incoming, reply, service, client_wants_close).await;
+    }
 
-    // Fast path: no request body (GET, HEAD, DELETE, Content-Length: 0).
-    // Avoids allocating a ConnSlot or Request body wrapper altogether.
-    let (mut conn, response, reply, force_close) = match next {
-        RecvRequestResult::ProvideResponse(reply) => {
-            let (parts, ()) = head.into_parts();
-            let req = Request::from_parts(parts, Body::empty());
-            let Ok(()) = poll_fn(|cx| service.poll_ready(cx)).await;
-            let Ok(response) = service.call(req).await;
-            (conn, response, reply, false)
-        }
-        RecvRequestResult::Send100(send100) => {
-            let remaining_hint = head
-                .headers()
-                .get(header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok());
-            run_with_body(
-                conn,
-                head,
-                IncomingReply::Send100(send100),
-                remaining_hint,
-                service,
-            )
-            .await?
-        }
-        RecvRequestResult::RecvBody(recv_body) => {
-            let remaining_hint = recv_body.remaining();
-            run_with_body(
-                conn,
-                head,
-                IncomingReply::RecvBody(recv_body),
-                remaining_hint,
-                service,
-            )
-            .await?
-        }
-    };
-
-    let keep_alive = respond(
-        &mut conn,
-        reply,
-        response,
-        force_close || client_wants_close,
-    )
-    .await?;
-    Ok(if keep_alive {
-        Some(conn)
+    // Bodyless requests retain the allocation-free connection fast path.
+    let (parts, ()) = head.into_parts();
+    let req = Request::from_parts(parts, Body::empty());
+    let Ok(()) = poll_fn(|cx| service.poll_ready(cx)).await;
+    let Ok(response) = service.call(req).await;
+    let keep_alive = respond(&mut conn, reply, response, client_wants_close).await?;
+    if keep_alive {
+        Ok(Some(conn))
     } else {
         conn.close().await;
-        None
-    })
+        Ok(None)
+    }
 }
 
 async fn run_with_body<S>(
     conn: Conn,
     head: Request<()>,
-    incoming: IncomingReply,
-    remaining_hint: Option<u64>,
+    incoming: RequestBody,
+    reply: Reply<ProvideResponse>,
     service: &mut S,
-) -> Result<(Conn, Response<Body>, Reply<ProvideResponse>, bool), Fatal>
+    client_wants_close: bool,
+) -> Result<Option<Conn>, Fatal>
 where
     S: Service<Request<Body>, Response = Response<Body>, Error = Infallible>,
 {
+    let remaining_hint = incoming.remaining();
+    let (reader, mut writer) = conn.split();
     let slot = ConnSlot::new(ActiveConn {
-        conn,
-        reply: incoming,
+        conn: reader,
+        body: incoming,
         io_error: false,
-    });
-    let (mut parts, ()) = head.into_parts();
-    parts.extensions.insert(IncomingDirectSlot(slot.clone()));
+    })
+    .map_err(|err| match err {
+        BodyError::Io(e) => Fatal::Io(e),
+        BodyError::Malformed(e) => Fatal::Protocol(e),
+    })?;
+    let (parts, ()) = head.into_parts();
     let body = Body::new(MultiRingIncoming::new(slot.clone(), remaining_hint));
     let req = Request::from_parts(parts, body);
 
     let Ok(()) = poll_fn(|cx| service.poll_ready(cx)).await;
     let Ok(response) = service.call(req).await;
-
-    let Some(mut active) = slot.take() else {
-        // Handler retained the body beyond returning a response (e.g. moved it
-        // to another task). We cannot safely reuse the connection.
-        return Err(Fatal::Io(io::Error::other(
-            "handler did not release request body before returning response",
-        )));
+    let force_close = match slot.before_response(DISCARD_LIMIT).await {
+        Ok(close) => close || client_wants_close,
+        Err(error) => {
+            writer.abort().await;
+            return Err(error.into());
+        }
     };
-    if active.io_error {
-        return Err(Fatal::Io(io::Error::from(io::ErrorKind::ConnectionReset)));
+    let keep_alive = match respond(&mut writer, reply, response, force_close).await {
+        Ok(keep_alive) => keep_alive && !force_close,
+        Err(error) => {
+            writer.abort().await;
+            return Err(error);
+        }
+    };
+
+    if !keep_alive && let Err(error) = writer.finish_output().await {
+        writer.abort().await;
+        return Err(error.into());
     }
-
-    let (reply, force_close) = match active.reply {
-        IncomingReply::Send100(reply) => {
-            // Answering without sending 100-continue closes the connection:
-            // the client may still send the body after a timeout.
-            (reply.reject(), true)
-        }
-        IncomingReply::RecvBody(body) if body.is_ended() => (body.proceed()?, false),
-        IncomingReply::RecvBody(body) => match discard(&mut active.conn, body).await? {
-            Discarded::All(reply) => (reply, false),
-            Discarded::Abandoned(reply) => (reply, true),
-        },
-        IncomingReply::Taken => {
-            return Err(Fatal::Io(io::Error::other(
-                "request body state machine was interrupted",
-            )));
-        }
+    // A body retained by another task may still be consuming input. Do not
+    // steal its framing state or silently turn a delayed read into EOF.
+    slot.wait_for_reader().await;
+    let Some(mut active) = slot.take() else {
+        writer.abort().await;
+        return Ok(None);
     };
-
-    Ok((active.conn, response, reply, force_close))
+    let reusable = if keep_alive && !active.io_error {
+        match discard(&mut active).await {
+            Ok(ended) => ended,
+            Err(error) => {
+                writer.abort().await;
+                return Err(error);
+            }
+        }
+    } else {
+        false
+    };
+    writer.reunite(active.conn);
+    if reusable {
+        Ok(Some(writer))
+    } else {
+        writer.close().await;
+        Ok(None)
+    }
 }
 
 /// Sends `response` over `conn`. Returns `Ok(true)` if the connection can
@@ -460,11 +437,9 @@ async fn respond(
 ) -> Result<bool, Fatal> {
     let (mut parts, mut body) = response.into_parts();
 
-    let direct = parts
-        .extensions
-        .remove::<OutgoingDirectSlot>()
-        .and_then(|slot| slot.take())
-        .filter(|_| body.is_end_stream());
+    let direct = body
+        .downcast_ref::<DirectResponseBody>()
+        .and_then(DirectResponseBody::take_writer);
 
     if force_close && !has_connection_close(&parts.headers) {
         parts
@@ -513,7 +488,19 @@ async fn respond(
                 let mut sink = BodySink::new(conn, &mut send_body);
                 writer.write_to(&mut sink).await?;
             } else {
-                while let Some(frame) = body.frame().await {
+                loop {
+                    // Keep coalescing immediately available frames, but flush
+                    // before waiting for a producer (which may itself be reading
+                    // the request). This also makes small streaming frames visible.
+                    let frame = poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_frame(cx))).await;
+                    let frame = match frame {
+                        Poll::Ready(frame) => frame,
+                        Poll::Pending => {
+                            conn.flush().await?;
+                            body.frame().await
+                        }
+                    };
+                    let Some(frame) = frame else { break };
                     let frame = frame.map_err(|e| Fatal::Io(io::Error::other(e)))?;
                     if let Ok(data) = frame.into_data() {
                         if data.is_empty() {

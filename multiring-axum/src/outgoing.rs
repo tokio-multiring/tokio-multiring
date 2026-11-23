@@ -1,133 +1,166 @@
-//! Zero-copy / registered-buffer response body fast path through Axum's
-//! [`http::Response<axum::body::Body>`].
+//! Registered-buffer response bodies with a standard streaming fallback.
 
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
+use std::task::{Context, Poll};
 
 use axum::body::Body;
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use http_body::{Frame, SizeHint};
+use tokio::sync::mpsc;
 use tokio_multiring::{FixedBuf, Reclaim, Segment};
 use ureq_proto::server::Reply;
 use ureq_proto::server::state::SendBody;
 
 use crate::conn::Conn;
 
-/// Sink passed to [`DirectWrite::write_to`] for writing a response body
-/// directly onto the worker's io_uring connection.
+const FALLBACK_CHUNK: usize = 16 * 1024;
+const FALLBACK_QUEUE: usize = 2;
+
+enum Sink<'a> {
+    Direct {
+        conn: &'a mut Conn,
+        body: &'a mut Reply<SendBody>,
+    },
+    Stream(mpsc::Sender<Bytes>),
+}
+
+/// Sink passed to [`DirectWrite::write_to`]. On the native connection it sends
+/// registered buffers directly; under a body wrapper or another HTTP server it
+/// yields bounded, copied `Bytes` frames through the normal Body interface.
 pub struct BodySink<'a> {
-    conn: &'a mut Conn,
-    body: &'a mut Reply<SendBody>,
+    inner: Sink<'a>,
 }
 
 impl<'a> BodySink<'a> {
     pub(crate) fn new(conn: &'a mut Conn, body: &'a mut Reply<SendBody>) -> Self {
-        Self { conn, body }
+        Self {
+            inner: Sink::Direct { conn, body },
+        }
     }
 
-    /// Whether zero-copy sends are enabled for this client.
+    /// Whether this sink supports zero-copy sends for the current client.
     pub fn zero_copy(&self) -> bool {
-        self.conn.zero_copy()
+        match &self.inner {
+            Sink::Direct { conn, .. } => conn.zero_copy(),
+            Sink::Stream(_) => false,
+        }
     }
 
-    /// Whether this response is using chunked transfer encoding.
+    /// Whether the native response uses chunked transfer encoding.
+    /// A standard-body fallback has no access to its eventual wire framing.
     pub fn is_chunked(&self) -> bool {
-        self.body.is_chunked()
+        match &self.inner {
+            Sink::Direct { body, .. } => body.is_chunked(),
+            Sink::Stream(_) => false,
+        }
     }
 
-    /// Flushes any buffered response headers or bytes.
+    /// Flushes buffered response headers or bytes. Stream frames are handed to
+    /// the consumer as they are written, so the fallback has nothing to flush.
     pub async fn flush(&mut self) -> io::Result<()> {
-        self.conn.flush().await
+        match &mut self.inner {
+            Sink::Direct { conn, .. } => conn.flush().await,
+            Sink::Stream(_) => Ok(()),
+        }
     }
 
-    /// Sends `segments` of `bufs` in one vectored io_uring send.
-    ///
-    /// If the response is non-chunked and the response headers are still in
-    /// the connection's output buffer, headers and body are coalesced into a
-    /// single vectored send operation.
+    /// Sends buffer segments, coalescing native response headers where possible.
+    /// Body wrappers receive copied frames and retain their normal semantics.
     pub async fn send_vectored(
         &mut self,
         bufs: Vec<FixedBuf>,
         segments: &[Segment],
     ) -> (io::Result<()>, Vec<FixedBuf>) {
-        if self.body.is_chunked() {
-            for seg in segments {
-                let slice = &bufs[seg.buf][seg.start..seg.start + seg.len];
-                if let Err(e) = self.write_bytes(slice).await {
-                    return (Err(e), bufs);
-                }
+        if let Sink::Direct { conn, body } = &mut self.inner
+            && !body.is_chunked()
+        {
+            let len: usize = segments.iter().map(|s| s.len).sum();
+            // Validate framing BEFORE putting any bytes on the socket.
+            if let Err(e) = body.consume_direct_write(len) {
+                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), bufs);
             }
-            return (Ok(()), bufs);
+            return conn.send_vectored(bufs, segments).await;
         }
-        let len: usize = segments.iter().map(|s| s.len).sum();
-        let (sent, bufs) = self.conn.send_vectored(bufs, segments).await;
-        if let Err(e) = sent {
-            return (Err(e), bufs);
-        }
-        if let Err(e) = self.body.consume_direct_write(len) {
-            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), bufs);
+        for seg in segments {
+            let slice = &bufs[seg.buf][seg.start..seg.start + seg.len];
+            if let Err(e) = self.write_bytes(slice).await {
+                return (Err(e), bufs);
+            }
         }
         (Ok(()), bufs)
     }
 
-    /// Sends `segments` of `bufs` without copying (`IORING_OP_SEND_ZC`).
-    ///
-    /// Only valid for non-chunked responses (e.g. when `Content-Length` is set).
-    /// Flushes any pending response headers before issuing the zero-copy send.
+    /// Sends registered buffers without copying. Call only when
+    /// [`Self::zero_copy`] is true and the response is not chunked.
     pub async fn send_zero_copy(
         &mut self,
         bufs: Vec<FixedBuf>,
         segments: &[Segment],
     ) -> (io::Result<()>, Option<Reclaim>) {
-        if self.body.is_chunked() {
+        let Sink::Direct { conn, body } = &mut self.inner else {
             return (
                 Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "send_zero_copy requires a known Content-Length (non-chunked response)",
+                    "zero-copy is unavailable through a body wrapper",
+                )),
+                None,
+            );
+        };
+        if body.is_chunked() {
+            return (
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "send_zero_copy requires a non-chunked response",
                 )),
                 None,
             );
         }
-        if let Err(e) = self.conn.flush().await {
+        let len: usize = segments.iter().map(|s| s.len).sum();
+        if let Err(e) = body.consume_direct_write(len) {
+            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), None);
+        }
+        if let Err(e) = conn.flush().await {
             return (Err(e), None);
         }
-        let len: usize = segments.iter().map(|s| s.len).sum();
-        let (sent, reclaim) = self.conn.send_zero_copy(bufs, segments).await;
-        if let Err(e) = sent {
-            return (Err(e), Some(reclaim));
-        }
-        if let Err(e) = self.body.consume_direct_write(len) {
-            return (
-                Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-                Some(reclaim),
-            );
-        }
-        (Ok(()), Some(reclaim))
+        let (sent, reclaim) = conn.send_zero_copy(bufs, segments).await;
+        (sent, Some(reclaim))
     }
 
-    /// Writes `bytes` through the HTTP response encoder (handles chunked or
-    /// content-length framing automatically).
+    /// Writes bytes through the HTTP encoder, or yields bounded Body frames.
     pub async fn write_bytes(&mut self, mut bytes: &[u8]) -> io::Result<()> {
-        while !bytes.is_empty() {
-            let output = self.conn.output()?;
-            let (used, produced) = self
-                .body
-                .write(bytes, output.spare_capacity_mut())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            output.grow(produced);
-            bytes = &bytes[used..];
-            if used == 0 {
-                self.conn.flush().await?;
+        match &mut self.inner {
+            Sink::Stream(sender) => {
+                for chunk in bytes.chunks(FALLBACK_CHUNK) {
+                    sender
+                        .send(Bytes::copy_from_slice(chunk))
+                        .await
+                        .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+                }
+            }
+            Sink::Direct { conn, body } => {
+                while !bytes.is_empty() {
+                    let output = conn.output()?;
+                    let (used, produced) = body
+                        .write(bytes, output.spare_capacity_mut())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    output.grow(produced);
+                    bytes = &bytes[used..];
+                    if used == 0 {
+                        conn.flush().await?;
+                    }
+                }
             }
         }
         Ok(())
     }
 }
 
-/// A response body producer that writes straight to a [`BodySink`] via
-/// io_uring (registered buffers, vectored sends, `send_zc`) without boxing
-/// chunks into [`bytes::Bytes`].
+/// A response producer that can use registered-buffer and zero-copy sends on
+/// the native server, with ordinary streaming semantics under Body middleware.
 pub trait DirectWrite: Send + 'static {
     fn write_to<'a>(
         self: Box<Self>,
@@ -135,34 +168,128 @@ pub trait DirectWrite: Send + 'static {
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>;
 }
 
-/// Extension stored on `http::Response<axum::body::Body>` to carry a
-/// [`DirectWrite`] through Axum routers and Tower middleware.
-#[derive(Clone)]
-pub(crate) struct DirectBodySlot(Arc<Mutex<Option<Box<dyn DirectWrite>>>>);
+/// The capability is owned by the actual Body. A response extension cannot
+/// prove middleware left that body intact, so no side channel is used.
+pub(crate) struct DirectResponseBody {
+    writer: Mutex<Option<Box<dyn DirectWrite>>>,
+    receiver: Option<mpsc::Receiver<Bytes>>,
+    producer: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send>>>,
+    result: Option<io::Result<()>>,
+    remaining: Option<u64>,
+    done: bool,
+}
 
-impl DirectBodySlot {
-    pub(crate) fn take(&self) -> Option<Box<dyn DirectWrite>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+impl DirectResponseBody {
+    pub(crate) fn take_writer(&self) -> Option<Box<dyn DirectWrite>> {
+        self.writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 }
 
-/// Builds an [`axum::response::Response`] whose body is produced directly via
-/// [`DirectWrite`] when served by `multiring-axum`.
-///
-/// The caller should set `Content-Length` on `head` if known (required for
-/// zero-copy sends). Any Tower middleware that inspects or adds response
-/// headers continues to work transparently.
-pub fn direct_response(head: http::Response<()>, writer: impl DirectWrite) -> Response {
-    let (parts, ()) = head.into_parts();
-    let mut response = Response::from_parts(parts, Body::empty());
-    response
-        .extensions_mut()
-        .insert(DirectBodySlot(Arc::new(Mutex::new(Some(Box::new(writer))))));
-    response
+impl http_body::Body for DirectResponseBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        if self.receiver.is_none() {
+            let Some(writer) = self.take_writer() else {
+                self.done = true;
+                return Poll::Ready(None);
+            };
+            let (sender, receiver) = mpsc::channel(FALLBACK_QUEUE);
+            self.receiver = Some(receiver);
+            self.producer = Some(Box::pin(async move {
+                let mut sink = BodySink {
+                    inner: Sink::Stream(sender),
+                };
+                writer.write_to(&mut sink).await
+            }));
+        }
+        // Run on the consumer's task. The bounded queue makes the producer
+        // yield; dropping this Body cancels it synchronously, without a runtime.
+        if let Some(producer) = &mut self.producer
+            && let Poll::Ready(result) = producer.as_mut().poll(cx)
+        {
+            self.producer = None;
+            self.result = Some(result);
+        }
+        match self.receiver.as_mut().expect("created above").poll_recv(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(bytes)) => {
+                if let Some(remaining) = &mut self.remaining {
+                    if bytes.len() as u64 > *remaining {
+                        self.done = true;
+                        return Poll::Ready(Some(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "response exceeds Content-Length",
+                        ))));
+                    }
+                    *remaining -= bytes.len() as u64;
+                }
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
+            Poll::Ready(None) => {
+                if let Some(Err(error)) = self.result.take() {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(error)));
+                }
+                self.done = true;
+                if self.remaining.is_some_and(|n| n != 0) {
+                    Poll::Ready(Some(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "response ended before Content-Length",
+                    ))))
+                } else {
+                    Poll::Ready(None)
+                }
+            }
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self.remaining {
+            Some(remaining) => SizeHint::with_exact(remaining),
+            None => SizeHint::default(),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done
+    }
 }
 
-/// Convenience wrapper implementing [`IntoResponse`] for a [`DirectWrite`]
-/// paired with response status and headers.
+/// Builds a response whose actual Body owns the producer. Header-only
+/// middleware preserves the native fast path; body wrappers use its bounded
+/// standard-body fallback, and replacing the body drops the producer.
+pub fn direct_response(head: http::Response<()>, writer: impl DirectWrite) -> Response {
+    let (parts, ()) = head.into_parts();
+    let remaining = parts
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok());
+    Response::from_parts(
+        parts,
+        Body::new(DirectResponseBody {
+            writer: Mutex::new(Some(Box::new(writer))),
+            receiver: None,
+            producer: None,
+            result: None,
+            remaining,
+            done: false,
+        }),
+    )
+}
+
+/// Convenience wrapper implementing [`IntoResponse`] for a producer and head.
 pub struct DirectResponse {
     response: Response,
 }

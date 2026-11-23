@@ -12,7 +12,7 @@ Four crates in one workspace:
   reference baseline.
 - **`multiring-axum`** (`multiring-axum/`): serves any real `axum::Router`
   (`tower_service::Service<Request<Body>, Response = Response<Body>>`) over
-  `tokio-multiring` and `ureq-proto` — no Hyper and no Axum fork. Standard Axum
+  `tokio-multiring` and `ureq-proto` with a vendored axum-core body downcast API. Standard Axum
   extractors, responses, and Tower middleware work unmodified; handlers can opt
   into `DirectBody` (`FromRequest`, transparent fallback to `axum::body::Body`
   on Hyper) and `DirectResponse` / `DirectWrite` (`IntoResponse`) for registered
@@ -59,7 +59,8 @@ RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --offline --workspace 
 | Crate | Source | Why |
 |---|---|---|
 | tokio | `https://github.com/tokio-multiring/tokio`, branch `io-reactor-wl` (`io-reactor` merged with `local-worker-v3` `ff2d7368`; `[patch.crates-io]` unifies axum/hyper-util onto it) | the reactor seam (`runtime::reactor::Reactor`, `Builder::io_reactor`) and upgraded worker-local tasks (`spawn_worker_local`, `run_on_each_worker`, `run_on_any_worker`, `worker_local_queue_interval`); uses stock crates.io `mio` |
-| ureq-proto | `https://github.com/lthiery/ureq-proto`, branch `axum-proto` (`algesten/ureq-proto` `main` + open PRs #60 and #61) | server state machine with HTTP/1.0 framing, strict transfer-encoding, any-final-status `Send100::reject`, and chunked finish capacity check |
+| axum-core | Vendored 0.5.6 | Shared downcast of the immediate body for adapter fast paths |
+| ureq-proto | `https://github.com/lthiery/ureq-proto`, branch `axum-proto` (`algesten/ureq-proto` `main` + open PRs #60 and #61) | server state machine with HTTP/1.0 framing, strict transfer-encoding, any-final-status `Send100::reject`, chunked finish capacity check, and a vendored request/response split |
 
 ## Layout
 

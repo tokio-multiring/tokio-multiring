@@ -13,6 +13,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
@@ -21,39 +22,142 @@ use axum::extract::{FromRequest, Request};
 use bytes::{Bytes, BytesMut};
 use http_body::{Frame, SizeHint};
 use tokio_multiring::{FixedBuf, Segment};
-use ureq_proto::server::Reply;
-use ureq_proto::server::state::{RecvBody, Send100};
 
 use crate::conn::{Conn, Filled};
 
-/// The protocol state while a request body may still be unread.
-pub(crate) enum IncomingReply {
-    Send100(Reply<Send100>),
-    RecvBody(Reply<RecvBody>),
-    /// Transient sentinel while transitioning between typestates.
-    Taken,
-}
-
-/// Live connection state loaned out while the handler runs.
+/// Live read half loaned out while a handler or response consumes its body.
 pub(crate) struct ActiveConn {
     pub(crate) conn: Conn,
-    pub(crate) reply: IncomingReply,
-    /// Set if a fatal transport error occurred while reading the body.
+    pub(crate) body: ureq_proto::server::RequestBody,
     pub(crate) io_error: bool,
 }
 
-/// Shared handoff slot between the connection driver, [`MultiRingIncoming`],
-/// and [`DirectBody`]. Uncontended during normal HTTP/1.1 execution.
+enum ContinueState {
+    Pending(Bytes),
+    Sending {
+        expected: usize,
+        operation: Pin<Box<dyn Future<Output = io::Result<usize>> + Send>>,
+    },
+    Accepted,
+    Rejected,
+    Failed,
+}
+
+/// Serializes the optional interim response against the final response head.
+struct ContinueGate {
+    state: tokio::sync::Mutex<ContinueState>,
+    multiring: tokio_multiring::MultiRing,
+    fd: Arc<std::os::fd::OwnedFd>,
+}
+
+impl ContinueGate {
+    /// Complete any started interim send before permitting final output. Its
+    /// future lives in the gate, so cancelling an individual body read neither
+    /// cancels nor duplicates a partially submitted 100 response.
+    async fn prepare(&self, receive: bool) -> io::Result<bool> {
+        let mut state = self.state.lock().await;
+        if let ContinueState::Pending(bytes) = &*state {
+            if !receive {
+                *state = ContinueState::Rejected;
+                return Ok(true);
+            }
+            let bytes = bytes.clone();
+            let expected = bytes.len();
+            let multiring = self.multiring.clone();
+            let fd = self.fd.clone();
+            *state = ContinueState::Sending {
+                expected,
+                operation: Box::pin(async move { multiring.send_bytes(fd, bytes).await }),
+            };
+        }
+        if let ContinueState::Sending {
+            expected,
+            operation,
+        } = &mut *state
+        {
+            let result = match operation.as_mut().await {
+                Ok(sent) if sent == *expected => Ok(()),
+                Ok(_) => Err(io::ErrorKind::WriteZero.into()),
+                Err(error) => Err(error),
+            };
+            *state = if result.is_ok() {
+                ContinueState::Accepted
+            } else {
+                ContinueState::Failed
+            };
+            result?;
+        }
+        match *state {
+            ContinueState::Accepted => Ok(false),
+            ContinueState::Rejected if !receive => Ok(true),
+            ContinueState::Rejected => {
+                Err(io::Error::other("request body rejected by final response"))
+            }
+            ContinueState::Failed => Err(io::Error::other("interim response failed")),
+            _ => unreachable!("pending interim state resolved above"),
+        }
+    }
+
+    async fn accept(&self) -> io::Result<()> {
+        self.prepare(true).await.map(drop)
+    }
+}
+
+#[derive(Default)]
+struct Readers {
+    count: AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+/// Counts actual body consumers, independently of temporary ConnSlot clones.
+/// Decrement BEFORE notification, so a concurrent waiter cannot miss the drop.
+struct ReaderLease(Arc<Readers>);
+
+impl Clone for ReaderLease {
+    fn clone(&self) -> Self {
+        self.0.count.fetch_add(1, Ordering::AcqRel);
+        Self(self.0.clone())
+    }
+}
+
+impl Drop for ReaderLease {
+    fn drop(&mut self) {
+        self.0.count.fetch_sub(1, Ordering::AcqRel);
+        self.0.changed.notify_waiters();
+    }
+}
+
+/// Shared ownership of the request read half. The response driver owns one
+/// reference; an incoming Body (or its pending read) owns another.
 #[derive(Clone)]
 pub(crate) struct ConnSlot {
     inner: Arc<Mutex<Option<Box<ActiveConn>>>>,
+    gate: Arc<ContinueGate>,
+    readers: Arc<Readers>,
 }
 
 impl ConnSlot {
-    pub(crate) fn new(active: ActiveConn) -> Self {
-        Self {
+    pub(crate) fn new(mut active: ActiveConn) -> Result<Self, BodyError> {
+        let (multiring, fd) = active.conn.transport();
+        let mut interim = [0; 64];
+        let used = active
+            .body
+            .accept_continue(&mut interim)
+            .map_err(BodyError::Malformed)?;
+        let state = if used == 0 {
+            ContinueState::Accepted
+        } else {
+            ContinueState::Pending(Bytes::copy_from_slice(&interim[..used]))
+        };
+        Ok(Self {
             inner: Arc::new(Mutex::new(Some(Box::new(active)))),
-        }
+            readers: Arc::new(Readers::default()),
+            gate: Arc::new(ContinueGate {
+                state: tokio::sync::Mutex::new(state),
+                multiring,
+                fd,
+            }),
+        })
     }
 
     pub(crate) fn take(&self) -> Option<Box<ActiveConn>> {
@@ -65,12 +169,72 @@ impl ConnSlot {
 
     pub(crate) fn put(&self, active: Box<ActiveConn>) {
         *self.inner.lock().unwrap_or_else(PoisonError::into_inner) = Some(active);
+        self.readers.changed.notify_waiters();
+    }
+
+    fn lease(&self) -> ReaderLease {
+        self.readers.count.fetch_add(1, Ordering::AcqRel);
+        ReaderLease(self.readers.clone())
+    }
+
+    /// A consumer may outlive the response and still legitimately read input.
+    /// Wait for EOF/error or for the last Body owner to release its lease before
+    /// taking over its framing state to drain and reuse the connection.
+    pub(crate) async fn wait_for_reader(&self) {
+        loop {
+            let changed = self.readers.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let finished = self
+                .inner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|active| active.io_error || active.body.is_ended());
+            if finished || self.readers.count.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) async fn accept_continue(&self) -> Result<(), BodyError> {
+        self.gate.accept().await.map_err(BodyError::Io)
+    }
+
+    /// If the source body is still alive, a streaming response may need it.
+    /// Otherwise a pending Expect request is rejected without sending 100.
+    /// Returns whether rejection requires closing after the final response.
+    pub(crate) async fn before_response(&self, discard_limit: usize) -> io::Result<bool> {
+        if self.readers.count.load(Ordering::Acquire) != 0 {
+            self.gate.accept().await?;
+            return Ok(false);
+        }
+        if self
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+        {
+            return Err(io::Error::other("request body read was cancelled"));
+        }
+        let rejected = self.gate.prepare(false).await?;
+        let unread_is_large = self
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(|active| {
+                active.io_error
+                    || (!active.body.is_ended()
+                        && active
+                            .body
+                            .remaining()
+                            .is_none_or(|n| n > discard_limit as u64))
+            });
+        Ok(rejected || unread_is_large)
     }
 }
-
-/// Request extension inserted by `multiring-axum` when a request has a body.
-#[derive(Clone)]
-pub(crate) struct DirectBodySlot(pub(crate) ConnSlot);
 
 /// Why reading a request body failed.
 #[derive(Debug)]
@@ -105,34 +269,11 @@ impl From<io::Error> for BodyError {
     }
 }
 
-/// Sends `100 Continue` if `active.reply` is in [`IncomingReply::Send100`].
-async fn ensure_recv_body(active: &mut ActiveConn) -> Result<(), BodyError> {
-    if !matches!(active.reply, IncomingReply::Send100(_)) {
-        return Ok(());
-    }
-    let IncomingReply::Send100(reply) = std::mem::replace(&mut active.reply, IncomingReply::Taken)
-    else {
-        unreachable!();
-    };
-    let output = active.conn.output()?;
-    let (used, body) = reply.accept(output.spare_capacity_mut()).map_err(|e| {
-        active.io_error = true;
-        BodyError::Malformed(e)
-    })?;
-    output.grow(used);
-    if let Err(e) = active.conn.flush().await {
-        active.io_error = true;
-        return Err(BodyError::Io(e));
-    }
-    active.reply = IncomingReply::RecvBody(body);
-    Ok(())
-}
-
 /// Decodes body bytes from `conn` into `output` (which must be non-empty).
 /// Returns `0` only once the body has ended.
 pub(crate) async fn read_body_into(
     conn: &mut Conn,
-    body: &mut Reply<RecvBody>,
+    body: &mut ureq_proto::server::RequestBody,
     output: &mut [u8],
 ) -> Result<usize, BodyError> {
     while !body.is_ended() {
@@ -163,7 +304,7 @@ pub(crate) async fn read_body_into(
 /// Extractor for direct io_uring request body reception.
 ///
 /// When running on `multiring-axum`, this claims the underlying connection and
-/// `ureq-proto` body state directly — enabling zero-copy `recv_vectored` into
+/// `ureq-proto` body state directly — enabling `recv_vectored` into
 /// registered [`FixedBuf`]s and explicit `Expect: 100-continue` approval.
 ///
 /// When running on another server (such as standard `axum::serve` / Hyper),
@@ -183,13 +324,17 @@ pub enum DirectBody {
 impl<S: Send + Sync> FromRequest<S> for DirectBody {
     type Rejection = Infallible;
 
-    async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        if let Some(DirectBodySlot(slot)) = req.extensions_mut().remove::<DirectBodySlot>()
+    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        // The capability belongs to the concrete Body, not the request's
+        // extensions: replacing or wrapping that Body must select the fallback.
+        if let Some(incoming) = req.body().downcast_ref::<MultiRingIncoming>()
+            && let IncomingState::Idle(slot) = &incoming.state
             && let Some(active) = slot.take()
         {
             return Ok(DirectBody::Direct(MultiRingDirectBody {
-                slot,
+                slot: slot.clone(),
                 active: Some(active),
+                _lease: incoming.lease.clone(),
             }));
         }
         let body = req.into_body();
@@ -203,11 +348,12 @@ impl<S: Send + Sync> FromRequest<S> for DirectBody {
 
 /// Direct io_uring request body handle returned inside [`DirectBody::Direct`].
 ///
-/// Returns the connection to the server automatically on drop so the server
-/// can send the response (or reject/discard/abandon an unread body).
+/// Returns the request read half to the server automatically on drop so it
+/// can drain unread input and decide whether the connection can be reused.
 pub struct MultiRingDirectBody {
     slot: ConnSlot,
     active: Option<Box<ActiveConn>>,
+    _lease: ReaderLease,
 }
 
 impl MultiRingDirectBody {
@@ -227,24 +373,17 @@ impl MultiRingDirectBody {
     /// validating the request (e.g. opening the target upload) so rejections
     /// can be answered without receiving the body.
     pub async fn accept_100(&mut self) -> Result<(), BodyError> {
-        ensure_recv_body(self.active_mut()).await
+        self.slot.accept_continue().await
     }
 
-    /// Remaining bytes for a length-delimited body, or `None` if chunked or
-    /// still waiting on `accept_100`.
+    /// Remaining bytes for a length-delimited body, or `None` for chunked framing.
     pub fn remaining(&self) -> Option<u64> {
-        match &self.active().reply {
-            IncomingReply::RecvBody(body) => body.remaining(),
-            IncomingReply::Send100(_) | IncomingReply::Taken => None,
-        }
+        self.active().body.remaining()
     }
 
     /// Whether the entire request body has been consumed.
     pub fn is_ended(&self) -> bool {
-        match &self.active().reply {
-            IncomingReply::RecvBody(body) => body.is_ended(),
-            IncomingReply::Send100(_) | IncomingReply::Taken => false,
-        }
+        self.active().body.is_ended()
     }
 
     /// Whether unread bytes are still buffered in the connection's head buffer.
@@ -262,11 +401,22 @@ impl MultiRingDirectBody {
         bufs: Vec<FixedBuf>,
         segments: &[Segment],
     ) -> (Result<usize, BodyError>, Vec<FixedBuf>) {
-        if let Err(err) = ensure_recv_body(self.active_mut()).await {
+        if let Err(err) = self.slot.accept_continue().await {
             return (Err(err), bufs);
         }
         let expected: usize = segments.iter().map(|s| s.len).sum();
         let active = self.active_mut();
+        if active.io_error {
+            return (
+                Err(BodyError::Io(io::Error::other(
+                    "an earlier body read was interrupted",
+                ))),
+                bufs,
+            );
+        }
+        // A cancelled receive may have consumed bytes without returning their
+        // count. Poison until both transport and framing have been accounted.
+        active.io_error = true;
         let (received, bufs) = active.conn.recv_vectored(bufs, segments).await;
         let received = match received {
             Ok(n) if n < expected => {
@@ -282,24 +432,30 @@ impl MultiRingDirectBody {
                 return (Err(BodyError::Io(e)), bufs);
             }
         };
-        let IncomingReply::RecvBody(body) = &mut active.reply else {
-            unreachable!("ensure_recv_body transitions to RecvBody");
-        };
+        let body = &mut active.body;
         if let Err(e) = body.consume_direct_read(received) {
             return (Err(BodyError::Malformed(e)), bufs);
         }
+        active.io_error = false;
         (Ok(received), bufs)
     }
 
     /// Reads decoded body bytes into `output`. Returns `0` once the body ends.
     pub async fn read_into(&mut self, output: &mut [u8]) -> Result<usize, BodyError> {
-        ensure_recv_body(self.active_mut()).await?;
+        self.slot.accept_continue().await?;
         let active = self.active_mut();
-        let IncomingReply::RecvBody(body) = &mut active.reply else {
-            return Ok(0);
-        };
+        if active.io_error {
+            return Err(BodyError::Io(io::Error::other(
+                "an earlier body read was interrupted",
+            )));
+        }
+        active.io_error = true;
+        let body = &mut active.body;
         match read_body_into(&mut active.conn, body, output).await {
-            Ok(n) => Ok(n),
+            Ok(n) => {
+                active.io_error = false;
+                Ok(n)
+            }
             Err(BodyError::Io(e)) => {
                 active.io_error = true;
                 Err(BodyError::Io(e))
@@ -333,13 +489,18 @@ enum IncomingState {
 pub(crate) struct MultiRingIncoming {
     state: IncomingState,
     remaining_hint: Option<u64>,
+    // Declared last so a pending read is cancelled before the lease wakes the
+    // connection driver during Drop.
+    lease: ReaderLease,
 }
 
 impl MultiRingIncoming {
     pub(crate) fn new(slot: ConnSlot, remaining_hint: Option<u64>) -> Self {
+        let lease = slot.lease();
         Self {
             state: IncomingState::Idle(slot),
             remaining_hint,
+            lease,
         }
     }
 }
@@ -362,7 +523,13 @@ impl http_body::Body for MultiRingIncoming {
 
                     // Fast synchronous path when bytes are already buffered in
                     // the head buffer and we don't need to send 100-continue.
-                    if let IncomingReply::RecvBody(ref mut body) = active.reply {
+                    if slot
+                        .gate
+                        .state
+                        .try_lock()
+                        .is_ok_and(|state| matches!(*state, ContinueState::Accepted))
+                    {
+                        let body = &mut active.body;
                         if body.is_ended() {
                             slot.put(active);
                             return Poll::Ready(None);
@@ -387,6 +554,7 @@ impl http_body::Body for MultiRingIncoming {
                                     }
                                 }
                                 Err(e) => {
+                                    active.io_error = true;
                                     slot.put(active);
                                     return Poll::Ready(Some(Err(io::Error::new(
                                         io::ErrorKind::InvalidData,
@@ -399,7 +567,7 @@ impl http_body::Body for MultiRingIncoming {
 
                     // Need async I/O (accept 100-continue and/or recv from socket).
                     let fut: ReadFut = Box::pin(async move {
-                        if let Err(err) = ensure_recv_body(&mut active).await {
+                        if let Err(err) = slot.accept_continue().await {
                             slot.put(active);
                             let io_err = match err {
                                 BodyError::Io(e) => e,
@@ -409,10 +577,7 @@ impl http_body::Body for MultiRingIncoming {
                             };
                             return (Some(Err(io_err)), slot);
                         }
-                        let IncomingReply::RecvBody(ref mut body) = active.reply else {
-                            slot.put(active);
-                            return (None, slot);
-                        };
+                        let body = &mut active.body;
                         let mut buf = BytesMut::zeroed(STREAM_CHUNK);
                         let res = match read_body_into(&mut active.conn, body, &mut buf).await {
                             Ok(0) => None,
@@ -425,6 +590,7 @@ impl http_body::Body for MultiRingIncoming {
                                 Some(Err(e))
                             }
                             Err(BodyError::Malformed(e)) => {
+                                active.io_error = true;
                                 Some(Err(io::Error::new(io::ErrorKind::InvalidData, e)))
                             }
                         };

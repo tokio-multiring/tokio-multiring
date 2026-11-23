@@ -14,7 +14,7 @@ Most `io_uring` runtimes in Rust (`tokio-uring`, `monoio`, `compio`, `glommio`) 
 - Standard Tokio sockets (`tokio::net`) continue to work transparently, watched via multishot poll on the workers' rings. Tokio timers stay with Tokio.
 - Callers that want completion-based I/O — `O_DIRECT` files, pre-registered fixed buffers, vectored I/O, zero-copy `SEND_ZC`, and optional `IOPOLL | SQPOLL` disk rings — submit directly onto the same per-worker rings using ordinary **`Send` futures**. Buffers and file descriptors move into an operation and come back with its completion, so the kernel never holds pointers to memory the caller can drop.
 
-To test this end-to-end against real HTTP workloads rather than echo microbenchmarks alone, the workspace also includes `multiring-axum` (serving unmodified `axum::Router`s over `tokio-multiring` and `ureq-proto`, with no Hyper and no Axum fork) and `s3-axum` (a single Axum S3 server that runs on `tokio-multiring`, standard Tokio/Hyper, or mainline Tokio's `io-uring` `tokio::fs` over the same on-disk format).
+To test this end-to-end against real HTTP workloads rather than echo microbenchmarks alone, the workspace also includes `multiring-axum` (serving unmodified `axum::Router`s over `tokio-multiring` and `ureq-proto`, using the vendored axum-core body API) and `s3-axum` (a single Axum S3 server that runs on `tokio-multiring`, standard Tokio/Hyper, or mainline Tokio's `io-uring` `tokio::fs` over the same on-disk format).
 
 ## Workspace crates
 
@@ -68,10 +68,11 @@ Opting into `--polled` (`IOPOLL | SQPOLL` disk rings) removes device interrupts 
 
 This is an experimental systems workspace (`publish = false`, Linux-only, Rust 1.85+, `--cfg tokio_unstable` configured in `.cargo/config.toml`).
 
-While the underlying changes are worked upstream, `Cargo.toml` pulls two forks:
+The workspace uses a Tokio fork and two vendored dependency patches.
 
 - **[`tokio-multiring/tokio`](https://github.com/tokio-multiring/tokio)** (`io-reactor-wl` branch) — adds the unstable `runtime::reactor::Reactor` / `Builder::io_reactor` seam and worker-local placement APIs (`run_on_each_worker`, `run_on_any_worker`) on top of stock crates.io `mio`.
-- **[`lthiery/ureq-proto`](https://github.com/lthiery/ureq-proto)** (`axum-proto` branch) — tracks `algesten/ureq-proto` `main` plus two small open PRs ([#60](https://github.com/algesten/ureq-proto/pull/60), [#61](https://github.com/algesten/ureq-proto/pull/61)). Once those merge and a new crates.io version is cut, this drops back to stock crates.io.
+- **[`lthiery/ureq-proto`](https://github.com/lthiery/ureq-proto)** (`axum-proto` branch) — tracks `algesten/ureq-proto` `main` plus two small open PRs ([#60](https://github.com/algesten/ureq-proto/pull/60), [#61](https://github.com/algesten/ureq-proto/pull/61)). The vendored snapshot adds independent request decoding and response encoding.
+- **axum-core 0.5.6** — the vendored snapshot adds shared downcasting for the immediate body passed to `Body::new`. This lets the adapter recognize its own body and honor middleware wrappers and replacements.
 
 ### Current constraints
 

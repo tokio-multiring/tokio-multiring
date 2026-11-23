@@ -39,6 +39,9 @@ pub(crate) struct Conn {
     /// Unacknowledged zero-copy `Bytes` sends on this connection, bounded to
     /// [`MAX_INFLIGHT_ZC`] to keep pinned memory per connection small.
     in_flight_zc: VecDeque<Release>,
+    /// A cancelled send may have written an unknown prefix. Never append to or
+    /// reuse that HTTP byte stream, even if a producer catches cancellation.
+    write_interrupted: bool,
 }
 
 fn lost() -> io::Error {
@@ -46,6 +49,41 @@ fn lost() -> io::Error {
 }
 
 impl Conn {
+    /// Separates the input buffer from the output buffer. Both halves own a
+    /// reference to the same socket, so reads and writes can progress together.
+    pub(crate) fn split(mut self) -> (Conn, Conn) {
+        let writer = Conn {
+            multiring: self.multiring.clone(),
+            fd: self.fd.clone(),
+            input: None,
+            consumed: 0,
+            output: self.output.take(),
+            zero_copy: self.zero_copy,
+            in_flight_zc: std::mem::take(&mut self.in_flight_zc),
+            write_interrupted: self.write_interrupted,
+        };
+        (self, writer)
+    }
+
+    pub(crate) fn reunite(&mut self, mut reader: Conn) {
+        assert!(Arc::ptr_eq(&self.fd, &reader.fd));
+        assert!(self.input.is_none() && reader.output.is_none());
+        self.input = reader.input.take();
+        self.consumed = reader.consumed;
+    }
+
+    pub(crate) fn transport(&self) -> (MultiRing, Arc<OwnedFd>) {
+        (self.multiring.clone(), self.fd.clone())
+    }
+
+    /// Stops both directions, including a request body retained by another task.
+    pub(crate) async fn abort(&self) {
+        let _ = self
+            .multiring
+            .shutdown(self.fd.clone(), std::net::Shutdown::Both)
+            .await;
+    }
+
     pub(crate) fn new(
         multiring: MultiRing,
         fd: OwnedFd,
@@ -61,6 +99,7 @@ impl Conn {
             output: Some(output),
             zero_copy,
             in_flight_zc: VecDeque::new(),
+            write_interrupted: false,
         }
     }
 
@@ -118,8 +157,17 @@ impl Conn {
             .await
     }
 
+    fn check_output(&self) -> io::Result<()> {
+        if self.write_interrupted {
+            Err(lost())
+        } else {
+            Ok(())
+        }
+    }
+
     /// The output buffer, for appending to.
     pub(crate) fn output(&mut self) -> io::Result<&mut FixedBuf> {
+        self.check_output()?;
         self.output.as_mut().ok_or_else(lost)
     }
 
@@ -130,6 +178,7 @@ impl Conn {
 
     /// Sends the output buffer and empties it.
     pub(crate) async fn flush(&mut self) -> io::Result<()> {
+        self.check_output()?;
         let output = self.output.take().ok_or_else(lost)?;
         if output.is_empty() {
             self.output = Some(output);
@@ -143,13 +192,18 @@ impl Conn {
 
     /// Sends the contents of `buf` from `start` on.
     pub(crate) async fn send(&mut self, buf: FixedBuf, start: usize) -> (io::Result<()>, FixedBuf) {
+        if let Err(error) = self.check_output() {
+            return (Err(error), buf);
+        }
         let expected = buf.len() - start;
+        self.write_interrupted = true;
         let (sent, buf) = self.multiring.send(self.fd.clone(), buf, start).await;
         let result = match sent {
             Ok(sent) if sent == expected => Ok(()),
             Ok(_) => Err(io::ErrorKind::WriteZero.into()),
             Err(error) => Err(error),
         };
+        self.write_interrupted = result.is_err();
         (result, buf)
     }
 
@@ -161,6 +215,10 @@ impl Conn {
         mut bufs: Vec<FixedBuf>,
         segments: &[Segment],
     ) -> (io::Result<()>, Vec<FixedBuf>) {
+        if let Err(error) = self.check_output() {
+            return (Err(error), bufs);
+        }
+        self.write_interrupted = true;
         if self.has_output() {
             let Some(head) = self.output.take() else {
                 return (Err(lost()), bufs);
@@ -188,6 +246,7 @@ impl Conn {
                 Ok(_) => Err(io::ErrorKind::WriteZero.into()),
                 Err(error) => Err(error),
             };
+            self.write_interrupted = result.is_err();
             return (result, bufs);
         }
 
@@ -201,6 +260,7 @@ impl Conn {
             Ok(_) => Err(io::ErrorKind::WriteZero.into()),
             Err(error) => Err(error),
         };
+        self.write_interrupted = result.is_err();
         (result, bufs)
     }
 
@@ -212,6 +272,8 @@ impl Conn {
         segments: &[Segment],
     ) -> (io::Result<()>, Reclaim) {
         debug_assert!(!self.has_output());
+        debug_assert!(!self.write_interrupted);
+        self.write_interrupted = true;
         let expected: usize = segments.iter().map(|segment| segment.len).sum();
         let (sent, reclaim) = self
             .multiring
@@ -222,6 +284,7 @@ impl Conn {
             Ok(_) => Err(io::ErrorKind::WriteZero.into()),
             Err(error) => Err(error),
         };
+        self.write_interrupted = result.is_err();
         (result, reclaim)
     }
 
@@ -229,12 +292,16 @@ impl Conn {
     /// output buffer. The output buffer must be flushed first.
     pub(crate) async fn send_bytes(&mut self, buf: Bytes) -> io::Result<()> {
         debug_assert!(!self.has_output());
+        self.check_output()?;
+        self.write_interrupted = true;
         let expected = buf.len();
-        match self.multiring.send_bytes(self.fd.clone(), buf).await {
+        let result = match self.multiring.send_bytes(self.fd.clone(), buf).await {
             Ok(sent) if sent == expected => Ok(()),
             Ok(_) => Err(io::ErrorKind::WriteZero.into()),
             Err(error) => Err(error),
-        }
+        };
+        self.write_interrupted = result.is_err();
+        result
     }
 
     /// Sends `buf` via `IORING_OP_SEND_ZC`, bounding unacknowledged chunks in
@@ -242,6 +309,8 @@ impl Conn {
     /// be flushed first.
     pub(crate) async fn send_bytes_zc(&mut self, buf: Bytes) -> io::Result<()> {
         debug_assert!(!self.has_output());
+        self.check_output()?;
+        self.write_interrupted = true;
         while self
             .in_flight_zc
             .front_mut()
@@ -258,11 +327,21 @@ impl Conn {
         let expected = buf.len();
         let (sent, release) = self.multiring.send_bytes_zc(self.fd.clone(), buf).await;
         self.in_flight_zc.push_back(release);
-        match sent {
+        let result = match sent {
             Ok(sent) if sent == expected => Ok(()),
             Ok(_) => Err(io::ErrorKind::WriteZero.into()),
             Err(error) => Err(error),
-        }
+        };
+        self.write_interrupted = result.is_err();
+        result
+    }
+
+    /// Announces response EOF while leaving a retained request consumer able
+    /// to read. This must precede waiting for that consumer on closing responses.
+    pub(crate) async fn finish_output(&self) -> io::Result<()> {
+        self.multiring
+            .shutdown(self.fd.clone(), std::net::Shutdown::Write)
+            .await
     }
 
     /// Closes the connection cleanly so the client can read the last response.
