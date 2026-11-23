@@ -532,7 +532,14 @@ fn many_rounds(server: &Fixture) {
     let body = pattern(21 * round + 3 * UNIT + 77);
     assert_eq!(client.put("/bucket/object", &body).status, 200);
     assert!(server.reassemble("object") == body);
-    assert!(client.get("/bucket/object").body == body);
+    let reply = client.get("/bucket/object");
+    assert_eq!(reply.status, 200, "GET failed: {}", reply.text());
+    assert!(
+        reply.body == body,
+        "GET body mismatch: got {} bytes, expected {}",
+        reply.body.len(),
+        body.len()
+    );
 
     // Starting and ending in the middle of rounds, several rounds apart.
     for range in [
@@ -743,7 +750,14 @@ fn polled_disk_rings() {
     let body = pattern(5 * UNIT + 44_641);
     assert_eq!(client.put("/bucket/object", &body).status, 200);
     assert!(server.reassemble("object") == body);
-    assert!(client.get("/bucket/object").body == body);
+    let reply = client.get("/bucket/object");
+    assert_eq!(reply.status, 200, "GET failed: {}", reply.text());
+    assert!(
+        reply.body == body,
+        "GET body mismatch: got {} bytes, expected {}",
+        reply.body.len(),
+        body.len()
+    );
     let part = client.request(
         "GET",
         "/bucket/object",
@@ -773,7 +787,14 @@ fn chunked_upload() {
     }
     assert_eq!(client.reply(false).status, 200);
     assert!(server.reassemble("object") == body);
-    assert!(client.get("/bucket/object").body == body);
+    let reply = client.get("/bucket/object");
+    assert_eq!(reply.status, 200, "GET failed: {}", reply.text());
+    assert!(
+        reply.body == body,
+        "GET body mismatch: got {} bytes, expected {}",
+        reply.body.len(),
+        body.len()
+    );
 
     client.send(b"PUT /bucket/broken HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\nnot hex\r\n");
     let refused = client.reply(false);

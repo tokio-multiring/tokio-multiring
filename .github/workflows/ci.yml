@@ -54,10 +54,11 @@ jobs:
         run: |
           uname -a
           nproc
+          findmnt -T .
           ulimit -a
 
       - name: Run workspace tests
         run: |
           sudo prlimit --pid=$$ --memlock=unlimited
           ulimit -l
-          cargo test --workspace
+          cargo test --workspace --no-fail-fast
